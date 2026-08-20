@@ -1,0 +1,36 @@
+[build-system]
+requires = ["uv_build>=0.11,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "fastapi-better-auth"
+version = "0.0.1"
+description = "Verify Better Auth (TypeScript) sessions from FastAPI. A bridge, not a Python port."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Mulugeta Solomon" }]
+keywords = ["better-auth", "fastapi", "authentication", "session", "jwt", "jwks"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Session",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.urls]
+Homepage = "https://github.com/Mulugeta-Solomon/fastapi-better-auth"
+Repository = "https://github.com/Mulugeta-Solomon/fastapi-better-auth"
+Issues = "https://github.com/Mulugeta-Solomon/fastapi-better-auth/issues"

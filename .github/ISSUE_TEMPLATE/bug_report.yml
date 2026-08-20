@@ -1,0 +1,35 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly
+body:
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Which verification mode are you using?
+      options:
+        - "A — cookie + shared DB/Redis"
+        - "B — JWT / JWKS"
+        - "C — remote get-session"
+        - "Not sure / not mode-related"
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: fastapi-better-auth / better-auth (Node) / Python / FastAPI
+      placeholder: "0.1.0 / 1.7.1 / 3.13 / 0.115"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: >
+        Never paste session tokens, cookies, JWTs, or secrets — redact them.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      render: python

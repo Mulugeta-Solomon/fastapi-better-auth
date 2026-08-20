@@ -1,0 +1,34 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: unit (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Sync (dev group)
+        run: uv sync
+      - name: Lint
+        run: uv run ruff check .
+      - name: Build
+        run: uv build
+      - name: Wheel must ship py.typed
+        run: unzip -l dist/fastapi_better_auth-*.whl | grep -q "fastapi_better_auth/py.typed"
+      - name: Test
+        run: uv run pytest -q
+
+  # e2e conformance lane (real Node better-auth via docker) is added in Phase 0 completion.
+  # It will be Linux-only and marked @pytest.mark.e2e, deselected by default.

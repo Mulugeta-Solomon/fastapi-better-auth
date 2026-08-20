@@ -1,0 +1,45 @@
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build distributions
+        run: uv build --no-sources
+      - name: Guard — git tag must equal the built wheel's version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          WHEEL=$(ls dist/*.whl)
+          case "$WHEEL" in
+            *"-${TAG}-"*) echo "tag ${TAG} matches wheel ${WHEEL}" ;;
+            *) echo "::error::tag ${TAG} does not match built wheel ${WHEEL}"; exit 1 ;;
+          esac
+      - name: Guard — wheel must ship py.typed
+        run: unzip -l dist/fastapi_better_auth-*.whl | grep -q "fastapi_better_auth/py.typed"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Mandatory for PyPI Trusted Publishing (OIDC). No token is configured anywhere.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

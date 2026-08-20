@@ -1,0 +1,25 @@
+# Development commentary & repo system map — local only, never shipped (ICM system-map form)
+development_doc/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build
+dist/
+build/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# OS / editor
+.DS_Store
+Thumbs.db
