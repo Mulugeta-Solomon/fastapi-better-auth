@@ -35,6 +35,22 @@ async def me(session: CurrentSession) -> MyUser:
 Design commitments: fail-closed everywhere; CSRF ships in the same release as cookie mode;
 compatibility with Better Auth is **tested in CI against a real Node server**, never assumed.
 
+## Do I need to run a Node service?
+
+Better Auth itself always runs in a Node/TypeScript process — sign-up, sign-in, OAuth, 2FA, and
+session *issuance* stay there; this library makes FastAPI a first-class *consumer* of the sessions
+it issues. Two topologies:
+
+- **You have a JS frontend server (Next.js, Nuxt, SvelteKit, …):** no extra service. Better Auth
+  is already mounted at `/api/auth/*` inside the frontend you deploy. FastAPI verifies the
+  sessions it issues — shared Postgres/Redis for Mode A, or nothing shared at all for Mode B (JWT).
+- **No JS server (static SPA, mobile app, pure API):** deploy one tiny Node service whose only
+  job is mounting Better Auth — ~50 lines of Hono or Express. FastAPI keeps 100% of the business
+  logic. (This repo's conformance harness doubles as a copy-paste example of exactly that service.)
+
+Either way, the browser or app performs its login flows against Better Auth, then presents the
+resulting session cookie or JWT to FastAPI, where this library verifies it.
+
 ## Why a library instead of the snippet
 
 The hand-rolled verifier circulating in Better Auth issues splits the cookie on the wrong dot,
