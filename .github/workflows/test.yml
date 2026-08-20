@@ -26,7 +26,7 @@ jobs:
       - name: Build
         run: uv build
       - name: Wheel must ship py.typed
-        run: unzip -l dist/fastapi_better_auth-*.whl | grep -q "fastapi_better_auth/py.typed"
+        run: unzip -l dist/fastapi_better_auth_bridge-*.whl | grep -q "fastapi_better_auth/py.typed"
       - name: Test
         run: uv run pytest -q
 

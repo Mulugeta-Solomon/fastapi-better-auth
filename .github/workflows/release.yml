@@ -24,7 +24,7 @@ jobs:
             *) echo "::error::tag ${TAG} does not match built wheel ${WHEEL}"; exit 1 ;;
           esac
       - name: Guard — wheel must ship py.typed
-        run: unzip -l dist/fastapi_better_auth-*.whl | grep -q "fastapi_better_auth/py.typed"
+        run: unzip -l dist/fastapi_better_auth_bridge-*.whl | grep -q "fastapi_better_auth/py.typed"
       - uses: actions/upload-artifact@v4
         with:
           name: dist

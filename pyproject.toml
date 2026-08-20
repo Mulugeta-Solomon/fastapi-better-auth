@@ -2,8 +2,12 @@
 requires = ["uv_build>=0.11,<0.13"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+# Distribution name is fastapi-better-auth-bridge; the import package stays fastapi_better_auth.
+module-name = "fastapi_better_auth"
+
 [project]
-name = "fastapi-better-auth"
+name = "fastapi-better-auth-bridge"
 version = "0.0.1"
 description = "Verify Better Auth (TypeScript) sessions from FastAPI. A bridge, not a Python port."
 readme = "README.md"

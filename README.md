@@ -1,4 +1,4 @@
-# fastapi-better-auth
+# fastapi-better-auth-bridge
 
 **A bridge to a TypeScript [Better Auth](https://better-auth.com) server — not a Python port.**
 (If you want a full Python re-implementation, this is not it.) Community-maintained; not affiliated
@@ -6,7 +6,8 @@ with or endorsed by Better Auth.
 
 > **Status: placeholder release (0.0.1).** The library is in active development — 0.1.0 is the first
 > usable release. Watch the [repository](https://github.com/Mulugeta-Solomon/fastapi-better-auth)
-> for progress.
+> for progress. The distribution is `fastapi-better-auth-bridge` (the shorter spelling collides
+> with an unrelated package under PyPI's name-similarity rules); the import is `fastapi_better_auth`.
 
 ## What this will be
 

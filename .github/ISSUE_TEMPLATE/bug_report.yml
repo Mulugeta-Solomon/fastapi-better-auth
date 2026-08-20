@@ -16,7 +16,7 @@ body:
     id: versions
     attributes:
       label: Versions
-      description: fastapi-better-auth / better-auth (Node) / Python / FastAPI
+      description: fastapi-better-auth-bridge / better-auth (Node) / Python / FastAPI
       placeholder: "0.1.0 / 1.7.1 / 3.13 / 0.115"
     validations:
       required: true
