@@ -1,0 +1,16 @@
+{
+  "name": "harness-auth-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.mjs"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.0",
+    "auth": "1.7.1",
+    "better-auth": "1.7.1",
+    "hono": "^4.7.0",
+    "ioredis": "^5.6.0",
+    "pg": "^8.16.0"
+  }
+}
