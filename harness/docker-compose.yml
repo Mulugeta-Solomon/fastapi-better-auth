@@ -27,7 +27,10 @@ services:
 
   # Default topology: sessions in Postgres only.
   auth:
-    build: ./auth-server
+    build:
+      context: ./auth-server
+      args:
+        BETTER_AUTH_VERSION: ${BETTER_AUTH_VERSION:-}
     environment:
       DATABASE_URL: postgres://harness:harness@postgres:5432/harness
       BETTER_AUTH_SECRET: harness-secret-do-not-use-in-production
@@ -35,6 +38,11 @@ services:
       PORT: "3100"
     ports:
       - "3100:3100"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3100/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
     depends_on:
       postgres:
         condition: service_healthy
@@ -43,7 +51,10 @@ services:
   # Postgres session table may stay empty. Started only with --profile redis.
   auth-redis:
     profiles: ["redis"]
-    build: ./auth-server
+    build:
+      context: ./auth-server
+      args:
+        BETTER_AUTH_VERSION: ${BETTER_AUTH_VERSION:-}
     environment:
       DATABASE_URL: postgres://harness:harness@postgres:5432/harness
       BETTER_AUTH_SECRET: harness-secret-do-not-use-in-production

@@ -1,0 +1,42 @@
+name: canary
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  conformance:
+    name: better-auth@${{ matrix.version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["1.6.30", "1.7.1", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Start harness (better-auth@${{ matrix.version }})
+        run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml up --build -d --wait
+      - name: Sync (dev group)
+        run: uv sync
+      - name: Conformance lane
+        run: uv run pytest -m e2e -q
+      - name: Harness logs
+        if: failure()
+        run: docker compose -f harness/docker-compose.yml logs
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="canary: conformance failure against better-auth@${{ matrix.version }}"
+          gh label create canary --color D93F0B --description "automated conformance canary" 2>/dev/null || true
+          EXISTING=$(gh issue list --state open --label canary --json title --jq ".[].title" | grep -Fx "$TITLE" || true)
+          if [ -z "$EXISTING" ]; then
+            gh issue create --title "$TITLE" --label canary --body "The e2e conformance lane failed against better-auth@${{ matrix.version }}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi

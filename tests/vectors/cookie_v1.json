@@ -1,0 +1,75 @@
+{
+  "better_auth_version": "1.7.1",
+  "captured_at": "2026-08-20T15:49:09+00:00",
+  "cookie_name": "better-auth.session_token",
+  "schema": "cookie-signature-vectors/1",
+  "secret": "harness-secret-do-not-use-in-production",
+  "vectors": [
+    {
+      "cookie_value": "SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B.fZbEAT2aS7kK1dFdaHJjZv9rcYjMmUNrr5jW%2FmVI6R8%3D",
+      "expect": "signature_valid",
+      "name": "captured-valid",
+      "note": "as issued by the live server (URL-encoded)"
+    },
+    {
+      "cookie_value": "SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B.ven6am/9K2WRtBY0pjoutCCqUysLvw213OspZ0Bm3UA%3D",
+      "expect": "signature_invalid",
+      "name": "wrong-secret",
+      "note": "HMAC computed with a different secret"
+    },
+    {
+      "cookie_value": "SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B.fZbEAT2aS7kK1dFdaHJjZv9rcYjMmUNrr5jW/mVI6R8",
+      "expect": "signature_invalid",
+      "name": "truncated-sig",
+      "note": "43 chars \u2014 one short"
+    },
+    {
+      "cookie_value": "SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B.fZbEAT2aS7kK1dFdaHJjZv9rcYjMmUNrr5jW/mVI6R8%3DA",
+      "expect": "signature_invalid",
+      "name": "overlong-sig",
+      "note": "45 chars \u2014 one long"
+    },
+    {
+      "cookie_value": "SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B.fZbEAT2aS7kK1dFdaHJjZv9rcYjMmUNrr5jW_mVI6R8",
+      "expect": "signature_invalid",
+      "name": "base64url-nopad-sig",
+      "note": "same HMAC bytes, base64url no-pad \u2014 catches verifiers using the wrong alphabet"
+    },
+    {
+      "cookie_value": "SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B.",
+      "expect": "signature_invalid",
+      "name": "empty-sig",
+      "note": "token with trailing dot"
+    },
+    {
+      "cookie_value": "SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B",
+      "expect": "signature_invalid",
+      "name": "no-dot",
+      "note": "bare token, no signature"
+    },
+    {
+      "cookie_value": ".bcBpKMB0ikj%2B78ISWDi1s022zGYU5lpcrETNyQiNVLo%3D",
+      "expect": "signature_invalid",
+      "name": "empty-token",
+      "note": "valid HMAC over the empty string \u2014 verifiers must reject empty tokens before comparing"
+    },
+    {
+      "cookie_value": "SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B.Nux7cQUeG2u7YR/9N2fWUt%2BfW7G9Fp%2BP1TDV8r1/1Qo%3D",
+      "expect": "signature_invalid",
+      "name": "swapped-sig",
+      "note": "valid signature of a different token"
+    },
+    {
+      "cookie_value": "prefix.SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B.aoqIbe6iIp6SWpUxPS5o0TxuxmTIE/RFlS76W9t2OtQ%3D",
+      "expect": "signature_valid",
+      "name": "dotted-token-valid",
+      "note": "token containing a dot, correctly signed \u2014 catches first-dot splits (must split at LAST dot)"
+    },
+    {
+      "cookie_value": "SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B.fZbEAT2aS7kK1dFdaHJjZv9rcYjMmUNrr5jW%252FmVI6R8%253D",
+      "expect": "signature_invalid",
+      "name": "double-urlencoded",
+      "note": "URL-encoded twice \u2014 a single unquote must not resolve it"
+    }
+  ]
+}

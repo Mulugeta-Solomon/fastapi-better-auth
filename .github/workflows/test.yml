@@ -30,5 +30,21 @@ jobs:
       - name: Test
         run: uv run pytest -q
 
-  # e2e conformance lane (real Node better-auth via docker) is added in Phase 0 completion.
-  # It will be Linux-only and marked @pytest.mark.e2e, deselected by default.
+  e2e:
+    name: e2e conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Start harness
+        run: docker compose -f harness/docker-compose.yml up --build -d --wait
+      - name: Sync (dev group)
+        run: uv sync
+      - name: Conformance lane
+        run: uv run pytest -m e2e -q
+      - name: Harness logs
+        if: failure()
+        run: docker compose -f harness/docker-compose.yml logs
+      - name: Teardown
+        if: always()
+        run: docker compose -f harness/docker-compose.yml down -v

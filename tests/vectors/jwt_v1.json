@@ -1,0 +1,36 @@
+{
+  "better_auth_version": "1.7.1",
+  "captured_at": "2026-08-20T15:49:09+00:00",
+  "claims": {
+    "aud": "http://localhost:3100",
+    "createdAt": "2026-08-20T15:34:02.764Z",
+    "email": "seed@example.com",
+    "emailVerified": false,
+    "exp": 1787241849,
+    "iat": 1787240949,
+    "id": "cIrUeXmXVG5Kg0Pzt4rCozIxLv3oeOMG",
+    "image": null,
+    "iss": "http://localhost:3100",
+    "name": "Seed User",
+    "sub": "cIrUeXmXVG5Kg0Pzt4rCozIxLv3oeOMG",
+    "updatedAt": "2026-08-20T15:34:02.764Z"
+  },
+  "header": {
+    "alg": "EdDSA",
+    "kid": "iRAEH8dYmpc2QAJ2kn24073PsTSnUX5r"
+  },
+  "issuer": "http://localhost:3100",
+  "jwks": {
+    "keys": [
+      {
+        "alg": "EdDSA",
+        "crv": "Ed25519",
+        "kid": "iRAEH8dYmpc2QAJ2kn24073PsTSnUX5r",
+        "kty": "OKP",
+        "x": "ImDQquyAvtIKPvU7KRIwSSA6WVhXSopWIcTER3CVly0"
+      }
+    ]
+  },
+  "schema": "jwt-vectors/1",
+  "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImlSQUVIOGRZbXBjMlFBSjJrbjI0MDczUHNUU25VWDVyIn0.eyJpYXQiOjE3ODcyNDA5NDksIm5hbWUiOiJTZWVkIFVzZXIiLCJlbWFpbCI6InNlZWRAZXhhbXBsZS5jb20iLCJlbWFpbFZlcmlmaWVkIjpmYWxzZSwiaW1hZ2UiOm51bGwsImNyZWF0ZWRBdCI6IjIwMjYtMDgtMjBUMTU6MzQ6MDIuNzY0WiIsInVwZGF0ZWRBdCI6IjIwMjYtMDgtMjBUMTU6MzQ6MDIuNzY0WiIsImlkIjoiY0lyVWVYbVhWRzVLZzBQenQ0ckNvekl4THYzb2VPTUciLCJzdWIiOiJjSXJVZVhtWFZHNUtnMFB6dDRyQ296SXhMdjNvZU9NRyIsImV4cCI6MTc4NzI0MTg0OSwiaXNzIjoiaHR0cDovL2xvY2FsaG9zdDozMTAwIiwiYXVkIjoiaHR0cDovL2xvY2FsaG9zdDozMTAwIn0.pnyMrelhxtti-4nMo_Lc6g0zh812ClXaAbhIfvWknA0QGcgZkH_al22196zb5Wkk4f4bWftXYUdfQd0dDzvWAQ"
+}

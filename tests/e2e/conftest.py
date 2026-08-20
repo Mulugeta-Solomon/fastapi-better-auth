@@ -19,6 +19,8 @@ def harness() -> str:
         resp = httpx.get(f"{HARNESS_URL}/healthz", timeout=5)
         resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001 - any failure means the harness is down
+        if os.environ.get("CI"):
+            pytest.fail(f"harness not reachable at {HARNESS_URL} in CI: {exc}")
         pytest.skip(f"harness not reachable at {HARNESS_URL}: {exc}")
     return HARNESS_URL
 

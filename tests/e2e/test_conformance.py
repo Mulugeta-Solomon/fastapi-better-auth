@@ -5,14 +5,27 @@ import base64
 import hashlib
 import hmac
 import json
+import pathlib
+import subprocess
 import urllib.parse
 
 import httpx
 import pytest
 
-from .conftest import SESSION_COOKIE
+from .conftest import SEED_EMAIL, SEED_PASSWORD, SESSION_COOKIE
 
 pytestmark = pytest.mark.e2e
+
+COMPOSE_FILE = pathlib.Path(__file__).resolve().parents[2] / "harness" / "docker-compose.yml"
+
+
+def _harness_sql(sql: str) -> None:
+    subprocess.run(
+        ["docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T", "postgres",
+         "psql", "-U", "harness", "-d", "harness", "-v", "ON_ERROR_STOP=1", "-c", sql],
+        check=True,
+        capture_output=True,
+    )
 
 
 def _split(raw_cookie: str) -> tuple[str, str]:
@@ -68,6 +81,27 @@ class TestGetSession:
         )
         assert resp.status_code == 200
         assert json.loads(resp.text) is None
+
+
+class TestExpiry:
+    def test_route_layer_rejects_expired_session(self, harness):
+        """Documents WHY the library must enforce expiresAt itself in Mode A: upstream's route
+        layer rejects expired sessions, but a bare store lookup (findSession) does not check."""
+        resp = httpx.post(
+            f"{harness}/api/auth/sign-in/email",
+            json={"email": SEED_EMAIL, "password": SEED_PASSWORD},
+        )
+        raw = resp.cookies.get(SESSION_COOKIE)
+        token, _ = _split(raw)
+        try:
+            _harness_sql(
+                f"""UPDATE session SET "expiresAt" = now() - interval '1 hour' WHERE token = '{token}'"""
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            pytest.skip(f"cannot reach harness postgres via docker compose: {exc}")
+        r = httpx.get(f"{harness}/api/auth/get-session", cookies={SESSION_COOKIE: raw})
+        assert r.status_code == 200
+        assert json.loads(r.text) is None
 
 
 class TestJwtPlugin:
