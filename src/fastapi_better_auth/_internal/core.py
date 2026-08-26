@@ -200,7 +200,7 @@ class BetterAuth:
             if (credential := _extracted(verifier, connection)) is not None
         ]
         if len(presented) > 1:
-            names = [type(verifier).__name__ for verifier, _credential in presented]
+            names = [_named(verifier) for verifier, _credential in presented]
             presented.clear()
             credential = None
             raise AmbiguousCredentials(reason=_ambiguity(names))
@@ -276,8 +276,13 @@ def _checked(session: Any, verifier: Verifier, user_model: type[UserModelT]) -> 
     return typed
 
 
+def _named(verifier: Verifier) -> str:
+    """Class name plus declared source. Operator-supplied labels, never client data."""
+    return f"{type(verifier).__name__}({verifier.credential_source})"
+
+
 def _nothing_presented(verifiers: Sequence[Verifier]) -> str:
-    asked = ", ".join(type(verifier).__name__ for verifier in verifiers)
+    asked = ", ".join(_named(verifier) for verifier in verifiers)
     return f"no credential presented; verifiers asked: {asked}"
 
 
@@ -297,17 +302,33 @@ def _validated(verifiers: object) -> tuple[Verifier, ...]:
             "BetterAuth(verifiers=...) needs at least one verifier: with none configured,"
             " every request would be answered as unauthenticated."
         )
-    seen: list[object] = []
+    seen: list[Verifier] = []
     for index, verifier in enumerate(ordered):
         _validate_verifier(verifier, index)
-        if any(verifier is earlier for earlier in seen):
+        checked = cast("Verifier", verifier)
+        if any(checked is earlier for earlier in seen):
             raise ConfigurationError(
-                f"BetterAuth(verifiers=...) lists the same {type(verifier).__name__} twice."
+                f"BetterAuth(verifiers=...) lists the same {type(checked).__name__} twice."
                 " Both copies would find the same credential, so every request carrying it"
                 " would be ambiguous."
             )
-        seen.append(verifier)
+        _reject_collision(checked, seen)
+        seen.append(checked)
     return cast("tuple[Verifier, ...]", ordered)
+
+
+def _reject_collision(verifier: Verifier, seen: Sequence[Verifier]) -> None:
+    """Two *different* verifiers reading one credential — what identity cannot see."""
+    source = verifier.credential_source.strip().casefold()
+    clash = next((s for s in seen if s.credential_source.strip().casefold() == source), None)
+    if clash is None:
+        return
+    raise ConfigurationError(
+        f"BetterAuth(verifiers=...) has two verifiers on one credential:"
+        f" {type(clash).__name__} and {type(verifier).__name__} both declare"
+        f" credential_source={verifier.credential_source!r}. Both would find it, so every"
+        " request carrying that credential would be ambiguous."
+    )
 
 
 def _validate_verifier(verifier: object, index: int) -> None:
@@ -321,11 +342,23 @@ def _validate_verifier(verifier: object, index: int) -> None:
     for method in ("extract", "verify"):
         if not callable(getattr(verifier, method)):
             raise ConfigurationError(f"{where} has a {method} that is not callable.")
+    _validate_source(verifier.credential_source, where)
     if inspect.iscoroutinefunction(verifier.extract):
         raise ConfigurationError(
             f"{where} declares extract() as async. extract() is a synchronous presence"
             " check; an async one returns a coroutine object, which is never None, so this"
             " verifier would claim every request and every request would be ambiguous."
+        )
+
+
+def _validate_source(source: object, where: str) -> None:
+    """`source` is annotated `str`; the object declaring it was written by someone else."""
+    if not isinstance(source, str) or not source.strip():
+        raise ConfigurationError(
+            f"{where} must declare a non-empty string credential_source naming where its"
+            " credential comes from, such as 'cookie:better-auth.session_token'. It is how"
+            " two verifiers reading one credential are caught here rather than by every"
+            f" request being ambiguous; got {source!r}."
         )
 
 

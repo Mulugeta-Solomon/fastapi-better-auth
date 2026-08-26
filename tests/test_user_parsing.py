@@ -15,8 +15,7 @@ from typing import Any
 import pytest
 from pydantic import ConfigDict, Field, ValidationError, field_validator
 
-from fastapi_better_auth import InvalidCredential, User
-from fastapi_better_auth._internal.parsing import parse_user
+from fastapi_better_auth import InvalidCredential, User, parse_user
 
 LEAKY_MARKER = "mallory-9f3ab21c"
 OVERLONG_EMAIL = f"{'x' * 400}@example.com"

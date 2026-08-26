@@ -26,8 +26,11 @@ EXPECTED = (
     "User",
     "UserT",
     "Verifier",
+    "normalize_base_url",
+    "parse_user",
 )
-NON_CLASS_EXPORTS = frozenset({"BEARER_CHALLENGE", "UserT"})
+NON_CLASS_EXPORTS = frozenset({"BEARER_CHALLENGE", "UserT", "normalize_base_url", "parse_user"})
+SANCTIONED_TOOLS = ("normalize_base_url", "parse_user")
 RESPONSE_CLASSVARS = ("response_status", "response_detail", "response_headers")
 
 
@@ -59,7 +62,7 @@ def test_every_published_name_resolves(name: str) -> None:
     assert getattr(fastapi_better_auth, name, None) is not None
 
 
-def test_the_non_class_exports_are_exactly_the_two_documented_ones() -> None:
+def test_the_non_class_exports_are_exactly_the_documented_ones() -> None:
     """A new non-class export needs a deliberate edit here, and a home in the docs."""
     published = {
         name
@@ -97,6 +100,28 @@ def test_the_session_error_docstring_documents_the_extension_mechanism() -> None
 
     for classvar in RESPONSE_CLASSVARS:
         assert classvar in doc, f"SessionError does not document {classvar}"
+
+
+@pytest.mark.parametrize("name", SANCTIONED_TOOLS)
+def test_the_sanctioned_tools_are_importable_from_the_root(name: str) -> None:
+    """A verifier written outside this package is told to contain its own validation
+    errors and to canonicalize its own base_url. If the sanctioned way to do either is not
+    importable, the safe path is harder than the unsafe one and everyone reimplements it."""
+    tool = getattr(fastapi_better_auth, name)
+
+    assert callable(tool)
+    assert tool.__module__.startswith("fastapi_better_auth")
+
+
+@pytest.mark.parametrize("name", SANCTIONED_TOOLS)
+def test_every_exported_function_carries_a_real_docstring(name: str) -> None:
+    doc = (getattr(fastapi_better_auth, name).__doc__ or "").strip()
+    lines = doc.splitlines()
+
+    assert doc, f"{name} has no docstring"
+    assert lines[0].strip(), f"{name} opens with a blank summary line"
+    assert len(lines) > 1, f"{name} documents itself in one clause"
+    assert "Raises:" in doc, f"{name} does not document what it raises"
 
 
 def test_the_version_marker_matches_the_installed_distribution() -> None:

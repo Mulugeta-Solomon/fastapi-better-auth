@@ -264,6 +264,7 @@ def test_the_missing_credential_reason_names_the_verifiers_that_were_asked() -> 
     assert response.status_code == 401
     assert observed
     assert "FakeVerifier" in observed[0].reason
+    assert f"header:{HEADER}" in observed[0].reason
 
 
 # --- the user model travels through the dependency ------------------------------------

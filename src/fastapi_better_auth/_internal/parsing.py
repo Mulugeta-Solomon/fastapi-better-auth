@@ -22,11 +22,28 @@ SAFE_LOCATION = re.compile(r"[A-Za-z0-9_]{1,64}")
 def parse_user(user_model: type[UserModelT], payload: Any) -> UserModelT:
     """Build a user model from an upstream payload, or fail as a credential failure.
 
+    This is how a verifier turns decoded JWT claims or a `get-session` body into the user
+    model the application asked for. Use it instead of calling `user_model.model_validate`
+    yourself - including in a verifier of your own:
+
+        from fastapi_better_auth import Session, parse_user
+
+        class HeaderVerifier:
+            credential_source = "header:x-assertion"
+
+            async def verify(self, credential: str, user_model: type[UserT]) -> Session[UserT]:
+                claims = decode(credential)
+                return Session(
+                    user=parse_user(user_model, claims),
+                    expires_at=expiry_of(claims),
+                    raw=claims,
+                )
+
     A `pydantic.ValidationError` escaping a verifier is answered as a 500, and a 500 is
     distinguishable on the wire from the uniform 401 every other failure renders: it tells
     a client that *this* payload parsed differently from the last one, and under a
-    debugging handler it echoes the payload back. Every verifier materializes its user
-    through this function so that outcome cannot happen.
+    debugging handler it echoes the payload back. Materializing the user through this
+    function is what makes that outcome unreachable.
 
     The validation diagnosis survives on `InvalidCredential.reason` - which field, what
     kind of failure - for logs and error reporters. Nothing the payload chose does. That

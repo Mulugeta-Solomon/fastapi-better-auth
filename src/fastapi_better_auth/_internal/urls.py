@@ -20,11 +20,18 @@ MAX_HOST_LENGTH = 253
 def normalize_base_url(value: str, *, field: str = "base_url") -> str:
     """Reduce an operator-supplied URL to its canonical origin, or refuse it.
 
+    Call this in a verifier's `__init__` on every URL it takes from configuration, and
+    keep the value it returns:
+
+        class HeaderVerifier:
+            def __init__(self, base_url: str) -> None:
+                self.base_url = normalize_base_url(base_url)
+
     Everything a verifier derives from configuration - the JWKS URL it will fetch, the
     issuer and audience it will require, the origins it will trust - is built from this
     string, and comparisons against it are exact. Two spellings of one origin would
-    therefore be two origins, so the string is canonicalized once, at startup, and the
-    canonical form is what the rest of the library ever sees.
+    therefore be two origins, so the string is canonicalized once, while the application
+    is being constructed, and the canonical form is what everything downstream sees.
 
     Accepted input is an origin and nothing else: a scheme, a host, and an optional port.
     A path, a query, a fragment or embedded credentials are rejected rather than silently

@@ -28,6 +28,7 @@ from tests.fakes import (
     BAD_CREDENTIAL,
     GOOD_CREDENTIAL,
     AsyncExtractVerifier,
+    BlankSourceVerifier,
     BrokenConfigVerifier,
     FailingVerifier,
     FakeVerifier,
@@ -36,6 +37,7 @@ from tests.fakes import (
     NullVerifier,
     RaisingExtractVerifier,
     RaisingVerifyVerifier,
+    SessionErrorExtractVerifier,
     SyncVerifyVerifier,
     TracedVerifier,
     WrongModelVerifier,
@@ -144,6 +146,45 @@ def test_the_same_verifier_twice_is_rejected() -> None:
         BetterAuth(verifiers=[verifier, verifier])
 
     assert "twice" in str(caught.value)
+
+
+def test_two_verifiers_declaring_one_credential_source_are_rejected() -> None:
+    """The collision identity-comparison cannot see: two *distinct* verifiers reading the
+    same credential. Every request carrying it would be ambiguous, and startup would
+    otherwise call the deployment healthy."""
+    with pytest.raises(ConfigurationError) as caught:
+        BetterAuth(
+            verifiers=[
+                FakeVerifier(HEADER_A, source="cookie:better-auth.session_token"),
+                FailingVerifier(
+                    HEADER_B, InvalidCredential, "r", source="COOKIE:Better-Auth.Session_Token"
+                ),
+            ]
+        )
+
+    message = str(caught.value)
+    assert "FakeVerifier" in message
+    assert "FailingVerifier" in message
+    assert "better-auth.session_token" in message.lower()
+
+
+@pytest.mark.parametrize(
+    "verifier",
+    [BlankSourceVerifier(HEADER_A), FakeVerifier(HEADER_A, source="")],
+    ids=["whitespace-only", "empty"],
+)
+def test_a_blank_credential_source_is_rejected(verifier: Any) -> None:
+    with pytest.raises(ConfigurationError) as caught:
+        BetterAuth(verifiers=[verifier])
+
+    assert "credential_source" in str(caught.value)
+
+
+def test_a_non_string_credential_source_is_rejected() -> None:
+    with pytest.raises(ConfigurationError) as caught:
+        BetterAuth(verifiers=[FakeVerifier(HEADER_A, source=3)])  # pyright: ignore[reportArgumentType]
+
+    assert "credential_source" in str(caught.value)
 
 
 def test_the_verifiers_argument_is_keyword_only() -> None:
@@ -324,6 +365,22 @@ async def test_a_contained_exception_names_only_its_type() -> None:
 
 
 @pytest.mark.anyio
+async def test_a_session_error_raised_from_extract_is_a_parser_escape() -> None:
+    """Deliberate asymmetry with `verify`, pinned so nobody "fixes" it: `extract` decides
+    ownership, not validity, so a refusal raised there is contained like any other escape
+    rather than honoured - and its reason does not survive into ours."""
+    secret = "sid_fp=7c1de90f elapsed"
+    auth = BetterAuth(verifiers=[SessionErrorExtractVerifier(HEADER_A, SessionExpired, secret)])
+
+    with pytest.raises(InvalidCredential) as caught:
+        await resolve_for(auth)(connection(**{HEADER_A: GOOD_CREDENTIAL}))
+
+    assert "SessionExpired" in caught.value.reason
+    assert "extract" in caught.value.reason
+    assert secret not in caught.value.reason
+
+
+@pytest.mark.anyio
 async def test_containment_never_swallows_a_configuration_error() -> None:
     """A deployment fault must stay loud; degrading it to a 401 would hide it forever."""
     auth = BetterAuth(verifiers=[BrokenConfigVerifier(HEADER_A)])
@@ -394,6 +451,8 @@ async def test_three_credentials_are_refused_too() -> None:
 
     assert all(verifier.verify_calls == 0 for verifier in verifiers)
     assert "3" in caught.value.reason
+    for header in (HEADER_A, HEADER_B, HEADER_C):
+        assert f"header:{header}" in caught.value.reason
 
 
 @pytest.mark.anyio

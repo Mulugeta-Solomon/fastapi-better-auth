@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from fastapi_better_auth import ConfigurationError
-from fastapi_better_auth._internal.urls import ip_literal, normalize_base_url
+from fastapi_better_auth import ConfigurationError, normalize_base_url
+from fastapi_better_auth._internal.urls import ip_literal
 
 CANONICAL: tuple[tuple[str, str], ...] = (
     ("https://auth.example.com", "https://auth.example.com"),

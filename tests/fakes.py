@@ -26,8 +26,8 @@ from fastapi_better_auth import (
     Session,
     SessionError,
     User,
+    parse_user,
 )
-from fastapi_better_auth._internal.parsing import parse_user
 
 UserModelT = TypeVar("UserModelT", bound=User)
 
@@ -47,8 +47,10 @@ class FakeVerifier:
         accepts: str = GOOD_CREDENTIAL,
         payload: Mapping[str, Any] | None = None,
         log: list[str] | None = None,
+        source: str | None = None,
     ) -> None:
         self.header = header
+        self.credential_source = f"header:{header}" if source is None else source
         self.accepts = accepts
         self.payload: Mapping[str, Any] = VALID_PAYLOAD if payload is None else payload
         self.log = log
@@ -77,8 +79,16 @@ class FakeVerifier:
 class FailingVerifier:
     """Always presents a credential, always fails it — the terminal-failure half."""
 
-    def __init__(self, header: str, error_cls: type[SessionError], reason: str) -> None:
+    def __init__(
+        self,
+        header: str,
+        error_cls: type[SessionError],
+        reason: str,
+        *,
+        source: str | None = None,
+    ) -> None:
         self.header = header
+        self.credential_source = f"header:{header}" if source is None else source
         self.error_cls = error_cls
         self.reason = reason
         self.extract_calls = 0
@@ -102,6 +112,7 @@ class NullVerifier:
 
     def __init__(self, header: str) -> None:
         self.header = header
+        self.credential_source = f"header:{header}"
 
     def extract(self, connection: HTTPConnection) -> str | None:
         return connection.headers.get(self.header)
@@ -115,6 +126,7 @@ class WrongModelVerifier:
 
     def __init__(self, header: str) -> None:
         self.header = header
+        self.credential_source = f"header:{header}"
 
     async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
         return Session(  # pyright: ignore[reportReturnType]
@@ -132,6 +144,7 @@ class RaisingExtractVerifier:
 
     def __init__(self, header: str) -> None:
         self.header = header
+        self.credential_source = f"header:{header}"
 
     def extract(self, connection: HTTPConnection) -> str | None:
         raise RuntimeError(f"parser blew up on {connection.headers.get(self.header)!r}")
@@ -145,6 +158,7 @@ class BrokenConfigVerifier:
 
     def __init__(self, header: str) -> None:
         self.header = header
+        self.credential_source = f"header:{header}"
 
     def extract(self, connection: HTTPConnection) -> str | None:
         raise ConfigurationError("secondary storage was never configured")
@@ -158,6 +172,7 @@ class RaisingVerifyVerifier:
 
     def __init__(self, header: str) -> None:
         self.header = header
+        self.credential_source = f"header:{header}"
 
     def extract(self, connection: HTTPConnection) -> str | None:
         return connection.headers.get(self.header)
@@ -189,6 +204,8 @@ class AsyncExtractVerifier:
     "present" and every request would be ambiguous. Rejected at construction.
     """
 
+    credential_source = "header:x-async"
+
     async def extract(self, connection: HTTPConnection) -> str | None:
         return connection.headers.get("x-async")
 
@@ -198,6 +215,8 @@ class AsyncExtractVerifier:
 
 class SyncVerifyVerifier:
     """`verify` returns a session rather than an awaitable — the forgotten `async def`."""
+
+    credential_source = "header:x-sync"
 
     def extract(self, connection: HTTPConnection) -> str | None:
         return connection.headers.get("x-sync")
@@ -211,12 +230,36 @@ class SyncVerifyVerifier:
 
 
 class NotAVerifier:
-    """Neither method: the shape a typo or a half-written class produces."""
+    """No members at all: the shape a typo or a half-written class produces."""
+
+
+class BlankSourceVerifier(FakeVerifier):
+    """Declares a whitespace-only `credential_source` — an unset label, dressed up."""
+
+    def __init__(self, header: str) -> None:
+        super().__init__(header, source="   ")
+
+
+class SessionErrorExtractVerifier:
+    """`extract` refuses the credential itself, which is `verify`'s job and not its own."""
+
+    def __init__(self, header: str, error_cls: type[SessionError], reason: str) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}"
+        self.error_cls = error_cls
+        self.reason = reason
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        raise self.error_cls(reason=self.reason)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        raise NotImplementedError
 
 
 class NonCallableVerifier:
-    """Both attributes exist and neither is callable — `isinstance` still says yes."""
+    """Every member exists and neither method is callable — `isinstance` still says yes."""
 
+    credential_source = "header:x-not-callable"
     extract = "not-a-function"
     verify = "not-a-function"
 

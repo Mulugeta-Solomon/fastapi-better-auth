@@ -34,6 +34,8 @@ class Verifier(Protocol):
     its own two halves; nothing else looks inside it:
 
         class HeaderVerifier:
+            credential_source = "header:x-assertion"
+
             def extract(self, connection: HTTPConnection) -> str | None:
                 return connection.headers.get("x-assertion")
 
@@ -42,8 +44,28 @@ class Verifier(Protocol):
 
     The protocol is runtime-checkable, and `BetterAuth` checks every verifier it is handed.
     Be aware of what that check can see: `isinstance` against a runtime-checkable protocol
-    proves the two method *names* exist and nothing about their signatures.
+    proves the member *names* exist, and nothing about their signatures or their
+    callability.
+
+    Attributes:
+        credential_source: A short label naming *where* this verifier's credential comes
+            from - `"header:authorization-bearer"`, `"cookie:better-auth.session_token"`.
+            `BetterAuth` requires a non-empty string and refuses, at construction, to
+            compose two verifiers that declare the same one: they would both find the same
+            credential, so every request carrying it would be `AmbiguousCredentials` - a
+            total authentication outage that startup would otherwise call healthy, and one
+            that comparing verifier *identity* cannot see, because the two are different
+            objects.
+
+            It is an honesty contract, and it is used for exactly two things:
+            build-time collision detection, and naming the verifier in operator-facing
+            reasons and logs. It is **never** consulted at request time and no security
+            decision is ever made from it - a verifier that declares a label it does not
+            read is a verifier that misleads its own operator, not one that can authorize
+            anything. Dispatch keys on what `extract` actually returns.
     """
+
+    credential_source: str
 
     def extract(self, connection: HTTPConnection) -> object | None:
         """Return this verifier's credential from the request, or `None` if it is absent.
@@ -58,6 +80,14 @@ class Verifier(Protocol):
         filesystem, a lock, or the event loop. It also must not raise: a credential that
         is present but malformed is `verify`'s business, and returning it is how it gets
         there.
+
+        That includes `SessionError`. Raising one here is treated as a parser escape and
+        is **not** honoured - it is contained as `InvalidCredential` like any other
+        exception, and its `reason` does not survive into the one the client's request
+        produces. The asymmetry with `verify`, which may raise `SessionError` freely, is
+        deliberate: `extract` decides which verifier *owns* the request, and a method that
+        could also reject it would be deciding validity before dispatch had chosen anyone.
+        Rejection belongs in `verify`.
 
         `HTTPConnection` rather than `Request`, so the same dependency serves WebSocket
         routes. Never derive a value that will be compared during verification - an
@@ -90,9 +120,9 @@ class Verifier(Protocol):
         Every failure is a `SessionError` subclass carrying a `reason` for operators.
         Anything else that escapes - including a `pydantic.ValidationError` from parsing
         the upstream payload - is contained as `InvalidCredential` and logged, so a
-        crafted credential cannot be told apart from any other refusal. Do the containment
-        yourself where you can: catch `ValidationError` around your model parsing and
-        raise `InvalidCredential` with a reason that names the field rather than the value.
+        crafted credential cannot be told apart from any other refusal. That net is a
+        backstop, not the contract: build the user with `parse_user`, which does the
+        containment deliberately and keeps the payload's own values out of the reason.
 
         Args:
             credential: Exactly what this verifier's own `extract` returned.

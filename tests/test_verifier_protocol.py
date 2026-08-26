@@ -16,11 +16,12 @@ import pytest
 from starlette.requests import HTTPConnection
 
 import fastapi_better_auth
-from fastapi_better_auth import Verifier
+from fastapi_better_auth import Session, User, Verifier
 from tests.fakes import (
     AsyncExtractVerifier,
     FailingVerifier,
     FakeVerifier,
+    NonCallableVerifier,
     NotAVerifier,
     SyncVerifyVerifier,
 )
@@ -43,6 +44,42 @@ def test_a_conforming_fake_is_recognized_at_runtime() -> None:
 )
 def test_a_non_conforming_object_is_not_a_verifier(candidate: Any) -> None:
     assert not isinstance(candidate, Verifier)
+
+
+def test_the_protocol_declares_a_credential_source() -> None:
+    """A label naming where the credential comes from, so two verifiers racing on one
+    source are caught at construction rather than by every request being ambiguous."""
+    hints = get_type_hints(Verifier)
+
+    assert hints["credential_source"] is str
+
+
+def test_a_verifier_without_a_credential_source_is_not_a_verifier() -> None:
+    class Sourceless:
+        def extract(self, connection: HTTPConnection) -> str | None:
+            return None
+
+        async def verify(self, credential: Any, user_model: type[User]) -> Session[User]:
+            raise NotImplementedError
+
+    assert not isinstance(Sourceless(), Verifier)
+
+
+def test_the_credential_source_is_documented_as_diagnostics_only() -> None:
+    """An honesty contract, not a control: a verifier that lies about its label must not
+    be able to reach anything a request-time decision keys on."""
+    doc = Verifier.__doc__ or ""
+
+    assert "credential_source" in doc
+    assert "never" in doc.lower()
+
+
+def test_the_extract_docstring_states_that_a_session_error_is_not_honoured() -> None:
+    """The asymmetry with `verify` is deliberate and has to be written down: `extract`
+    decides ownership, not validity, so a refusal raised there is a parser escape."""
+    doc = Verifier.extract.__doc__ or ""
+
+    assert "SessionError" in doc
 
 
 def test_the_protocol_cannot_be_instantiated() -> None:
@@ -68,8 +105,10 @@ def test_extract_takes_a_connection_not_a_request() -> None:
     assert hints["connection"] is HTTPConnection
 
 
-def test_runtime_conformance_only_proves_the_methods_exist() -> None:
+def test_runtime_conformance_only_proves_the_members_exist() -> None:
     """A trap, asserted so it cannot be forgotten: `isinstance` against a runtime-checkable
-    Protocol checks names, not signatures. Both of these pass it and neither works."""
+    Protocol checks names, not signatures and not callability. All three pass it and none
+    of them works."""
     assert isinstance(AsyncExtractVerifier(), Verifier)
     assert isinstance(SyncVerifyVerifier(), Verifier)
+    assert isinstance(NonCallableVerifier(), Verifier)

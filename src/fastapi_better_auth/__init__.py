@@ -22,6 +22,8 @@ from ._internal.errors import (
     SessionRevoked,
 )
 from ._internal.models import Session, User, UserT
+from ._internal.parsing import parse_user
+from ._internal.urls import normalize_base_url
 from ._internal.verifiers import Verifier
 
 __all__ = [
@@ -41,6 +43,8 @@ __all__ = [
     "User",
     "UserT",
     "Verifier",
+    "normalize_base_url",
+    "parse_user",
 ]
 
 __version__ = "0.0.1"
