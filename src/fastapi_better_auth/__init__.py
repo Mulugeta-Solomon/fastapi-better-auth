@@ -21,8 +21,16 @@ from ._internal.errors import (
     SessionExpired,
     SessionRevoked,
 )
+from ._internal.httpx_transports import Httpx2Transport, HttpxTransport
 from ._internal.models import Session, User, UserT
 from ._internal.parsing import parse_user
+from ._internal.transport import (
+    ContentEncodingRejected,
+    ResponseTooLarge,
+    Transport,
+    TransportResponse,
+    UntrustedResponse,
+)
 from ._internal.urls import normalize_base_url
 from ._internal.verifiers import Verifier
 
@@ -33,13 +41,20 @@ __all__ = [
     "BetterAuth",
     "BetterAuthError",
     "ConfigurationError",
+    "ContentEncodingRejected",
     "CsrfFailure",
+    "Httpx2Transport",
+    "HttpxTransport",
     "InvalidCredential",
     "MissingCredential",
+    "ResponseTooLarge",
     "Session",
     "SessionError",
     "SessionExpired",
     "SessionRevoked",
+    "Transport",
+    "TransportResponse",
+    "UntrustedResponse",
     "User",
     "UserT",
     "Verifier",
