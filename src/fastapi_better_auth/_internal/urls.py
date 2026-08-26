@@ -163,9 +163,18 @@ def ip_literal(raw: str, field: str) -> ipaddress.IPv4Address | ipaddress.IPv6Ad
     if "%" in raw:
         raise ConfigurationError(unusable)
     try:
-        return ipaddress.ip_address(raw)
+        address = ipaddress.ip_address(raw)
     except ValueError:
         raise ConfigurationError(unusable) from None
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        raise ConfigurationError(
+            f"{field} must not use an IPv4-mapped IPv6 host: CPython renders it - and"
+            " answers is_loopback for it - differently before and after 3.13, so the"
+            " canonical origin would change under a Python upgrade and stop matching the"
+            f" issuer it is compared against. Pass 'https://{mapped}' instead."
+        )
+    return address
 
 
 def _port(split: SplitResult, scheme: str, field: str) -> str:

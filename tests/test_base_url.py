@@ -31,7 +31,6 @@ CANONICAL: tuple[tuple[str, str], ...] = (
     ("  https://auth.example.com  ", "https://auth.example.com"),
     ("https://auth.example.com.", "https://auth.example.com"),
     ("https://[0:0:0:0:0:0:0:1]", "https://[::1]"),
-    ("https://[::FFFF:127.0.0.1]", "https://[::ffff:127.0.0.1]"),
     ("https://Keys.example.com", "https://keys.example.com"),
 )
 
@@ -67,6 +66,8 @@ REJECTED: tuple[tuple[str, str, str], ...] = (
     ("trailing-hyphen-label", "https://auth-.example.com", "host"),
     ("underscore-label", "https://auth_server.example.com", "host"),
     ("ipv6-zone-id", "https://[fe80::1%25eth0]", "host"),
+    ("ipv4-mapped-ipv6", "https://[::ffff:127.0.0.1]", "IPv4-mapped"),
+    ("ipv4-mapped-cleartext", "http://[::FFFF:10.0.0.5]", "IPv4-mapped"),
     ("port-zero", "https://auth.example.com:0", "port"),
     ("cleartext-public-host", "http://auth.example.com", "https"),
     ("cleartext-private-ip", "http://10.0.0.5:3000", "https"),
@@ -163,6 +164,17 @@ def test_a_url_python_itself_refuses_to_parse_is_a_configuration_error(raw: str)
     """`urlsplit` defers its port parsing, so the failure surfaces on attribute access."""
     with pytest.raises(ConfigurationError):
         normalize_base_url(raw)
+
+
+def test_an_ipv4_mapped_host_is_refused_because_python_renders_it_two_ways() -> None:
+    """`IPv6Address('::ffff:127.0.0.1')` compresses to `::ffff:7f00:1` before CPython 3.13
+    and `::ffff:127.0.0.1` after, and `is_loopback` flips with it. Either would make the
+    canonical origin - the string an `iss` claim is compared against - depend on the
+    interpreter, and would move the cleartext exemption under a Python upgrade."""
+    with pytest.raises(ConfigurationError) as caught:
+        normalize_base_url("https://[::ffff:127.0.0.1]")
+
+    assert "127.0.0.1" in str(caught.value)
 
 
 def test_a_bracketed_host_that_is_not_an_address_is_rejected() -> None:
