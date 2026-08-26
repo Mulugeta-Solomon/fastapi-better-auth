@@ -62,6 +62,23 @@ jobs:
       - name: Test (unit lane)
         run: uv run pytest -q
 
+  floors:
+    # Every other lane installs the lockfile, which pins the newest compatible versions,
+    # so the declared floors are never actually exercised. This lane installs them.
+    name: unit (declared floors, py3.10)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.10"
+      - name: Resolve every direct dependency to its declared floor
+        run: uv lock --resolution lowest-direct
+      - name: Sync (dev group)
+        run: uv sync --frozen
+      - name: Test (unit lane)
+        run: uv run --frozen pytest -q
+
   prerelease:
     # Advisory only: a red here never blocks a merge. uv resolves "3.15" to the newest
     # 3.15 pre-release because no stable 3.15 exists yet.
