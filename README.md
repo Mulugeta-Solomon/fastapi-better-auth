@@ -27,6 +27,7 @@ All three behind one FastAPI-native surface:
 auth = BetterAuth(verifiers=[JwtVerifier(base_url="https://auth.example.com")])
 CurrentSession = Annotated[Session[MyUser], Depends(auth.current_session(user_model=MyUser))]
 
+
 @app.get("/me")
 async def me(session: CurrentSession) -> MyUser:
     return session.user
