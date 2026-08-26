@@ -8,12 +8,13 @@ import hmac
 import json
 import pathlib
 import urllib.parse
+from typing import Any
 
 import pytest
 
 VECTOR_DIR = pathlib.Path(__file__).parent / "vectors"
-COOKIE_DOC = json.loads((VECTOR_DIR / "cookie_v1.json").read_text())
-JWT_DOC = json.loads((VECTOR_DIR / "jwt_v1.json").read_text())
+COOKIE_DOC: dict[str, Any] = json.loads((VECTOR_DIR / "cookie_v1.json").read_text())
+JWT_DOC: dict[str, Any] = json.loads((VECTOR_DIR / "jwt_v1.json").read_text())
 
 
 def reference_verify(cookie_value: str, secret: bytes) -> bool:
@@ -31,13 +32,13 @@ def reference_verify(cookie_value: str, secret: bytes) -> bool:
 
 
 @pytest.mark.parametrize("vector", COOKIE_DOC["vectors"], ids=lambda v: v["name"])
-def test_cookie_vector_matches_expectation(vector):
-    secret = COOKIE_DOC["secret"].encode()
+def test_cookie_vector_matches_expectation(vector: dict[str, str]) -> None:
+    secret: bytes = COOKIE_DOC["secret"].encode()
     outcome = reference_verify(vector["cookie_value"], secret)
     assert outcome is (vector["expect"] == "signature_valid")
 
 
-def test_captured_vector_is_live_not_synthesized():
+def test_captured_vector_is_live_not_synthesized() -> None:
     captured = [v for v in COOKIE_DOC["vectors"] if v["name"] == "captured-valid"]
     assert len(captured) == 1
     token = urllib.parse.unquote(captured[0]["cookie_value"]).rpartition(".")[0]
@@ -45,7 +46,7 @@ def test_captured_vector_is_live_not_synthesized():
     assert token.isalnum()
 
 
-def test_jwt_vector_structure():
+def test_jwt_vector_structure() -> None:
     assert JWT_DOC["header"]["alg"] == "EdDSA"
     kids = {k["kid"] for k in JWT_DOC["jwks"]["keys"]}
     assert JWT_DOC["header"]["kid"] in kids
