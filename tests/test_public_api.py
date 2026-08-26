@@ -11,17 +11,21 @@ import fastapi_better_auth
 
 EXPECTED = (
     "BEARER_CHALLENGE",
+    "AmbiguousCredentials",
     "AuthServiceUnavailable",
+    "BetterAuth",
     "BetterAuthError",
     "ConfigurationError",
     "CsrfFailure",
     "InvalidCredential",
+    "MissingCredential",
     "Session",
     "SessionError",
     "SessionExpired",
     "SessionRevoked",
     "User",
     "UserT",
+    "Verifier",
 )
 NON_CLASS_EXPORTS = frozenset({"BEARER_CHALLENGE", "UserT"})
 RESPONSE_CLASSVARS = ("response_status", "response_detail", "response_headers")

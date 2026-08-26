@@ -21,26 +21,40 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.testclient import TestClient
 
 from fastapi_better_auth import (
+    AmbiguousCredentials,
     AuthServiceUnavailable,
+    BetterAuth,
     CsrfFailure,
     InvalidCredential,
+    MissingCredential,
     SessionError,
     SessionExpired,
     SessionRevoked,
 )
+from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, session_app
 
 UNAUTHENTICATED_CASES: tuple[tuple[str, type[SessionError], str], ...] = (
     ("invalid", InvalidCredential, "signature mismatch kid=iRAEH8dY tok_fp=9f3ab21c"),
     ("expired", SessionExpired, "expiry 1787241849 elapsed sid_fp=7c1de90f"),
     ("revoked", SessionRevoked, "revocation absent upstream sid_fp=3ba57ce1"),
     ("unavailable", AuthServiceUnavailable, "jwks fetch failed https://auth.internal.example"),
+    ("missing", MissingCredential, "no credential presented JwtVerifier CookieVerifier"),
 )
 CSRF_CASE: tuple[str, type[SessionError], str] = (
     "csrf",
     CsrfFailure,
     "origin https://evil.example rejected allowlist",
 )
-ALL_CASES = (*UNAUTHENTICATED_CASES, CSRF_CASE)
+AMBIGUOUS_CASE: tuple[str, type[SessionError], str] = (
+    "ambiguous",
+    AmbiguousCredentials,
+    "2 credentials presented JwtVerifier CookieVerifier",
+)
+ALL_CASES = (*UNAUTHENTICATED_CASES, CSRF_CASE, AMBIGUOUS_CASE)
+
+PAYLOAD_MARKER = "mallory-9f3ab21c"
+MALFORMED_PAYLOAD = {"id": "u1", "image": f"https://cdn.example/{PAYLOAD_MARKER}/{'x' * 5000}"}
+CREDENTIAL_HEADER = "x-cred-a"
 BODY_LEAK_REASON = "signature mismatch kid=iRAEH8dY tok_fp=9f3ab21c"
 HEADER_LEAK_REASON = "revocation absent upstream sid_fp=3ba57ce1"
 
@@ -153,7 +167,7 @@ def test_no_response_carries_any_fragment_of_its_reason(
         for path, _error_cls, reason in ALL_CASES:
             response = client.get(f"/{path}")
 
-            assert response.status_code in (401, 403), f"/{path} never reached its handler"
+            assert response.status_code in (400, 401, 403), f"/{path} never reached its handler"
             assert leaked_fragments(reason, response) == (), f"/{path} leaked its reason"
 
 
@@ -181,6 +195,50 @@ def test_csrf_failure_is_a_403_with_no_challenge(app_and_observed: AppAndObserve
     assert response.status_code == 403
     assert response.json() == {"detail": "Forbidden"}
     assert "www-authenticate" not in response.headers
+
+
+def test_ambiguous_credentials_is_a_400_with_no_challenge(
+    app_and_observed: AppAndObserved,
+) -> None:
+    """400 is about the request *shape*: the client already knows it sent two credentials,
+    so saying so creates no oracle — and there is nothing to re-authenticate."""
+    app, _ = app_and_observed
+    with TestClient(app) as client:
+        response = client.get(f"/{AMBIGUOUS_CASE[0]}")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Ambiguous request"}
+    assert "www-authenticate" not in response.headers
+
+
+def test_a_missing_credential_is_byte_identical_to_a_forged_one(
+    app_and_observed: AppAndObserved,
+) -> None:
+    """Anonymous traffic must not be separable from an attack by anything on the wire."""
+    app, _ = app_and_observed
+    with TestClient(app) as client:
+        missing = client.get("/missing")
+        forged = client.get("/invalid")
+
+    assert missing.status_code == forged.status_code
+    assert missing.content == forged.content
+    assert comparable_headers(missing) == comparable_headers(forged)
+
+
+def test_a_malformed_upstream_payload_answers_the_uniform_401() -> None:
+    """The containment contract, driven through a real dependency: a `ValidationError`
+    that escaped would be a 500 - a wire-distinguishable signal that echoes the payload."""
+    verifier = FakeVerifier(CREDENTIAL_HEADER, payload=MALFORMED_PAYLOAD)
+    auth = BetterAuth(verifiers=[verifier])
+    with TestClient(session_app(auth)) as client:
+        response = client.get("/required", headers={CREDENTIAL_HEADER: GOOD_CREDENTIAL})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Not authenticated"}
+    assert response.headers["www-authenticate"] == "Bearer"
+    blob = observable_text(response)
+    for needle in (PAYLOAD_MARKER, "xxxx", "validation", "string_too_long", "image"):
+        assert needle not in blob, f"the malformed payload leaked {needle!r}"
 
 
 def test_the_operator_side_still_sees_every_reason() -> None:

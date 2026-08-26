@@ -12,6 +12,7 @@ BEARER_CHALLENGE: Mapping[str, str] = MappingProxyType({"WWW-Authenticate": "Bea
 
 SANCTIONED_RESPONSES: Mapping[int, tuple[str, Mapping[str, str] | None]] = MappingProxyType(
     {
+        400: ("Ambiguous request", None),
         401: ("Not authenticated", BEARER_CHALLENGE),
         403: ("Forbidden", None),
     }
@@ -64,8 +65,8 @@ class SessionError(HTTPException):
     To add a failure of your own, subclass and override the three response constants -
     `response_status`, `response_detail` and `response_headers`. They are the whole
     extension mechanism, and they are validated when the subclass is created: a status
-    outside {401, 403}, a non-uniform detail, or headers that are not `BEARER_CHALLENGE`
-    (401) / `None` (403) raises `TypeError` at class-creation time. Setting `status_code`,
+    outside {400, 401, 403}, a non-uniform detail, or headers that are not
+    `BEARER_CHALLENGE` (401) / `None` (400, 403) raises `TypeError`. Setting `status_code`,
     `detail` or `headers` directly in a class body raises for the same reason - those are
     instance attributes, so they would silently win at runtime and ship the wrong shape.
 
@@ -155,6 +156,19 @@ class AuthServiceUnavailable(SessionError):
     """
 
 
+class MissingCredential(SessionError):
+    """No credential was presented at all.
+
+    A separate class so operators can tell anonymous traffic apart from attacks in logs
+    and metrics. On the wire it is byte-identical to every other 401: "you sent nothing"
+    and "you sent something forged" must not be distinguishable, or an endpoint becomes a
+    detector for which credentials this deployment accepts.
+
+    Raised by `current_session` when no verifier found a credential on the request.
+    `optional_session` answers that same situation with `None` instead.
+    """
+
+
 class CsrfFailure(SessionError):
     """A cookie-authenticated request failed its cross-site request forgery check.
 
@@ -165,4 +179,25 @@ class CsrfFailure(SessionError):
 
     response_status: ClassVar[int] = 403
     response_detail: ClassVar[str] = "Forbidden"
+    response_headers: ClassVar[Mapping[str, str] | None] = None
+
+
+class AmbiguousCredentials(SessionError):
+    """Two or more credentials arrived on one request.
+
+    400, not 401: what is wrong is the shape of the request, not the identity behind it.
+    The client already knows it sent two credentials, so being told so teaches it nothing
+    it could not have worked out - no oracle is created - and there is nothing for it to
+    re-authenticate, so it gets no `WWW-Authenticate` challenge either.
+
+    It is still a `SessionError`, so `except SessionError` remains "every request-time
+    failure this library raises".
+
+    Raised before any verification happens. Picking one of the two credentials to verify
+    would let a client choose which verifier answers, and trying both in turn is the
+    fallthrough this library refuses to do.
+    """
+
+    response_status: ClassVar[int] = 400
+    response_detail: ClassVar[str] = "Ambiguous request"
     response_headers: ClassVar[Mapping[str, str] | None] = None

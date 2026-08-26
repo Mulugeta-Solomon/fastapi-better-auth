@@ -68,6 +68,12 @@ markers = [
 [tool.ruff]
 line-length = 100
 
+[tool.ruff.lint.flake8-bugbear]
+# `Depends(...)` in a parameter default is how FastAPI declares a dependency; the object
+# is inert and per-request state lives in the resolver, so B008's mutable-default hazard
+# does not apply. Only the marker itself is exempted, never the callables passed to it.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Security"]
+
 [tool.pyright]
 include = ["src", "tests"]
 typeCheckingMode = "strict"
