@@ -21,7 +21,7 @@ from .urls import normalize_base_url
 
 UserModelT = TypeVar("UserModelT", bound=User)
 
-CREDENTIAL_SOURCE = "authorization-bearer"
+CREDENTIAL_SOURCE = "header:authorization-bearer"
 DEFAULT_ALGORITHMS: tuple[str, ...] = ("EdDSA",)
 REQUIRED_CLAIMS: tuple[str, ...] = ("exp", "iat", "iss", "aud", "sub")
 SCHEME = "bearer"
@@ -221,13 +221,23 @@ class JwtVerifier:
 
 
 def _checked_shape(credential: object) -> str:
-    """The cheap refusals, before a parser sees anything: a marker for the reasons, or a no."""
+    """The cheap refusals, before a parser sees anything: a marker for the reasons, or a no.
+
+    Every path drops the credential from its own frame before raising: a reporter that
+    captures frame locals would otherwise lift the raw token straight out of this frame's
+    traceback (D-018/D-094), the channel the deep-path helpers already close.
+    """
     if not isinstance(credential, str) or not credential:
-        raise InvalidCredential(reason=f"credential is not a token: {type(credential).__name__}")
+        kind = type(credential).__name__
+        credential = ""
+        raise InvalidCredential(reason=f"credential is not a token: {kind}")
     marker = fingerprint(credential)
-    if len(credential) > MAX_TOKEN_BYTES:
-        raise InvalidCredential(reason=f"token is {len(credential)} bytes, over the cap {marker}")
-    if credential.count(".") != DOT_SEPARATORS:
+    length = len(credential)
+    separators = credential.count(".")
+    credential = ""
+    if length > MAX_TOKEN_BYTES:
+        raise InvalidCredential(reason=f"token is {length} bytes, over the cap {marker}")
+    if separators != DOT_SEPARATORS:
         raise InvalidCredential(reason=f"token is not three dot-separated segments {marker}")
     return marker
 
@@ -302,6 +312,8 @@ def _check_lifetime(claims: Mapping[str, Any], ceiling: float, marker: str) -> N
     if issued is None or expires is None:
         raise InvalidCredential(reason=f"iat or exp is not a number {marker}")
     lifetime = expires - issued
+    if lifetime <= 0:
+        raise InvalidCredential(reason=f"token lifetime {lifetime:.0f}s is not positive {marker}")
     if lifetime > ceiling:
         raise InvalidCredential(
             reason=f"token lifetime {lifetime:.0f}s exceeds the {ceiling:.0f}s ceiling {marker}"

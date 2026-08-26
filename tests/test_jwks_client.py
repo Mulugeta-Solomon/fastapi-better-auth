@@ -352,10 +352,11 @@ async def test_concurrent_misses_coalesce_behind_one_fetch() -> None:
 
 
 @pytest.mark.anyio
-async def test_an_unknown_kid_is_remembered_and_not_fetched_for_again() -> None:
-    """Without this, a kid nobody has ever published costs one upstream fetch per request."""
+async def test_an_unknown_kid_is_not_refetched_for_inside_the_window() -> None:
+    """Within the refetch window, a kid nobody has published is refused without a second
+    upstream call - otherwise it would cost one fetch per request."""
     clock = Clock()
-    keys, transport = client(json_reply(KEY_SET), clock=clock, refetch_interval=0.0)
+    keys, transport = client(json_reply(KEY_SET), clock=clock)
 
     assert await keys.key_for("never-published") is None
     assert await keys.key_for("never-published") is None
@@ -363,16 +364,69 @@ async def test_an_unknown_kid_is_remembered_and_not_fetched_for_again() -> None:
 
 
 @pytest.mark.anyio
-async def test_a_remembered_kid_is_looked_for_again_once_its_ttl_has_passed() -> None:
+async def test_a_kid_cached_as_absent_is_rechecked_at_the_window_not_the_negative_ttl() -> None:
+    """B2: a kid a fetch did not contain is cached as absent - but a rotation routinely lands
+    the first token bearing a new kid before this process has fetched the rotation. The
+    re-check has to open with the 10s refetch window, not stay shut for the 60s negative TTL,
+    or every real rotation refuses valid tokens six times longer than advertised.
+
+    RED before the reorder: at t=11 the negative cache short-circuits and returns None for a
+    kid that is now published, for the full 60s.
+    """
     clock = Clock()
     keys, transport = client(
-        json_reply(KEY_SET), clock=clock, refetch_interval=0.0, negative_ttl=60.0
+        json_reply(KEY_SET),  # t=0: the rotated kid is not published yet
+        json_reply(key_set(SIGNER, ROTATED)),  # by t=11 it is
+        clock=clock,
+        negative_ttl=60.0,
     )
 
-    assert await keys.key_for(ROTATED.kid) is None
-    clock.advance(61)
-    assert await keys.key_for(ROTATED.kid) is None
+    assert await keys.key_for(ROTATED.kid) is None  # cached as absent
+    clock.advance(11)  # past the 10s window, far under the 60s TTL
+
+    assert await keys.key_for(ROTATED.kid) is not None
     assert transport.calls == 2
+
+
+@pytest.mark.anyio
+async def test_the_flood_defense_survives_the_window_winning_over_the_negative_cache() -> None:
+    """The other side of B2's reorder: letting the window override the negative cache must
+    not reopen the flood. Distinct unknown kids inside one window still cost a single fetch."""
+    clock = Clock()
+    keys, transport = client(json_reply(KEY_SET), clock=clock, negative_ttl=60.0)
+
+    assert await keys.key_for(ROTATED.kid) is None
+    for index in range(50):
+        assert await keys.key_for(f"flood-{index}") is None
+    assert await keys.key_for(ROTATED.kid) is None
+
+    assert transport.calls == 1
+
+
+@pytest.mark.anyio
+async def test_a_confirmed_absent_verdict_does_not_outlive_its_ttl_into_a_stale_key_set() -> None:
+    """A kid confirmed absent by a fresh fetch may answer None while that verdict is young.
+    Once it is older than negative_ttl AND the key set has gone stale, the verdict expires and
+    the honest answer becomes AuthServiceUnavailable (D-083): the kid can no longer be told
+    apart from one freshly rotated in. A long refetch window keeps a fetch from papering over
+    the transition, so the expiry is what is under test."""
+    clock = Clock()
+    keys, _transport = client(
+        json_reply(KEY_SET),
+        clock=clock,
+        cache_ttl=60.0,
+        negative_ttl=30.0,
+        refetch_interval=1000.0,
+    )
+
+    assert await keys.key_for("gone") is None  # confirmed absent, verdict fresh, keys fresh
+    clock.advance(20)
+    assert await keys.key_for("gone") is None  # still inside negative_ttl and cache_ttl
+    clock.advance(50)  # now past BOTH negative_ttl and cache_ttl, window still shut
+
+    with pytest.raises(AuthServiceUnavailable):
+        await keys.key_for("gone")
+    assert keys.remembered == 0  # the expired verdict was dropped, not re-served as None
 
 
 @pytest.mark.anyio

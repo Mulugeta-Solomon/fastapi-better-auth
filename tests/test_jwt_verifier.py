@@ -102,7 +102,7 @@ def test_it_is_a_verifier() -> None:
     checked: Verifier = JwtVerifier(base_url=ORIGIN, transport=ScriptedTransport(Reply(b"{}")))
 
     assert isinstance(checked, Verifier)
-    assert checked.credential_source == "authorization-bearer"
+    assert checked.credential_source == "header:authorization-bearer"
     assert not inspect.iscoroutinefunction(checked.extract)
 
 
@@ -681,6 +681,33 @@ async def test_a_lifetime_exactly_at_the_ceiling_is_accepted() -> None:
 
 
 @pytest.mark.anyio
+async def test_a_token_whose_lifetime_is_negative_is_refused_even_within_leeway() -> None:
+    """B3: `iat` after `exp` is a malformed lifetime the ceiling — which only checks the
+    *upper* bound — used to wave through. Inert at leeway=0, because PyJWT's own
+    iat<=now<=exp forbids it; live the moment an operator opts into leeway, where a token
+    signed by a trusted key can carry iat 20s past exp and still be neither expired nor
+    immature."""
+    verifier, _transport = build(leeway=60)
+    now = int(time.time())
+    token = SIGNER.sign(claims(issued_at=now + 10, lifetime=-20))
+
+    with pytest.raises(InvalidCredential):
+        await verifier.verify(token, User)
+
+
+@pytest.mark.anyio
+async def test_a_token_with_a_zero_lifetime_is_refused() -> None:
+    """`exp == iat` is the boundary of the same defect: a lifetime of nothing is not a
+    lifetime, and the ceiling's `>` would let it through."""
+    verifier, _transport = build(leeway=60)
+    now = int(time.time())
+    token = SIGNER.sign(claims(issued_at=now, lifetime=0))
+
+    with pytest.raises(InvalidCredential):
+        await verifier.verify(token, User)
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("lifetime", "accepted"), [(930, True), (931, False)], ids=["at-the-ceiling", "over"]
 )
@@ -869,21 +896,47 @@ async def test_every_refusal_still_tells_an_operator_something() -> None:
     assert all(reason.strip() for reason in reasons)
 
 
+LEAK_MARKER = "leaky-credential-9f3ab21c"
+
+
 @pytest.mark.anyio
-async def test_no_raw_credential_survives_in_a_library_frame() -> None:
+@pytest.mark.parametrize(
+    ("credential", "needle"),
+    [
+        (LEAK_MARKER + "x" * 9000, LEAK_MARKER),
+        (LEAK_MARKER + "-carries-no-dots", LEAK_MARKER),
+        ((LEAK_MARKER + "-in-bytes").encode(), LEAK_MARKER),
+        (None, None),
+    ],
+    ids=["over-cap", "wrong-dots", "not-a-string", "deep-path"],
+)
+async def test_no_raw_credential_survives_in_a_library_frame(
+    credential: object, needle: str | None
+) -> None:
     """The frame-locals channel, which the reason rules do not cover: a reporter captures
-    every frame in the traceback, and this library's frames are the ones it blames us for."""
+    every frame in the traceback, and this library's frames are the ones it blames us for.
+
+    B1 reopened it on the three *early* refusals — over the size cap, wrong dot count, not a
+    string at all — whose own frame held the raw credential while the deep path (a wrong-key
+    token) had already been scrubbed. Every shape is driven here, and each must fail before
+    the fix.
+    """
     verifier, _transport = build()
-    token = OTHER.sign(claims())
+    if credential is None:
+        credential = OTHER.sign(claims())  # the deep path: passes the shape checks, fails at decode
 
     with pytest.raises(SessionError) as caught:
-        await verifier.verify(token, User)
+        await verifier.verify(credential, User)  # pyright: ignore[reportArgumentType]
 
     rendered = " ".join(repr(frame.f_locals) for frame in _library_frames(caught.value))
 
     assert rendered, "no library frame was captured; retune this probe"
-    assert token not in rendered
-    assert token.split(".")[2] not in rendered
+    if needle is not None:
+        assert needle not in rendered
+        return
+    assert isinstance(credential, str)
+    assert credential not in rendered
+    assert credential.split(".")[2] not in rendered
 
 
 def _library_frames(error: BaseException) -> list[Any]:

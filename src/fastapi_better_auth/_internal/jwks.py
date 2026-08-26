@@ -151,10 +151,13 @@ class JwksClient:
             hit = self._fresh_hit(kid)
             if hit is not None:
                 return hit
-            if self._is_remembered(kid):
-                return None
+            # The window wins over the negative cache (D-095): once it opens, a cached-absent
+            # kid is re-fetched (a rotation resolves in refetch_interval, not negative_ttl);
+            # inside the window the negative cache still short-circuits, so a flood is bounded.
             if self._may_fetch():
                 await self._refresh()
+            elif self._is_remembered(kid):
+                return None
             return self._answer(kid)
 
     def _fresh_hit(self, kid: str) -> Jwk | None:

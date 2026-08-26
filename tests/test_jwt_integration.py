@@ -117,7 +117,7 @@ def test_two_bearer_verifiers_are_refused_at_construction() -> None:
             ]
         )
 
-    assert "authorization-bearer" in str(caught.value)
+    assert "header:authorization-bearer" in str(caught.value)
 
 
 def test_the_user_model_the_application_asked_for_is_the_one_it_gets(
