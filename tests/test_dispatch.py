@@ -8,20 +8,27 @@ are refused before anything is verified, and none is an absence rather than a fa
 
 from __future__ import annotations
 
+import gc
+import warnings
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
+from fastapi import Request, Response
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.testclient import TestClient
 
 from fastapi_better_auth import (
     AmbiguousCredentials,
     BetterAuth,
     ConfigurationError,
+    CsrfFailure,
     InvalidCredential,
     MissingCredential,
     Session,
+    SessionError,
     SessionExpired,
+    SessionRevoked,
     User,
 )
 from tests.fakes import (
@@ -32,15 +39,21 @@ from tests.fakes import (
     BrokenConfigVerifier,
     FailingVerifier,
     FakeVerifier,
+    MultiFailureTaskGroupVerifier,
     NonCallableVerifier,
     NotAVerifier,
     NullVerifier,
     RaisingExtractVerifier,
+    RaisingInstanceVerifier,
     RaisingVerifyVerifier,
     SessionErrorExtractVerifier,
+    SyncPrologueVerifier,
     SyncVerifyVerifier,
+    TaskGroupVerifier,
     TracedVerifier,
+    WrappedAsyncExtractVerifier,
     WrongModelVerifier,
+    client,
     connection,
     resolver_of,
     session_app,
@@ -113,6 +126,179 @@ def test_a_verify_wrapped_by_a_plain_decorator_is_accepted() -> None:
     auth = BetterAuth(verifiers=[TracedVerifier(HEADER_A)])
 
     assert auth.verifiers
+
+
+def test_a_verify_wrapped_by_a_plain_decorator_actually_serves_a_request() -> None:
+    """Constructing one proves nothing: the blessed shape has to be driven end to end, or
+    the containment around it is never exercised by any test."""
+    verifier = TracedVerifier(HEADER_A)
+    auth = BetterAuth(verifiers=[verifier])
+    with TestClient(session_app(auth)) as http:
+        response = http.get("/required", headers={HEADER_A: GOOD_CREDENTIAL})
+
+    assert response.status_code == 200
+    assert response.json() == {"id": "u1", "model": "User"}
+    assert verifier.verify_calls == 1
+
+
+@pytest.mark.parametrize("path", ["/required", "/optional"])
+def test_the_sync_prologue_of_a_plain_callable_verify_is_contained(path: str) -> None:
+    """B1: a plain-callable `verify` does its argument checks, its decorator work and any
+    parsing BEFORE it hands back a coroutine. None of that is inside an `await`, so a
+    containment wrapping only the `await` leaves an input-dependent 500 on a live route."""
+    auth = BetterAuth(verifiers=[SyncPrologueVerifier(HEADER_A)])
+    with TestClient(session_app(auth), raise_server_exceptions=False) as http:
+        response = http.get(path, headers={HEADER_A: BAD_CREDENTIAL})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Not authenticated"}
+    assert BAD_CREDENTIAL not in response.text
+
+
+@pytest.mark.anyio
+async def test_the_sync_prologue_escape_names_only_its_type() -> None:
+    auth = BetterAuth(verifiers=[SyncPrologueVerifier(HEADER_A)])
+
+    with pytest.raises(InvalidCredential) as caught:
+        await resolve_for(auth)(connection(**{HEADER_A: BAD_CREDENTIAL}))
+
+    assert "RuntimeError" in caught.value.reason
+    assert BAD_CREDENTIAL not in caught.value.reason
+
+
+# --- B2: extract's answer is checked at the call, not only its declaration ------------
+
+
+def test_a_wrapped_async_extract_is_refused_at_the_request() -> None:
+    """`functools.wraps` defeats `iscoroutinefunction` - the same predicate failure D-054
+    proved for `verify`. Unchecked, this verifier's coroutine answer is never `None`, so it
+    claims every request: anonymous traffic 401s, and a valid credential belonging to
+    another verifier becomes an Ambiguous 400."""
+    auth = BetterAuth(verifiers=[WrappedAsyncExtractVerifier(HEADER_A)])
+    with TestClient(session_app(auth), raise_server_exceptions=False) as http:
+        response = http.get("/optional")
+
+    assert response.status_code == 500
+
+
+@pytest.mark.anyio
+async def test_an_awaitable_credential_is_a_configuration_fault() -> None:
+    auth = BetterAuth(verifiers=[WrappedAsyncExtractVerifier(HEADER_A)])
+
+    with pytest.raises(ConfigurationError) as caught:
+        await resolve_for(auth)(connection())
+
+    assert "WrappedAsyncExtractVerifier" in str(caught.value)
+    assert "extract" in str(caught.value)
+
+
+@pytest.mark.anyio
+async def test_a_rejected_coroutine_credential_leaves_no_un_awaited_warning() -> None:
+    """One leaked coroutine per request is a resource bug, and under `filterwarnings=error`
+    it is a failure that lands in whichever unlucky test the collector runs inside."""
+    auth = BetterAuth(verifiers=[WrappedAsyncExtractVerifier(HEADER_A)])
+
+    with pytest.raises(ConfigurationError):
+        await resolve_for(auth)(connection())
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        gc.collect()
+
+
+@pytest.mark.anyio
+async def test_a_wrapped_async_extract_never_claims_another_verifiers_request() -> None:
+    auth = BetterAuth(verifiers=[WrappedAsyncExtractVerifier(HEADER_A), FakeVerifier(HEADER_B)])
+
+    with pytest.raises(ConfigurationError):
+        await resolve_for(auth)(connection(**{HEADER_B: GOOD_CREDENTIAL}))
+
+
+# --- B3: a refusal raised inside a task group is still that refusal -------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error_cls", "status"), [(SessionExpired, 401), (CsrfFailure, 403)], ids=["expired", "csrf"]
+)
+async def test_a_refusal_raised_inside_a_task_group_keeps_its_own_class(
+    error_cls: type[SessionError], status: int
+) -> None:
+    """anyio wraps a child's exception in a `BaseExceptionGroup`, and an all-`Exception`
+    group IS an `Exception` - so an unwrapping-blind containment rewrites a deliberate
+    `CsrfFailure` (403, no challenge) into a 401 WITH a challenge."""
+    auth = BetterAuth(verifiers=[TaskGroupVerifier(HEADER_A, error_cls, "refused in a child")])
+
+    with pytest.raises(error_cls) as caught:
+        await resolve_for(auth)(connection(**{HEADER_A: GOOD_CREDENTIAL}))
+
+    assert caught.value.status_code == status
+    assert caught.value.reason == "refused in a child"
+
+
+@pytest.mark.parametrize(
+    ("error_cls", "status", "challenge"),
+    [(SessionExpired, 401, True), (CsrfFailure, 403, False)],
+    ids=["expired", "csrf"],
+)
+def test_a_task_group_refusal_keeps_its_wire_shape(
+    error_cls: type[SessionError], status: int, challenge: bool, client_backend: str
+) -> None:
+    """The oracle cannot see this one: it never raises through a task group."""
+    auth = BetterAuth(verifiers=[TaskGroupVerifier(HEADER_A, error_cls, "refused in a child")])
+    with client(session_app(auth), client_backend) as http:
+        response = http.get("/required", headers={HEADER_A: GOOD_CREDENTIAL})
+
+    assert response.status_code == status
+    assert ("www-authenticate" in response.headers) is challenge
+
+
+@pytest.mark.anyio
+async def test_a_multi_leaf_group_stays_contained() -> None:
+    """Unwrapping is for a group with exactly one leaf. Two failures at once are not one
+    verifier's answer, and choosing between them would be a guess."""
+    auth = BetterAuth(
+        verifiers=[MultiFailureTaskGroupVerifier(HEADER_A, SessionExpired, "two children")]
+    )
+
+    with pytest.raises(InvalidCredential):
+        await resolve_for(auth)(connection(**{HEADER_A: GOOD_CREDENTIAL}))
+
+
+# --- B4: the terminal failure is the verifier's own, instance and reason --------------
+
+
+@pytest.mark.anyio
+async def test_a_terminal_failure_propagates_as_the_very_instance_raised() -> None:
+    """Asserting only the class lets a mutant re-wrap the failure with a fresh reason and
+    stay green - the operator's whole diagnosis replaced by a placeholder."""
+    error = SessionExpired(reason="expiry 1787241849 elapsed sid_fp=7c1de90f")
+    auth = BetterAuth(verifiers=[RaisingInstanceVerifier(HEADER_A, error)])
+
+    with pytest.raises(SessionExpired) as caught:
+        await resolve_for(auth)(connection(**{HEADER_A: BAD_CREDENTIAL}))
+
+    assert caught.value is error
+    assert caught.value.reason == "expiry 1787241849 elapsed sid_fp=7c1de90f"
+
+
+def test_a_terminal_failure_reaches_the_handler_with_its_own_reason() -> None:
+    error = SessionRevoked(reason="revocation absent upstream sid_fp=3ba57ce1")
+    auth = BetterAuth(verifiers=[RaisingInstanceVerifier(HEADER_A, error)])
+    observed: list[SessionError] = []
+    app = session_app(auth)
+
+    async def record(request: Request, exc: Exception) -> Response:
+        assert isinstance(exc, SessionError)
+        observed.append(exc)
+        return await http_exception_handler(request, exc)
+
+    app.add_exception_handler(SessionError, record)
+    with TestClient(app) as http:
+        response = http.get("/required", headers={HEADER_A: BAD_CREDENTIAL})
+
+    assert response.status_code == 401
+    assert observed == [error]
+    assert observed[0].reason == "revocation absent upstream sid_fp=3ba57ce1"
 
 
 @pytest.mark.anyio
@@ -398,20 +584,43 @@ async def test_containment_never_swallows_a_session_error() -> None:
         await resolve_for(auth)(connection(**{HEADER_A: BAD_CREDENTIAL}))
 
 
-@pytest.mark.anyio
-async def test_no_raw_credential_survives_in_the_dispatch_frame() -> None:
-    """Error reporters capture frame locals; this frame is the sole holder on the
-    ambiguity path, where no verifier frame exists to blame."""
-    secret = "raw-session-token-9f3ab21c"
-    auth = BetterAuth(verifiers=[FakeVerifier(HEADER_A), FakeVerifier(HEADER_B)])
+SECRET = "raw-session-token-9f3ab21c"
 
-    with pytest.raises(AmbiguousCredentials) as caught:
-        await resolve_for(auth)(connection(**{HEADER_A: secret, HEADER_B: secret}))
+
+def ambiguous_auth() -> BetterAuth:
+    return BetterAuth(verifiers=[FakeVerifier(HEADER_A), FakeVerifier(HEADER_B)])
+
+
+def escaping_extract_auth() -> BetterAuth:
+    """A healthy verifier extracts first, then a later one blows up mid-sweep."""
+    return BetterAuth(verifiers=[FakeVerifier(HEADER_A), RaisingExtractVerifier(HEADER_B)])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("build", "headers", "error_cls"),
+    [
+        (ambiguous_auth, {HEADER_A: SECRET, HEADER_B: SECRET}, AmbiguousCredentials),
+        (escaping_extract_auth, {HEADER_A: SECRET, HEADER_B: SECRET}, InvalidCredential),
+        (escaping_extract_auth, {HEADER_A: SECRET}, InvalidCredential),
+    ],
+    ids=["ambiguity", "extract-escape", "extract-escape-sole-holder"],
+)
+async def test_no_raw_credential_survives_in_a_library_frame(
+    build: Callable[[], BetterAuth], headers: dict[str, str], error_cls: type[SessionError]
+) -> None:
+    """Error reporters capture frame locals. On the ambiguity path and on an extract
+    escape mid-sweep, a credential an earlier verifier already returned is held by the
+    dispatcher alone - there is no verifier frame to blame it on."""
+    auth = build()
+
+    with pytest.raises(error_cls) as caught:
+        await resolve_for(auth)(connection(**headers))
 
     rendered = " ".join(repr(frame.f_locals) for frame in _library_frames(caught.value))
 
     assert rendered, "no library frame was captured; retune this probe"
-    assert secret not in rendered, "a presented credential survived in a captured frame"
+    assert SECRET not in rendered, "a presented credential survived in a captured frame"
 
 
 def _library_frames(error: BaseException) -> list[Any]:

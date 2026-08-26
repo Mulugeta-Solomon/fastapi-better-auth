@@ -46,13 +46,23 @@ def parse_user(user_model: type[UserModelT], payload: Any) -> UserModelT:
     function is what makes that outcome unreachable.
 
     The validation diagnosis survives on `InvalidCredential.reason` - which field, what
-    kind of failure - for logs and error reporters. Nothing the payload chose does. That
-    covers three channels that each leaked in review: pydantic renders `input_value=` into
-    its own message, `loc` is payload-supplied for an `extra="forbid"` model or a mapping
-    field, and a model's own validator may interpolate the value it rejected into its
-    `ValueError`. The summary is therefore rebuilt from the field path and pydantic's error
-    *type*, and the original is not chained onto the raise - `__cause__` is rendered by
-    `logger.exception` and walked by error reporters, which would put it all back.
+    kind of failure - for logs and error reporters. The *values* the payload carried do
+    not. That covers three channels that each leaked in review: pydantic renders
+    `input_value=` into its own message, and a model's own validator may interpolate the
+    value it rejected into its `ValueError`, so the summary is rebuilt from the field path
+    and pydantic's error *type* alone; and the original is not chained onto the raise,
+    because `__cause__` is rendered by `logger.exception` and walked by error reporters,
+    which would put it all back. The upstream payload is also dropped from this function's
+    locals before the raise, since reporters capture those too.
+
+    One thing the payload *can* influence, stated plainly because the alternative is a
+    guarantee this cannot keep: the field **path**. For a model with `extra="forbid"`, or
+    one with a mapping field, the rejected key is chosen by the payload and pydantic puts
+    it in `loc`. A path segment survives into the reason only if it is already
+    `[A-Za-z0-9_]{1,64}` - so it cannot carry a quote, a separator, a newline or a control
+    character into a log line, and it cannot choose how long that line is. Anything else
+    is replaced by `<redacted>`. Keeping plain names is what makes the reason useful to
+    the operator reading it.
 
     Args:
         user_model: The `User` subclass this deployment declared.
@@ -68,6 +78,7 @@ def parse_user(user_model: type[UserModelT], payload: Any) -> UserModelT:
         return user_model.model_validate(payload)
     except ValidationError as exc:
         summary = _summarize(user_model, exc)
+    payload = None
     raise InvalidCredential(reason=summary) from None
 
 

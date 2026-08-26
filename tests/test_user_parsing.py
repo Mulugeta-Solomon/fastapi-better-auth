@@ -18,6 +18,7 @@ from pydantic import ConfigDict, Field, ValidationError, field_validator
 from fastapi_better_auth import InvalidCredential, User, parse_user
 
 LEAKY_MARKER = "mallory-9f3ab21c"
+PLAIN_MARKER = "mallory9f3ab21c"
 OVERLONG_EMAIL = f"{'x' * 400}@example.com"
 OVERLONG_IMAGE = f"https://cdn.example.com/{LEAKY_MARKER}/{'x' * 5000}"
 
@@ -129,6 +130,27 @@ def test_the_reason_does_not_echo_a_long_input_value_either() -> None:
     assert LEAKY_MARKER not in caught.value.reason
 
 
+def test_the_upstream_payload_does_not_survive_in_the_parse_frame() -> None:
+    """B5: error reporters capture frame locals, and this frame holds the whole upstream
+    payload - session id, ip address, plugin data - at the moment it raises."""
+    secret = "raw-session-token-9f3ab21c"
+    payload = {"id": "", "image": f"https://cdn.example/{secret}"}
+
+    with pytest.raises(InvalidCredential) as caught:
+        parse_user(User, payload)
+
+    frames: list[Any] = []
+    tb = caught.value.__traceback__
+    while tb is not None:
+        if "fastapi_better_auth" in tb.tb_frame.f_code.co_filename:
+            frames.append(tb.tb_frame)
+        tb = tb.tb_next
+    rendered = " ".join(repr(frame.f_locals) for frame in frames)
+
+    assert frames, "no library frame was captured; retune this probe"
+    assert secret not in rendered, "the upstream payload survived in a captured frame"
+
+
 def test_the_pydantic_error_is_not_chained_onto_the_raise() -> None:
     """`__cause__` is rendered by `logger.exception` and walked by error reporters, so
     chaining would put `input_value=` back in both after the summary took it out."""
@@ -164,11 +186,11 @@ def test_the_rendered_traceback_carries_no_input_value() -> None:
     ],
     ids=["extra-forbid-key", "dict-key"],
 )
-def test_a_payload_controlled_field_name_never_reaches_the_reason(
+def test_a_payload_field_name_that_is_not_a_plain_identifier_is_redacted(
     model: type[User], payload: dict[str, Any]
 ) -> None:
     """`loc` is pydantic's field path, and for these two ordinary subclass shapes the path
-    itself is attacker-supplied."""
+    itself is payload-supplied. `LEAKY_MARKER` carries a hyphen, so it is redacted."""
     with pytest.raises(ValidationError) as pydantic_error:
         model.model_validate(payload)
     with pytest.raises(InvalidCredential) as caught:
@@ -176,6 +198,58 @@ def test_a_payload_controlled_field_name_never_reaches_the_reason(
 
     assert LEAKY_MARKER in str(pydantic_error.value), "pydantic stopped echoing; retune this"
     assert LEAKY_MARKER not in caught.value.reason
+    assert "<redacted>" in caught.value.reason
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (StrictUser, {"id": "u1", PLAIN_MARKER: "x"}),
+        (TaggedUser, {"id": "u1", "labels": {PLAIN_MARKER: 1}}),
+    ],
+    ids=["extra-forbid-key", "dict-key"],
+)
+def test_a_plain_identifier_field_name_does_reach_the_reason(
+    model: type[User], payload: dict[str, Any]
+) -> None:
+    """The contract, stated honestly rather than by accident of a hyphen: a payload-chosen
+    key that is already `[A-Za-z0-9_]{1,64}` is kept. It is what makes the reason usable
+    for the operator, it cannot carry a separator or a control character into a log line,
+    and it is size-capped. Anything else is redacted - see the test above."""
+    with pytest.raises(InvalidCredential) as caught:
+        parse_user(model, payload)
+
+    assert PLAIN_MARKER in caught.value.reason
+
+
+def test_an_oversized_field_name_is_redacted() -> None:
+    """The cap is what keeps a payload from choosing how long a log line is."""
+    with pytest.raises(InvalidCredential) as caught:
+        parse_user(StrictUser, {"id": "u1", "x" * 65: "y"})
+
+    assert "x" * 65 not in caught.value.reason
+    assert "<redacted>" in caught.value.reason
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["two words", "semi;colon", "new\nline", "quote'mark", "dot.path", "null\x00byte"],
+    ids=["space", "semicolon", "newline", "quote", "dot", "null"],
+)
+def test_a_field_name_that_could_confuse_a_log_line_is_redacted(name: str) -> None:
+    with pytest.raises(InvalidCredential) as caught:
+        parse_user(StrictUser, {"id": "u1", name: "y"})
+
+    assert name not in caught.value.reason
+    assert "<redacted>" in caught.value.reason
+
+
+def test_the_docstring_states_which_field_names_survive() -> None:
+    """The contract is only honest if the reader of the public docstring learns it."""
+    doc = parse_user.__doc__ or ""
+
+    assert "field name" in doc or "field path" in doc
+    assert "redact" in doc.lower()
 
 
 def test_a_subclass_validator_message_never_reaches_the_reason() -> None:

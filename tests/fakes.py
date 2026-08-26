@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timezone
 from typing import Any, TypeVar
 
+import anyio
 from fastapi import Depends, FastAPI, params
 from fastapi.testclient import TestClient
 from starlette.requests import HTTPConnection
@@ -195,6 +196,93 @@ class TracedVerifier(FakeVerifier):
     """A perfectly good verifier whose `verify` is wrapped by a non-async decorator."""
 
     verify = traced(FakeVerifier.verify)
+
+
+def sync_prologue(function: Callable[..., Any]) -> Callable[..., Any]:
+    """A decorator that does real work BEFORE returning the wrapped coroutine."""
+
+    @functools.wraps(function)
+    def wrapper(self: Any, credential: str, user_model: Any) -> Any:
+        if credential == BAD_CREDENTIAL:
+            raise RuntimeError(f"prologue rejected {credential!r}")
+        return function(self, credential, user_model)
+
+    return wrapper
+
+
+class SyncPrologueVerifier(FakeVerifier):
+    """A plain-callable `verify` — the shape D-054 blesses — whose sync half can raise.
+
+    Everything it does before handing back its coroutine runs outside any `await`, so a
+    containment that only wraps the `await` never sees it.
+    """
+
+    verify = sync_prologue(FakeVerifier.verify)
+
+
+async def _async_extract(self: Any, connection: HTTPConnection) -> str | None:
+    return connection.headers.get(self.header)
+
+
+class WrappedAsyncExtractVerifier(FakeVerifier):
+    """An `async def extract` behind an ordinary `functools.wraps` decorator.
+
+    `inspect.iscoroutinefunction` answers False for the wrapper, so the startup guard lets
+    it through; every call then returns a coroutine object, which is never `None`.
+    """
+
+    extract = traced(_async_extract)
+
+
+class RaisingInstanceVerifier:
+    """Raises one specific `SessionError` instance, so identity survives or it does not."""
+
+    def __init__(self, header: str, error: SessionError) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}"
+        self.error = error
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get(self.header)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        raise self.error
+
+
+class TaskGroupVerifier:
+    """Refuses from inside an `anyio` task group — the concurrency tool D-013 mandates.
+
+    A task group delivers a child's exception wrapped in a `BaseExceptionGroup`, and an
+    all-`Exception` group is itself an `Exception`, so an `except SessionError` above it
+    does not fire.
+    """
+
+    def __init__(self, header: str, error_cls: type[SessionError], reason: str) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}"
+        self.error_cls = error_cls
+        self.reason = reason
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get(self.header)
+
+    async def _refuse(self) -> None:
+        raise self.error_cls(reason=self.reason)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        async with anyio.create_task_group() as group:
+            group.start_soon(self._refuse)
+        raise NotImplementedError
+
+
+class MultiFailureTaskGroupVerifier(TaskGroupVerifier):
+    """Two children fail at once — a group with more than one leaf stays contained."""
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        async with anyio.create_task_group() as group:
+            group.start_soon(self._refuse)
+            group.start_soon(self._refuse)
+        raise NotImplementedError
 
 
 class AsyncExtractVerifier:

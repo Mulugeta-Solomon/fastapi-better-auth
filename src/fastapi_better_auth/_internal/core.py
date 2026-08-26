@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import inspect
 import logging
+import sys
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, TypeVar, cast
+
+if sys.version_info >= (3, 11):  # pragma: no cover - one branch per interpreter
+    from builtins import BaseExceptionGroup
+else:  # pragma: no cover - one branch per interpreter
+    from exceptiongroup import BaseExceptionGroup
 
 from fastapi import Depends
 from starlette.requests import HTTPConnection
@@ -22,6 +28,8 @@ from .models import Session, User
 from .verifiers import Verifier
 
 logger = logging.getLogger("fastapi_better_auth")
+
+GROUP_TYPES: tuple[type[BaseException], ...] = (BaseExceptionGroup,)
 
 UserModelT = TypeVar("UserModelT", bound=User)
 
@@ -109,6 +117,14 @@ class BetterAuth:
         `optional_session` shares the same underlying resolver, so declaring both on one
         route also verifies once.
 
+        **Call it.** `Depends(auth.current_session())`, with the parentheses. Passing the
+        factory itself - `Depends(auth.current_session)` - is a bypass, not an error: at
+        router level FastAPI resolves it as a dependency that takes an optional
+        `user_model` argument, calls it, discards the callable it returns, and **no
+        verification happens on any route under that router**. At route level it surfaces
+        as a type mismatch instead, so the two spellings fail very differently. Nothing
+        detects the router-level form at runtime today.
+
         Args:
             user_model: The `User` subclass to parse the upstream payload into. The
                 returned dependency is typed `Session[user_model]`.
@@ -142,6 +158,10 @@ class BetterAuth:
 
         Memoized on `user_model`, and sharing one resolver with `current_session`, for the
         reasons in that method's documentation.
+
+        **Call it.** `Depends(auth.optional_session())`, with the parentheses - passing the
+        factory itself silently runs no verification at router level. See
+        `current_session` for what that failure looks like.
 
         Args:
             user_model: The `User` subclass to parse the upstream payload into.
@@ -194,52 +214,97 @@ class BetterAuth:
     async def _authenticate(
         self, connection: HTTPConnection, user_model: type[UserModelT]
     ) -> Session[UserModelT] | None:
-        presented: Presented = [
-            (verifier, credential)
-            for verifier in self._verifiers
-            if (credential := _extracted(verifier, connection)) is not None
-        ]
-        if len(presented) > 1:
-            names = [_named(verifier) for verifier, _credential in presented]
-            presented.clear()
-            credential = None
-            raise AmbiguousCredentials(reason=_ambiguity(names))
-        if not presented:
-            return None
-        verifier, credential = presented[0]
-        presented.clear()
+        presented: Presented = []
+        credential: object | None = None
         try:
-            answer = await _verified(verifier, credential, user_model)
+            for verifier in self._verifiers:
+                credential = _extracted(verifier, connection)
+                if credential is not None:
+                    presented.append((verifier, credential))
+            credential = None
+            if len(presented) > 1:
+                names = [_named(each) for each, _credential in presented]
+                raise AmbiguousCredentials(reason=_ambiguity(names))
+            if not presented:
+                return None
+            chosen, credential = presented[0]
+            answer = await _verified(chosen, credential, user_model)
         finally:
             credential = None
-        return _checked(answer, verifier, user_model)
+            presented.clear()
+        return _checked(answer, chosen, user_model)
 
 
 def _extracted(verifier: Verifier, connection: HTTPConnection) -> object | None:
     try:
-        return verifier.extract(connection)
+        credential = verifier.extract(connection)
     except BetterAuthError:
         raise
     except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-        raise _contained(exc, verifier, "extract") from None
+        raise _resolved(exc, verifier, "extract", (BetterAuthError,)) from None
+    if inspect.isawaitable(credential):
+        if inspect.iscoroutine(credential):
+            credential.close()
+        raise ConfigurationError(
+            f"{type(verifier).__name__}.extract() returned an awaitable. extract() is a"
+            " synchronous presence check, and an awaitable is never None, so this verifier"
+            " would claim every request. Declare it with `def` - and note that a decorator"
+            " hides an `async def` from the check made at construction."
+        )
+    return credential
 
 
 async def _verified(verifier: Verifier, credential: object, user_model: type[UserModelT]) -> Any:
-    answer = verifier.verify(credential, user_model)
-    if not inspect.isawaitable(answer):
-        raise ConfigurationError(
-            f"{type(verifier).__name__}.verify() did not return an awaitable. Declare it"
-            " with `async def`."
-        )
     try:
+        answer = verifier.verify(credential, user_model)
+        if not inspect.isawaitable(answer):
+            raise ConfigurationError(
+                f"{type(verifier).__name__}.verify() did not return an awaitable. Declare it"
+                " with `async def`."
+            )
         return await answer
     except (BetterAuthError, SessionError):
         raise
     except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-        raise _contained(exc, verifier, "verify") from None
+        raise _resolved(exc, verifier, "verify", (BetterAuthError, SessionError)) from None
 
 
-def _contained(exc: Exception, verifier: Verifier, method: str) -> InvalidCredential:
+def _unwrapped(exc: BaseException) -> BaseException:
+    """A task group with one failing child delivers a group whose single leaf is the answer."""
+    leaf = exc
+    while isinstance(leaf, GROUP_TYPES):
+        nested: tuple[BaseException, ...] = getattr(leaf, "exceptions", ())
+        if len(nested) != 1:
+            break
+        leaf = nested[0]
+    return leaf
+
+
+def _resolved(
+    exc: Exception,
+    verifier: Verifier,
+    method: str,
+    honoured: tuple[type[BaseException], ...],
+) -> BaseException:
+    """Decide whether an escaping exception is an answer or an accident.
+
+    `anyio` task groups - the concurrency tool this library mandates - wrap a child's
+    exception in a `BaseExceptionGroup`, and a group whose leaves are all `Exception` is
+    itself an `Exception`. Without unwrapping, a verifier's deliberate `CsrfFailure` (403,
+    no challenge) raised from inside a task group is rewritten as `InvalidCredential`
+    (401, with a challenge) - a wire-shape change nothing else in the suite can see.
+
+    A single-leaf group is that leaf, and an honoured leaf is re-raised **as itself**, so
+    its class, status, headers and `reason` all survive. A group with more than one leaf is
+    not one verifier's answer, so it stays contained rather than guessed at.
+    """
+    leaf = _unwrapped(exc)
+    if isinstance(leaf, honoured):
+        return leaf
+    return _contained(leaf, verifier, method)
+
+
+def _contained(exc: BaseException, verifier: Verifier, method: str) -> InvalidCredential:
     """Turn an escaping exception into the uniform refusal, and log the real one.
 
     A 500 is the only request-time answer a client can tell apart from every other, and
