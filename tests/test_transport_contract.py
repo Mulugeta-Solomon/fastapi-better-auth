@@ -22,21 +22,26 @@ import fastapi_better_auth
 from fastapi_better_auth import (
     BetterAuth,
     BetterAuthError,
+    ContentEncodingRejected,
     ResponseTooLarge,
     SessionError,
     Transport,
     TransportResponse,
+    UntrustedResponse,
 )
 from tests.fakes import GOOD_CREDENTIAL, OversizeVerifier, client, session_app
 
 HEADER = "x-cred-a"
 NEW_EXPORTS = (
+    "ContentEncodingRejected",
     "HttpxTransport",
     "Httpx2Transport",
     "ResponseTooLarge",
     "Transport",
     "TransportResponse",
+    "UntrustedResponse",
 )
+UNTRUSTED = (ResponseTooLarge(max_bytes=1), ContentEncodingRejected(encoding="gzip"))
 
 
 class ConformingTransport:
@@ -136,8 +141,8 @@ def test_post_defaults_to_an_empty_body() -> None:
 
 @pytest.mark.parametrize(
     "obligation",
-    ["redirect", "max_bytes", "Content-Length"],
-    ids=["no-redirects", "the-cap", "content-length-is-not-enforcement"],
+    ["redirect", "max_bytes", "Content-Length", "TimeoutError"],
+    ids=["no-redirects", "the-cap", "content-length-is-not-enforcement", "timeout-is-builtin"],
 )
 def test_the_docstring_states_the_implementer_obligations(obligation: str) -> None:
     """An implementer reads this docstring and nothing else. Every rule that makes a
@@ -145,11 +150,22 @@ def test_the_docstring_states_the_implementer_obligations(obligation: str) -> No
     assert obligation in (Transport.__doc__ or "")
 
 
-def test_the_docstring_says_failures_are_not_translated_here() -> None:
+def test_the_docstring_says_a_timeout_is_a_builtin_timeout_error() -> None:
+    """B4: the Protocol *defines* its timeout type, so a caller's recipe does not depend on
+    which library is underneath. A network timeout is a builtin `TimeoutError`."""
     doc = Transport.__doc__ or ""
 
-    assert "timeout" in doc.lower()
+    assert "TimeoutError" in doc
     assert "AuthServiceUnavailable" in doc
+
+
+def test_the_response_docstring_tells_the_truth_about_repeated_headers() -> None:
+    """B3: the docstring used to claim last-value-wins while both adapters comma-join. A lie
+    in a fixed-forever public type is worse than silence, and Set-Cookie is the reason."""
+    doc = TransportResponse.__doc__ or ""
+
+    assert "comma" in doc.lower()
+    assert "Set-Cookie" in doc
 
 
 def test_a_response_carries_the_status_headers_and_body() -> None:
@@ -193,12 +209,35 @@ def test_responses_compare_by_value() -> None:
     assert first == second
 
 
-def test_the_body_stays_out_of_the_repr() -> None:
-    """A response repr reaches logs and tracebacks; an unverified body must not ride along."""
-    response = TransportResponse(status_code=200, headers={}, content=b"a-secret-key-set")
+def test_the_repr_shows_only_the_status_not_the_body_or_headers() -> None:
+    """N1: a get-session response's `Set-Cookie` carries a live session cookie, and a repr
+    reaches logs and tracebacks. The body was already redacted; the headers must be too."""
+    response = TransportResponse(
+        status_code=200,
+        headers={"set-cookie": "session=a-live-secret"},
+        content=b"a-secret-key-set",
+    )
+    printed = repr(response)
 
-    assert "a-secret-key-set" not in repr(response)
-    assert "200" in repr(response)
+    assert "a-secret-key-set" not in printed
+    assert "a-live-secret" not in printed
+    assert "set-cookie" not in printed
+    assert "200" in printed
+
+
+def test_a_response_is_not_hashable_the_same_way_a_session_is_not() -> None:
+    """N2: `hash()` raises `TypeError` at call time because `headers` is a mapping — the same
+    house pattern `Session` carries. Documented so it is a promise, not an accident."""
+    response = TransportResponse(status_code=200, headers={}, content=b"")
+
+    with pytest.raises(TypeError):
+        hash(response)
+
+
+def test_the_response_documents_that_it_is_not_hashable() -> None:
+    doc = TransportResponse.__doc__ or ""
+
+    assert "hash" in doc.lower()
 
 
 def test_the_cap_failure_names_the_cap() -> None:
@@ -217,22 +256,45 @@ def test_the_cap_failure_survives_a_pickle() -> None:
     assert restored.max_bytes == 7
 
 
-def test_the_cap_failure_is_not_a_session_error() -> None:
-    """The transport has no request context: it cannot know whether an oversized body is a
-    401 or a 503, so it does not get to answer a client. The verifier above translates."""
-    error = ResponseTooLarge(max_bytes=1)
+def test_the_content_encoding_failure_names_the_encoding_and_survives_a_pickle() -> None:
+    error = ContentEncodingRejected(encoding="gzip")
 
+    assert error.encoding == "gzip"
+    assert "gzip" in str(error)
+    restored = pickle.loads(pickle.dumps(error))
+    assert isinstance(restored, ContentEncodingRejected)
+    assert restored.encoding == "gzip"
+
+
+@pytest.mark.parametrize("error", UNTRUSTED, ids=lambda e: type(e).__name__)
+def test_every_untrusted_response_shares_the_base(error: UntrustedResponse) -> None:
+    """One catch clause covers them all: `except UntrustedResponse` is what WP5 will write."""
+    assert isinstance(error, UntrustedResponse)
+
+
+@pytest.mark.parametrize("error", UNTRUSTED, ids=lambda e: type(e).__name__)
+def test_no_untrusted_response_is_a_session_error(error: UntrustedResponse) -> None:
+    """The transport has no request context: it cannot know whether a refused body is a 401
+    or a 503, so it does not get to answer a client. The verifier above translates."""
     assert not isinstance(error, SessionError)
     assert not isinstance(error, HTTPException)
 
 
-def test_the_cap_failure_is_not_a_better_auth_error() -> None:
+@pytest.mark.parametrize("error", UNTRUSTED, ids=lambda e: type(e).__name__)
+def test_no_untrusted_response_is_a_better_auth_error(error: UntrustedResponse) -> None:
     """Deliberate, and load-bearing: `BetterAuthError` is honoured by dispatch and would
     escape as a 500 — the one request-time answer a client can tell apart from every other.
-    An oversized key set is an upstream fault, not a configuration fault."""
-    error = ResponseTooLarge(max_bytes=1)
-
+    A refused upstream body is an upstream fault, not a configuration fault."""
     assert not isinstance(error, BetterAuthError)
+
+
+def test_the_base_is_documented_as_outside_the_taxonomy() -> None:
+    """The base carries the containment rationale, so an implementer of a new rejection knows
+    which side of the 401/500 line to fall on."""
+    doc = UntrustedResponse.__doc__ or ""
+
+    assert "BetterAuthError" in doc
+    assert "SessionError" in doc
 
 
 def test_an_untranslated_cap_failure_is_contained_as_the_uniform_401(client_backend: str) -> None:

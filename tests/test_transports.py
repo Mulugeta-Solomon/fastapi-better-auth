@@ -4,19 +4,22 @@
 and nothing else — which is exactly the situation where a fix lands in one and not the other.
 Every obligation in the `Transport` docstring is asserted here once and parameterized over
 both, against a real socket: an in-process ASGI double cannot show that a redirect was not
-followed, that an oversized body was abandoned mid-stream, or that a stalled read raises the
-adapter library's own timeout error.
+followed, that an oversized body was abandoned mid-stream, or that a stalled read raises a
+timeout.
 """
 
 from __future__ import annotations
 
 import gc
+import gzip
+import inspect
 import sys
+import tracemalloc
 import warnings
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import anyio
 import httpx
@@ -26,12 +29,25 @@ from typing_extensions import Self
 
 from fastapi_better_auth import (
     ConfigurationError,
+    ContentEncodingRejected,
     Httpx2Transport,
     HttpxTransport,
     ResponseTooLarge,
     Transport,
 )
-from tests.scripted_server import replying, scripted_server, stalling, trickling, unframed
+from fastapi_better_auth._internal.httpx_transports import (
+    _capped,  # pyright: ignore[reportPrivateUsage]
+)
+from tests.scripted_server import (
+    encoded,
+    hangup,
+    replaying,
+    replying,
+    scripted_server,
+    stalling,
+    trickling,
+    unframed,
+)
 
 CAP = 4096
 OVERSIZED = 8 * 1024 * 1024
@@ -40,6 +56,10 @@ STALL_TIMEOUT = 0.25
 TRICKLE_CEILING = 5.0
 TRICKLE_INTERVAL = 0.05
 TRICKLE_TIMEOUT = 0.5
+# A gzip stream that expands ~1000x: the wire body is tiny, the decoded body is not.
+BOMB_DECODED = 64 * 1024 * 1024
+GZIP_BOMB = gzip.compress(b"\0" * BOMB_DECODED)
+GIANT_CHUNK = b"x" * (16 * 1024 * 1024)
 
 
 class Adapter(Transport, Protocol):
@@ -65,6 +85,7 @@ class Library:
     build: Callable[..., Adapter]
     connect: Callable[..., Any]
     timeout_error: type[Exception]
+    disconnect_error: type[Exception]
 
 
 LIBRARIES = (
@@ -73,12 +94,14 @@ LIBRARIES = (
         build=HttpxTransport,
         connect=httpx.AsyncClient,
         timeout_error=httpx.TimeoutException,
+        disconnect_error=httpx.RemoteProtocolError,
     ),
     Library(
         name="httpx2",
         build=Httpx2Transport,
         connect=httpx2.AsyncClient,
         timeout_error=httpx2.TimeoutException,
+        disconnect_error=httpx2.RemoteProtocolError,
     ),
 )
 
@@ -90,6 +113,42 @@ def library(request: pytest.FixtureRequest) -> Library:
     return chosen
 
 
+class _OneChunk:
+    """A response whose whole body arrives in a single `aiter_raw()` chunk — the shape a
+    socket never produces (it reads in blocks) but the cap must survive anyway."""
+
+    status_code = 200
+
+    def __init__(self, chunk: bytes) -> None:
+        self._chunk = chunk
+        self.headers: dict[str, str] = {}
+
+    def aiter_raw(self) -> AsyncIterator[bytes]:
+        async def _one() -> AsyncIterator[bytes]:
+            yield self._chunk
+
+        return _one()
+
+
+def _max_bytes_is_required_by_type(
+    protocol: Transport, one: HttpxTransport, two: Httpx2Transport
+) -> None:
+    """B5 typing pin: calling `get`/`post` without `max_bytes` must be a type error on the
+    Protocol AND both adapters. Under `reportUnnecessaryTypeIgnoreComment`, a default creeping
+    onto `max_bytes` makes the call valid, both suppressed codes vanish, and the now-unused
+    ignore fails the type gate. Never executed — accessed under `TYPE_CHECKING` below."""
+    _ = protocol.get("x")  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+    _ = protocol.post("x")  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+    _ = one.get("x")  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+    _ = one.post("x")  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+    _ = two.get("x")  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+    _ = two.post("x")  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+
+
+if TYPE_CHECKING:
+    _ = _max_bytes_is_required_by_type  # accessed so pyright does not call it unused
+
+
 def test_both_adapters_are_shipped() -> None:
     """A suite parameterized over one adapter would prove nothing about the other."""
     assert {each.name for each in LIBRARIES} == {"httpx", "httpx2"}
@@ -97,6 +156,16 @@ def test_both_adapters_are_shipped() -> None:
 
 def test_an_adapter_satisfies_the_protocol(library: Library) -> None:
     assert isinstance(library.build(), Transport)
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_the_adapters_require_max_bytes_at_runtime_too(library: Library, method: str) -> None:
+    """B5, the runtime half of the typing pin: `max_bytes` has no default on either adapter,
+    so an accidental default is caught even where pyright is not run."""
+    parameter = inspect.signature(getattr(library.build, method)).parameters["max_bytes"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
 
 
 @pytest.mark.anyio
@@ -212,13 +281,100 @@ async def test_an_oversized_body_with_no_content_length_aborts_the_read(library:
 
 
 @pytest.mark.anyio
-async def test_a_stalled_response_raises_the_libraries_own_timeout(library: Library) -> None:
-    """Untranslated on purpose: the verifier above turns this into `AuthServiceUnavailable`,
-    because only it knows what a failed fetch means to the request that caused it."""
+async def test_a_gzip_bomb_is_refused_without_ever_decompressing(library: Library) -> None:
+    """B1: the cap counts WIRE bytes and a Content-Encoding we did not ask for is refused
+    before any decode, so a tiny compressed stream cannot expand to exhaust memory. Reproduced
+    at 260 KB wire -> ~400 MB peak before this fix. `accept-encoding: identity` is only a
+    request hint; both libraries decode off the RESPONSE's Content-Encoding regardless."""
+    bomb = scripted_server(encoded(body=GZIP_BOMB, encoding="gzip"))
+    tracemalloc.start()
+    try:
+        async with bomb as served, library.build() as transport:
+            with pytest.raises(ContentEncodingRejected) as caught:
+                await transport.get(f"{served.origin()}/api/auth/jwks", max_bytes=CAP)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert caught.value.encoding == "gzip"
+    assert peak < BOMB_DECODED // 8, f"peaked at {peak} bytes — the bomb was decompressed"
+
+
+@pytest.mark.anyio
+async def test_capped_holds_the_buffer_to_the_cap_even_on_one_giant_chunk() -> None:
+    """B2: the cap is checked AFTER `body += chunk`, so a single chunk far larger than the cap
+    blows the bound before the check lands. Slicing each chunk to `cap - len + 1` keeps the
+    buffer at cap+1 whatever the chunk size. The giant chunk is allocated OUTSIDE the traced
+    region, so what tracemalloc sees is `_capped`'s own buffer, not the source."""
+    tracemalloc.start()
+    try:
+        with pytest.raises(ResponseTooLarge):
+            await _capped(_OneChunk(GIANT_CHUNK), CAP)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < len(GIANT_CHUNK) // 8, f"buffer grew to {peak} bytes — the chunk was not sliced"
+
+
+@pytest.mark.anyio
+async def test_duplicate_headers_arrive_comma_joined(library: Library) -> None:
+    """B3: both libraries comma-join repeated header names, and `TransportResponse` keeps that.
+    It is correct for a `WWW-Authenticate` a caller reads as one value, and it is exactly why
+    `Set-Cookie` must never be read off this mapping — a join hides a smuggled second cookie
+    behind a comma."""
+    answer = replaying(
+        [
+            ("www-authenticate", "Bearer"),
+            ("www-authenticate", 'Basic realm="x"'),
+            ("set-cookie", "a=1"),
+            ("set-cookie", "b=2"),
+        ],
+        body=b"{}",
+    )
+
+    async with scripted_server(answer) as served, library.build() as transport:
+        response = await transport.get(f"{served.origin()}/api/auth/jwks", max_bytes=CAP)
+
+    assert response.headers["www-authenticate"] == 'Bearer, Basic realm="x"'
+    assert response.headers["set-cookie"] == "a=1, b=2"
+
+
+@pytest.mark.anyio
+async def test_a_stalled_response_before_headers_raises_builtin_timeout_error(
+    library: Library,
+) -> None:
+    """B4: a per-phase read timeout fires before any header arrives. The adapter translates
+    the library's own `TimeoutException` into a builtin `TimeoutError`, so the Protocol's
+    timeout contract does not leak which library is underneath. The verifier above turns the
+    builtin into `AuthServiceUnavailable`."""
     stalled = library.build(timeout=STALL_TIMEOUT)
 
     async with scripted_server(stalling()) as served, stalled as transport:
-        with pytest.raises(library.timeout_error):
+        with pytest.raises(TimeoutError):
+            await transport.get(f"{served.origin()}/api/auth/jwks", max_bytes=CAP)
+
+
+@pytest.mark.anyio
+async def test_a_timeout_is_never_the_libraries_own_exception_type(library: Library) -> None:
+    """The other half of B4, stated as a negative so it cannot silently regress: the thing a
+    caller catches is `TimeoutError`, and never `httpx(2).TimeoutException`."""
+    stalled = library.build(timeout=STALL_TIMEOUT)
+
+    async with scripted_server(stalling()) as served, stalled as transport:
+        with pytest.raises(TimeoutError) as caught:
+            await transport.get(f"{served.origin()}/api/auth/jwks", max_bytes=CAP)
+
+    assert not isinstance(caught.value, library.timeout_error)
+
+
+@pytest.mark.anyio
+async def test_a_non_timeout_network_error_stays_untranslated(library: Library) -> None:
+    """The line B4 does not cross: only a timeout is translated. A server that disconnects
+    without answering is the library's own `RemoteProtocolError`, passed through for the
+    verifier above to read as it likes."""
+    async with scripted_server(hangup()) as served, library.build() as transport:
+        with pytest.raises(library.disconnect_error):
             await transport.get(f"{served.origin()}/api/auth/jwks", max_bytes=CAP)
 
 

@@ -14,7 +14,7 @@ than about a mock. It is `anyio`-native, so the whole suite still runs on both b
 from __future__ import annotations
 
 import contextlib
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from http import HTTPStatus
 from types import MappingProxyType
@@ -70,6 +70,45 @@ def replying(
     return respond
 
 
+def encoded(*, body: bytes, encoding: str) -> Responder:
+    """A body carrying a `Content-Encoding` — the header a server must not send under identity.
+
+    Connection-close framed (no `Content-Length`), so a transport that read the *decoded*
+    stream would decompress the whole thing before any cap could compare a length.
+    """
+
+    async def respond(request: Received, stream: SocketStream) -> None:
+        head = _head(
+            200,
+            {
+                "content-type": "application/json",
+                "content-encoding": encoding,
+                "connection": "close",
+            },
+        )
+        await stream.send(head + body)
+
+    return respond
+
+
+def replaying(pairs: Sequence[tuple[str, str]], *, body: bytes = b"") -> Responder:
+    """Emit header lines verbatim, duplicates and all — what a `Mapping` cannot express.
+
+    The only way to prove how repeated `WWW-Authenticate` / `Set-Cookie` lines land in
+    `TransportResponse.headers`, since a dict would collapse them before the wire.
+    """
+
+    async def respond(request: Received, stream: SocketStream) -> None:
+        lines = [f"HTTP/1.1 200 {HTTPStatus.OK.phrase}"]
+        lines.extend(f"{name}: {value}" for name, value in pairs)
+        lines.append(f"content-length: {len(body)}")
+        lines.append("connection: close")
+        head = (CRLF.join(line.encode() for line in lines)) + HEADER_END
+        await stream.send(head + body)
+
+    return respond
+
+
 def unframed(*, total: int, written: list[int]) -> Responder:
     """A body with NO `Content-Length`: framing is the connection close (RFC 9112 §6.3).
 
@@ -99,6 +138,19 @@ def stalling() -> Responder:
 
     async def respond(request: Received, stream: SocketStream) -> None:
         await anyio.sleep_forever()
+
+    return respond
+
+
+def hangup() -> Responder:
+    """Reads the request and closes without a byte of response.
+
+    A deterministic, cross-platform NON-timeout network failure - the client's own library
+    raises "server disconnected" - for proving what the adapter leaves untranslated.
+    """
+
+    async def respond(request: Received, stream: SocketStream) -> None:
+        return
 
     return respond
 
