@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, TypeVar
 
 from pydantic import ValidationError
@@ -14,6 +15,8 @@ UserModelT = TypeVar("UserModelT", bound=User)
 
 MAX_REPORTED_ERRORS = 5
 MAX_REASON_LENGTH = 500
+REDACTED = "<redacted>"
+SAFE_LOCATION = re.compile(r"[A-Za-z0-9_]{1,64}")
 
 
 def parse_user(user_model: type[UserModelT], payload: Any) -> UserModelT:
@@ -26,9 +29,13 @@ def parse_user(user_model: type[UserModelT], payload: Any) -> UserModelT:
     through this function so that outcome cannot happen.
 
     The validation diagnosis survives on `InvalidCredential.reason` - which field, what
-    kind of failure - for logs and error reporters. The values that failed do not: reasons
-    are serialized by error reporters along with the rest of the exception, and an upstream
-    payload is not something to copy into one.
+    kind of failure - for logs and error reporters. Nothing the payload chose does. That
+    covers three channels that each leaked in review: pydantic renders `input_value=` into
+    its own message, `loc` is payload-supplied for an `extra="forbid"` model or a mapping
+    field, and a model's own validator may interpolate the value it rejected into its
+    `ValueError`. The summary is therefore rebuilt from the field path and pydantic's error
+    *type*, and the original is not chained onto the raise - `__cause__` is rendered by
+    `logger.exception` and walked by error reporters, which would put it all back.
 
     Args:
         user_model: The `User` subclass this deployment declared.
@@ -43,7 +50,8 @@ def parse_user(user_model: type[UserModelT], payload: Any) -> UserModelT:
     try:
         return user_model.model_validate(payload)
     except ValidationError as exc:
-        raise InvalidCredential(reason=_summarize(user_model, exc)) from exc
+        summary = _summarize(user_model, exc)
+    raise InvalidCredential(reason=summary) from None
 
 
 def _summarize(user_model: type[User], exc: ValidationError) -> str:
@@ -56,5 +64,11 @@ def _summarize(user_model: type[User], exc: ValidationError) -> str:
 
 
 def _render(error: ErrorDetails) -> str:
-    location = ".".join(str(part) for part in error["loc"]) or "<root>"
-    return f"{location}: {error['msg']} [{error['type']}]"
+    """Field path and error type only: `msg` and half of `loc` can be payload-supplied."""
+    parts = [part if isinstance(part, int) else _safe(part) for part in error["loc"]]
+    location = ".".join(str(part) for part in parts) or "<root>"
+    return f"{location}: [{error['type']}]"
+
+
+def _safe(part: str) -> str:
+    return part if SAFE_LOCATION.fullmatch(part) else REDACTED

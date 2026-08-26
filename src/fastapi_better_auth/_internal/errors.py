@@ -185,10 +185,17 @@ class CsrfFailure(SessionError):
 class AmbiguousCredentials(SessionError):
     """Two or more credentials arrived on one request.
 
-    400, not 401: what is wrong is the shape of the request, not the identity behind it.
-    The client already knows it sent two credentials, so being told so teaches it nothing
-    it could not have worked out - no oracle is created - and there is nothing for it to
-    re-authenticate, so it gets no `WWW-Authenticate` challenge either.
+    400, not 401: what is wrong is the shape of the request, not the identity behind it,
+    and there is nothing for the client to re-authenticate - so it gets no
+    `WWW-Authenticate` challenge either. A uniform 401 here would instead make a
+    legitimate client's own misconfiguration undebuggable.
+
+    What the 400 does disclose, precisely: that this deployment recognizes *both* of the
+    credential shapes that were sent. It fires only when two configured verifiers each
+    found their credential, so a client can use it to learn which modes are enabled. That
+    is deployment configuration rather than identity - normally published in the API's own
+    documentation, and discoverable from the sign-in flow - and it says nothing about
+    whether any credential was valid.
 
     It is still a `SessionError`, so `except SessionError` remains "every request-time
     failure this library raises".

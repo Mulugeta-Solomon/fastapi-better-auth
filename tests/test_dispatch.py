@@ -28,10 +28,17 @@ from tests.fakes import (
     BAD_CREDENTIAL,
     GOOD_CREDENTIAL,
     AsyncExtractVerifier,
+    BrokenConfigVerifier,
     FailingVerifier,
     FakeVerifier,
+    NonCallableVerifier,
     NotAVerifier,
+    NullVerifier,
+    RaisingExtractVerifier,
+    RaisingVerifyVerifier,
     SyncVerifyVerifier,
+    TracedVerifier,
+    WrongModelVerifier,
     connection,
     resolver_of,
     session_app,
@@ -42,6 +49,12 @@ HEADER_B = "x-cred-b"
 HEADER_C = "x-cred-c"
 
 
+class AdminUser(User):
+    """A deployment's own model, so a verifier that ignores `user_model` is detectable."""
+
+    role: str | None = None
+
+
 def pair() -> tuple[FakeVerifier, FakeVerifier, BetterAuth, list[str]]:
     log: list[str] = []
     first = FakeVerifier(HEADER_A, log=log)
@@ -49,8 +62,10 @@ def pair() -> tuple[FakeVerifier, FakeVerifier, BetterAuth, list[str]]:
     return first, second, BetterAuth(verifiers=[first, second]), log
 
 
-def resolve_for(auth: BetterAuth) -> Callable[..., Awaitable[Session[Any] | None]]:
-    return resolver_of(auth.current_session(user_model=User))
+def resolve_for(
+    auth: BetterAuth, user_model: type[User] = User
+) -> Callable[..., Awaitable[Session[Any] | None]]:
+    return resolver_of(auth.current_session(user_model=user_model))
 
 
 # --- constructor: every fault is a startup fault, never a request-time 500 -------------
@@ -79,7 +94,7 @@ def test_an_object_missing_the_protocol_is_rejected_by_position() -> None:
 
     message = str(caught.value)
     assert "NotAVerifier" in message
-    assert "1" in message
+    assert "[1]" in message
 
 
 def test_an_async_extract_is_rejected_at_construction() -> None:
@@ -90,11 +105,59 @@ def test_an_async_extract_is_rejected_at_construction() -> None:
     assert "extract" in str(caught.value)
 
 
-def test_a_synchronous_verify_is_rejected_at_construction() -> None:
+def test_a_verify_wrapped_by_a_plain_decorator_is_accepted() -> None:
+    """`inspect.iscoroutinefunction` is False for a `functools.wraps` tracing wrapper, and
+    refusing that shape would reject a perfectly good verifier at startup."""
+    auth = BetterAuth(verifiers=[TracedVerifier(HEADER_A)])
+
+    assert auth.verifiers
+
+
+@pytest.mark.anyio
+async def test_a_verify_that_is_not_awaitable_is_a_configuration_fault_not_a_401() -> None:
+    """It cannot be caught at startup for every shape, so it is caught loudly, once,
+    rather than degraded into a credential failure that hides the mistake."""
+    auth = BetterAuth(verifiers=[SyncVerifyVerifier()])  # pyright: ignore[reportArgumentType]
+
     with pytest.raises(ConfigurationError) as caught:
-        BetterAuth(verifiers=[SyncVerifyVerifier()])  # pyright: ignore[reportArgumentType]
+        await resolve_for(auth)(connection(**{"x-sync": GOOD_CREDENTIAL}))
 
     assert "verify" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "verifier",
+    [NonCallableVerifier(), NotAVerifier()],
+    ids=["non-callable-attributes", "missing-methods"],
+)
+def test_a_verifier_whose_methods_are_not_callable_is_rejected(verifier: Any) -> None:
+    with pytest.raises(ConfigurationError):
+        BetterAuth(verifiers=[verifier])
+
+
+def test_the_same_verifier_twice_is_rejected() -> None:
+    """Both copies would extract the same credential, so every request would be ambiguous
+    - a total authentication outage that startup would otherwise call healthy."""
+    verifier = FakeVerifier(HEADER_A)
+
+    with pytest.raises(ConfigurationError) as caught:
+        BetterAuth(verifiers=[verifier, verifier])
+
+    assert "twice" in str(caught.value)
+
+
+def test_the_verifiers_argument_is_keyword_only() -> None:
+    with pytest.raises(TypeError):
+        BetterAuth([FakeVerifier(HEADER_A)])  # pyright: ignore[reportCallIssue]
+
+
+def test_the_user_model_argument_is_keyword_only() -> None:
+    auth = BetterAuth(verifiers=[FakeVerifier(HEADER_A)])
+
+    with pytest.raises(TypeError):
+        auth.current_session(User)  # pyright: ignore[reportCallIssue]
+    with pytest.raises(TypeError):
+        auth.optional_session(User)  # pyright: ignore[reportCallIssue]
 
 
 def test_the_declared_order_is_captured_and_cannot_be_edited_afterwards() -> None:
@@ -176,6 +239,133 @@ async def test_a_malformed_upstream_payload_is_an_invalid_credential() -> None:
 
     with pytest.raises(InvalidCredential):
         await resolve_for(auth)(connection(**{HEADER_A: GOOD_CREDENTIAL}))
+
+
+@pytest.mark.anyio
+async def test_an_empty_credential_is_present_not_absent() -> None:
+    """`None` is the only absence signal. Tightening this to a truthiness test would turn
+    a blank cookie into "nobody asked", which `optional_session` answers with a 200."""
+    verifier = FakeVerifier(HEADER_A)
+    auth = BetterAuth(verifiers=[verifier])
+
+    with pytest.raises(InvalidCredential):
+        await resolve_for(auth)(connection(**{HEADER_A: ""}))
+
+    assert verifier.verify_calls == 1
+
+
+# --- rogue verifiers: the protocol is structural, so the answer must be checked --------
+
+
+@pytest.mark.anyio
+async def test_a_verifier_that_returns_none_is_a_configuration_fault() -> None:
+    """`None` is the dispatcher's absence signal, so an unchecked return would downgrade a
+    presented credential to anonymous - the fail-open D-004 exists to prevent."""
+    auth = BetterAuth(verifiers=[NullVerifier(HEADER_A)])
+
+    with pytest.raises(ConfigurationError) as caught:
+        await resolve_for(auth)(connection(**{HEADER_A: GOOD_CREDENTIAL}))
+
+    assert "NullVerifier" in str(caught.value)
+
+
+@pytest.mark.anyio
+async def test_a_verifier_that_ignores_the_user_model_is_a_configuration_fault() -> None:
+    """Otherwise the wrong model reaches user code and 500s on its first extra field."""
+    auth = BetterAuth(verifiers=[WrongModelVerifier(HEADER_A)])
+
+    with pytest.raises(ConfigurationError):
+        await resolve_for(auth, user_model=AdminUser)(connection(**{HEADER_A: GOOD_CREDENTIAL}))
+
+
+def test_a_rogue_verifier_never_grants_anonymous_access() -> None:
+    """The wire form of the fail-open: `optional_session` must not answer 200 with a null
+    session for a request that presented a credential. A loud 500 is the correct answer -
+    the verifier is broken, and hiding that behind a 401 would make it permanent."""
+    auth = BetterAuth(verifiers=[NullVerifier(HEADER_A)])
+    with TestClient(session_app(auth), raise_server_exceptions=False) as http:
+        response = http.get("/optional", headers={HEADER_A: GOOD_CREDENTIAL})
+
+    assert response.status_code == 500
+    assert response.text != '{"id":null,"model":null}'
+
+
+@pytest.mark.parametrize(
+    ("verifier_cls", "header"),
+    [(RaisingExtractVerifier, HEADER_A), (RaisingVerifyVerifier, HEADER_A)],
+    ids=["extract-raises", "verify-raises"],
+)
+def test_an_exception_escaping_a_verifier_answers_the_uniform_401(
+    verifier_cls: Any, header: str
+) -> None:
+    """A 500 is the only wire-distinguishable request-time outcome, and under a debug
+    handler its body is a traceback carrying the credential out of the frame locals."""
+    auth = BetterAuth(verifiers=[verifier_cls(header)])
+    with TestClient(session_app(auth)) as http:
+        response = http.get("/required", headers={header: BAD_CREDENTIAL})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Not authenticated"}
+    assert BAD_CREDENTIAL not in response.text
+
+
+@pytest.mark.anyio
+async def test_a_contained_exception_names_only_its_type() -> None:
+    auth = BetterAuth(verifiers=[RaisingVerifyVerifier(HEADER_A)])
+
+    with pytest.raises(InvalidCredential) as caught:
+        await resolve_for(auth)(connection(**{HEADER_A: BAD_CREDENTIAL}))
+
+    reason = caught.value.reason
+    assert "RuntimeError" in reason
+    assert "RaisingVerifyVerifier" in reason
+    assert BAD_CREDENTIAL not in reason
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.anyio
+async def test_containment_never_swallows_a_configuration_error() -> None:
+    """A deployment fault must stay loud; degrading it to a 401 would hide it forever."""
+    auth = BetterAuth(verifiers=[BrokenConfigVerifier(HEADER_A)])
+
+    with pytest.raises(ConfigurationError):
+        await resolve_for(auth)(connection(**{HEADER_A: GOOD_CREDENTIAL}))
+
+
+@pytest.mark.anyio
+async def test_containment_never_swallows_a_session_error() -> None:
+    """A verifier's own refusal is the answer, not something to reinterpret."""
+    auth = BetterAuth(verifiers=[FailingVerifier(HEADER_A, SessionExpired, "elapsed")])
+
+    with pytest.raises(SessionExpired):
+        await resolve_for(auth)(connection(**{HEADER_A: BAD_CREDENTIAL}))
+
+
+@pytest.mark.anyio
+async def test_no_raw_credential_survives_in_the_dispatch_frame() -> None:
+    """Error reporters capture frame locals; this frame is the sole holder on the
+    ambiguity path, where no verifier frame exists to blame."""
+    secret = "raw-session-token-9f3ab21c"
+    auth = BetterAuth(verifiers=[FakeVerifier(HEADER_A), FakeVerifier(HEADER_B)])
+
+    with pytest.raises(AmbiguousCredentials) as caught:
+        await resolve_for(auth)(connection(**{HEADER_A: secret, HEADER_B: secret}))
+
+    rendered = " ".join(repr(frame.f_locals) for frame in _library_frames(caught.value))
+
+    assert rendered, "no library frame was captured; retune this probe"
+    assert secret not in rendered, "a presented credential survived in a captured frame"
+
+
+def _library_frames(error: BaseException) -> list[Any]:
+    """Only this library's own frames — a test's locals are not what a reporter blames."""
+    frames: list[Any] = []
+    tb = error.__traceback__
+    while tb is not None:
+        if "fastapi_better_auth" in tb.tb_frame.f_code.co_filename:
+            frames.append(tb.tb_frame)
+        tb = tb.tb_next
+    return frames
 
 
 # --- rule 3: two or more credentials ---------------------------------------------------

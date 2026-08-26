@@ -9,15 +9,24 @@ assertion rather than a hope.
 
 from __future__ import annotations
 
+import functools
 import inspect
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timezone
 from typing import Any, TypeVar
 
 from fastapi import Depends, FastAPI, params
+from fastapi.testclient import TestClient
 from starlette.requests import HTTPConnection
 
-from fastapi_better_auth import BetterAuth, InvalidCredential, Session, SessionError, User
+from fastapi_better_auth import (
+    BetterAuth,
+    ConfigurationError,
+    InvalidCredential,
+    Session,
+    SessionError,
+    User,
+)
 from fastapi_better_auth._internal.parsing import parse_user
 
 UserModelT = TypeVar("UserModelT", bound=User)
@@ -84,6 +93,95 @@ class FailingVerifier:
         raise self.error_cls(reason=self.reason)
 
 
+class NullVerifier:
+    """Accepts the credential and returns nothing — a `verify` that fell off the end.
+
+    The rogue shape that matters most: `None` is the dispatcher's absence signal, so an
+    unguarded return would downgrade a presented credential to anonymous.
+    """
+
+    def __init__(self, header: str) -> None:
+        self.header = header
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get(self.header)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        return None  # pyright: ignore[reportReturnType]
+
+
+class WrongModelVerifier:
+    """Ignores `user_model` and always builds a plain `User`."""
+
+    def __init__(self, header: str) -> None:
+        self.header = header
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        return Session(  # pyright: ignore[reportReturnType]
+            user=User.model_validate(VALID_PAYLOAD),
+            expires_at=EXPIRES_AT,
+            raw=dict(VALID_PAYLOAD),
+        )
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get(self.header)
+
+
+class RaisingExtractVerifier:
+    """`extract` parses attacker bytes, so `extract` can be made to raise."""
+
+    def __init__(self, header: str) -> None:
+        self.header = header
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        raise RuntimeError(f"parser blew up on {connection.headers.get(self.header)!r}")
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        raise NotImplementedError
+
+
+class BrokenConfigVerifier:
+    """`extract` raises a `ConfigurationError` — a deployment fault, not a bad credential."""
+
+    def __init__(self, header: str) -> None:
+        self.header = header
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        raise ConfigurationError("secondary storage was never configured")
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        raise NotImplementedError
+
+
+class RaisingVerifyVerifier:
+    """`verify` raises something that is not a `SessionError` — a bug, or a stray library error."""
+
+    def __init__(self, header: str) -> None:
+        self.header = header
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get(self.header)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        raise RuntimeError(f"jwt library blew up on {credential!r}")
+
+
+def traced(function: Callable[..., Any]) -> Callable[..., Any]:
+    """A plain metrics/tracing decorator — the shape that hides `async def` from `inspect`."""
+
+    @functools.wraps(function)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
+class TracedVerifier(FakeVerifier):
+    """A perfectly good verifier whose `verify` is wrapped by a non-async decorator."""
+
+    verify = traced(FakeVerifier.verify)
+
+
 class AsyncExtractVerifier:
     """Structurally a verifier, but `extract` is a coroutine function.
 
@@ -99,17 +197,28 @@ class AsyncExtractVerifier:
 
 
 class SyncVerifyVerifier:
-    """`verify` is not awaitable; awaiting it would be a request-time 500."""
+    """`verify` returns a session rather than an awaitable — the forgotten `async def`."""
 
     def extract(self, connection: HTTPConnection) -> str | None:
         return connection.headers.get("x-sync")
 
     def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
-        raise NotImplementedError
+        return Session(
+            user=parse_user(user_model, VALID_PAYLOAD),
+            expires_at=EXPIRES_AT,
+            raw=dict(VALID_PAYLOAD),
+        )
 
 
 class NotAVerifier:
     """Neither method: the shape a typo or a half-written class produces."""
+
+
+class NonCallableVerifier:
+    """Both attributes exist and neither is callable — `isinstance` still says yes."""
+
+    extract = "not-a-function"
+    verify = "not-a-function"
 
 
 def connection(**headers: str) -> HTTPConnection:
@@ -130,6 +239,11 @@ def resolver_of(dependency: Callable[..., Any]) -> Callable[..., Awaitable[Sessi
     anchored = default.dependency
     assert anchored is not None
     return anchored
+
+
+def client(app: FastAPI, backend: str = "asyncio") -> TestClient:
+    """Starlette supports Trio; an asyncio-only integration lane covers half the surface."""
+    return TestClient(app, backend=backend)  # pyright: ignore[reportArgumentType]
 
 
 def session_app(auth: BetterAuth, *, user_model: type[User] = User) -> FastAPI:

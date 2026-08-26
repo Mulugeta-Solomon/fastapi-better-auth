@@ -69,7 +69,10 @@ class Verifier(Protocol):
 
         Returns:
             The credential, in whatever form `verify` expects, or `None` when this
-            verifier's credential is not on the request.
+            verifier's credential is not on the request. `None` is the *only* absence
+            signal - an empty string counts as present, and will be dispatched to
+            `verify`. Return `None` for a blank or whitespace-only value, or a planted
+            empty cookie from a sibling subdomain will make every request ambiguous.
         """
         ...
 
@@ -81,15 +84,21 @@ class Verifier(Protocol):
         already committed to this verifier - whatever it raises is the answer to the
         request, and no other verifier is consulted.
 
+        Declare it with `async def`; a plain function is checked for an awaitable result
+        and refused loudly if it does not return one.
+
         Every failure is a `SessionError` subclass carrying a `reason` for operators.
-        Parse the upstream payload through the library's user parser rather than calling
-        the model directly, so a validation failure becomes `InvalidCredential` instead of
-        a 500 that echoes the payload.
+        Anything else that escapes - including a `pydantic.ValidationError` from parsing
+        the upstream payload - is contained as `InvalidCredential` and logged, so a
+        crafted credential cannot be told apart from any other refusal. Do the containment
+        yourself where you can: catch `ValidationError` around your model parsing and
+        raise `InvalidCredential` with a reason that names the field rather than the value.
 
         Args:
             credential: Exactly what this verifier's own `extract` returned.
             user_model: The `User` subclass the application asked for. Return
-                `Session[user_model]`, not `Session[User]`.
+                `Session[user_model]`, not `Session[User]`: returning the wrong model, or
+                returning `None`, is refused as a configuration fault.
 
         Returns:
             The verified session.

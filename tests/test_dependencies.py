@@ -15,11 +15,11 @@ from typing import Any
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, Request, Response, WebSocket
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.testclient import TestClient
 from typing_extensions import assert_type
 
 from fastapi_better_auth import (
     BetterAuth,
+    ConfigurationError,
     MissingCredential,
     Session,
     User,
@@ -28,6 +28,7 @@ from tests.fakes import (
     BAD_CREDENTIAL,
     GOOD_CREDENTIAL,
     FakeVerifier,
+    client,
     resolver_of,
     session_app,
 )
@@ -93,6 +94,23 @@ def test_a_different_user_model_gets_its_own_resolver() -> None:
     )
 
 
+def test_the_optional_default_user_model_memoizes_with_the_explicit_one() -> None:
+    _verifier, auth = one_verifier()
+
+    assert auth.optional_session() is auth.optional_session(user_model=User)
+
+
+def test_a_rejected_user_model_does_not_poison_the_cache() -> None:
+    """The non-obvious half of the memoization contract: a `ConfigurationError` must leave
+    nothing half-written, or the next good call would hand out a second callable."""
+    _verifier, auth = one_verifier()
+
+    with pytest.raises(ConfigurationError):
+        auth.current_session(user_model=str)  # pyright: ignore[reportArgumentType]
+
+    assert auth.current_session(user_model=User) is auth.current_session(user_model=User)
+
+
 def test_two_apps_never_share_a_cache() -> None:
     _first, one = one_verifier()
     _second, other = one_verifier()
@@ -150,19 +168,19 @@ def both_factories_app() -> tuple[FakeVerifier, FastAPI]:
     return verifier, app
 
 
-def test_a_router_level_and_a_route_level_dependency_verify_once() -> None:
+def test_a_router_level_and_a_route_level_dependency_verify_once(client_backend: str) -> None:
     verifier, app = router_and_route_app()
-    with TestClient(app) as client:
-        response = client.get("/me", headers={HEADER: GOOD_CREDENTIAL})
+    with client(app, client_backend) as http:
+        response = http.get("/me", headers={HEADER: GOOD_CREDENTIAL})
 
     assert response.status_code == 200
     assert verifier.verify_calls == 1
 
 
-def test_required_and_optional_on_one_route_verify_once() -> None:
+def test_required_and_optional_on_one_route_verify_once(client_backend: str) -> None:
     verifier, app = both_factories_app()
-    with TestClient(app) as client:
-        response = client.get("/me", headers={HEADER: GOOD_CREDENTIAL})
+    with client(app, client_backend) as http:
+        response = http.get("/me", headers={HEADER: GOOD_CREDENTIAL})
 
     assert response.status_code == 200
     assert verifier.verify_calls == 1
@@ -172,9 +190,9 @@ def test_required_and_optional_on_one_route_verify_once() -> None:
 def test_the_spy_counts_across_requests_rather_than_within_one() -> None:
     """Prove the instrument: a counter stuck at 1 would pass both tests above."""
     verifier, app = router_and_route_app()
-    with TestClient(app) as client:
+    with client(app) as http:
         for _ in range(3):
-            client.get("/me", headers={HEADER: GOOD_CREDENTIAL})
+            http.get("/me", headers={HEADER: GOOD_CREDENTIAL})
 
     assert verifier.verify_calls == 3
 
@@ -182,38 +200,38 @@ def test_the_spy_counts_across_requests_rather_than_within_one() -> None:
 # --- the two contracts ----------------------------------------------------------------
 
 
-def test_current_session_refuses_an_anonymous_request() -> None:
+def test_current_session_refuses_an_anonymous_request(client_backend: str) -> None:
     _verifier, auth = one_verifier()
-    with TestClient(session_app(auth)) as client:
-        response = client.get("/required")
+    with client(session_app(auth), client_backend) as http:
+        response = http.get("/required")
 
     assert response.status_code == 401
     assert response.json() == {"detail": "Not authenticated"}
     assert response.headers["www-authenticate"] == "Bearer"
 
 
-def test_optional_session_returns_none_for_an_anonymous_request() -> None:
+def test_optional_session_returns_none_for_an_anonymous_request(client_backend: str) -> None:
     _verifier, auth = one_verifier()
-    with TestClient(session_app(auth)) as client:
-        response = client.get("/optional")
+    with client(session_app(auth), client_backend) as http:
+        response = http.get("/optional")
 
     assert response.status_code == 200
     assert response.json() == {"id": None, "model": None}
 
 
-def test_optional_session_never_swallows_an_invalid_credential() -> None:
+def test_optional_session_never_swallows_an_invalid_credential(client_backend: str) -> None:
     """D-004: `None` means "nobody asked", never "somebody asked badly"."""
     _verifier, auth = one_verifier()
-    with TestClient(session_app(auth)) as client:
-        response = client.get("/optional", headers={HEADER: BAD_CREDENTIAL})
+    with client(session_app(auth), client_backend) as http:
+        response = http.get("/optional", headers={HEADER: BAD_CREDENTIAL})
 
     assert response.status_code == 401
 
 
 def test_optional_session_never_swallows_ambiguity() -> None:
     auth = BetterAuth(verifiers=[FakeVerifier(HEADER), FakeVerifier(HEADER_B)])
-    with TestClient(session_app(auth)) as client:
-        response = client.get(
+    with client(session_app(auth)) as http:
+        response = http.get(
             "/optional", headers={HEADER: GOOD_CREDENTIAL, HEADER_B: GOOD_CREDENTIAL}
         )
 
@@ -223,8 +241,8 @@ def test_optional_session_never_swallows_ambiguity() -> None:
 def test_optional_session_never_swallows_a_malformed_payload() -> None:
     verifier = FakeVerifier(HEADER, payload={"id": ""})
     auth = BetterAuth(verifiers=[verifier])
-    with TestClient(session_app(auth)) as client:
-        response = client.get("/optional", headers={HEADER: GOOD_CREDENTIAL})
+    with client(session_app(auth)) as http:
+        response = http.get("/optional", headers={HEADER: GOOD_CREDENTIAL})
 
     assert response.status_code == 401
 
@@ -240,8 +258,8 @@ def test_the_missing_credential_reason_names_the_verifiers_that_were_asked() -> 
         return await http_exception_handler(request, exc)
 
     app.add_exception_handler(MissingCredential, record)
-    with TestClient(app) as client:
-        response = client.get("/required")
+    with client(app) as http:
+        response = http.get("/required")
 
     assert response.status_code == 401
     assert observed
@@ -251,11 +269,11 @@ def test_the_missing_credential_reason_names_the_verifiers_that_were_asked() -> 
 # --- the user model travels through the dependency ------------------------------------
 
 
-def test_a_subclass_user_model_survives_the_round_trip() -> None:
+def test_a_subclass_user_model_survives_the_round_trip(client_backend: str) -> None:
     verifier = FakeVerifier(HEADER, payload={"id": "u1", "role": "admin"})
     auth = BetterAuth(verifiers=[verifier])
-    with TestClient(session_app(auth, user_model=AdminUser)) as client:
-        response = client.get("/required", headers={HEADER: GOOD_CREDENTIAL})
+    with client(session_app(auth, user_model=AdminUser), client_backend) as http:
+        response = http.get("/required", headers={HEADER: GOOD_CREDENTIAL})
 
     assert response.status_code == 200
     assert response.json() == {"id": "u1", "model": "AdminUser"}
@@ -264,7 +282,7 @@ def test_a_subclass_user_model_survives_the_round_trip() -> None:
 # --- websockets are connections too ----------------------------------------------------
 
 
-def test_the_dependency_resolves_on_a_websocket() -> None:
+def test_the_dependency_resolves_on_a_websocket(client_backend: str) -> None:
     """`HTTPConnection`, not `Request`: the same dependency has to work on both, and
     nothing in the resolver may reach for an HTTP-only attribute."""
     verifier, auth = one_verifier()
@@ -281,8 +299,8 @@ def test_the_dependency_resolves_on_a_websocket() -> None:
 
     app.add_api_websocket_route("/ws", socket)
     with (
-        TestClient(app) as client,
-        client.websocket_connect("/ws", headers={HEADER: GOOD_CREDENTIAL}) as ws,
+        client(app, client_backend) as http,
+        http.websocket_connect("/ws", headers={HEADER: GOOD_CREDENTIAL}) as ws,
     ):
         received = ws.receive_text()
 
@@ -295,8 +313,8 @@ def test_the_connection_parameter_never_becomes_a_documented_query_parameter(pat
     """FastAPI resolves `HTTPConnection` from the ASGI scope; anything it did not
     recognize would surface as a required query parameter and break every route."""
     _verifier, auth = one_verifier()
-    with TestClient(session_app(auth)) as client:
-        document: dict[str, Any] = client.get("/openapi.json").json()
+    with client(session_app(auth)) as http:
+        document: dict[str, Any] = http.get("/openapi.json").json()
 
     operation: dict[str, Any] = document["paths"][path]["get"]
     assert operation.get("parameters", []) == []

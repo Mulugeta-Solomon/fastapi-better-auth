@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ipaddress
+import re
 from collections.abc import Mapping
 from types import MappingProxyType
 from urllib.parse import SplitResult, urlsplit
@@ -11,6 +13,8 @@ from .errors import ConfigurationError
 ALLOWED_SCHEMES = ("https", "http")
 DEFAULT_PORTS: Mapping[str, int] = MappingProxyType({"https": 443, "http": 80})
 EXAMPLE = "https://auth.example.com"
+HOSTNAME = re.compile(r"(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))*")
+MAX_HOST_LENGTH = 253
 
 
 def normalize_base_url(value: str, *, field: str = "base_url") -> str:
@@ -22,15 +26,26 @@ def normalize_base_url(value: str, *, field: str = "base_url") -> str:
     therefore be two origins, so the string is canonicalized once, at startup, and the
     canonical form is what the rest of the library ever sees.
 
-    Accepted input is an origin and nothing else: a scheme (`https`, or `http` for a local
-    development server), a host, and an optional port. A path, a query, a fragment or
-    embedded credentials are rejected rather than silently dropped, because each of them
-    means the caller believed this value was something it is not.
+    Accepted input is an origin and nothing else: a scheme, a host, and an optional port.
+    A path, a query, a fragment or embedded credentials are rejected rather than silently
+    dropped, because each of them means the caller believed this value was something it is
+    not.
 
-    Canonicalization lowercases the scheme and host, drops a single trailing slash, and
-    removes the port when it is the scheme's default, so `HTTPS://Auth.Example.COM:443/`
-    and `https://auth.example.com` are one value. The result is idempotent: normalizing it
-    again returns it unchanged.
+    The host must be an ASCII hostname or an IP literal. A non-ASCII host is refused
+    rather than converted, because the conversion is where the two dangerous things live:
+    several Unicode codepoints are IDNA *label separators*, so a host that reads as
+    `auth.example.com` in configuration can be fetched from a subdomain of somewhere else
+    entirely - while still comparing equal as an issuer, because it is compared against
+    the same spelling. Pass the punycode (`xn--`) form if you need an international domain.
+
+    `http` is accepted only for a loopback host. A key set fetched over cleartext can be
+    replaced by anyone on the path, and a substituted key set is a complete authentication
+    bypass with no signature left to fall back on.
+
+    Canonicalization lowercases the scheme and host, drops one trailing slash and one
+    trailing dot, compresses IP literals, and removes the port when it is the scheme's
+    default, so `HTTPS://Auth.Example.COM:443/` and `https://auth.example.com` are one
+    value. The result is idempotent: normalizing it again returns it unchanged.
 
     Args:
         value: The URL as the operator wrote it, typically from configuration or an
@@ -52,7 +67,15 @@ def normalize_base_url(value: str, *, field: str = "base_url") -> str:
     split = _split(text, field)
     scheme = _scheme(split, field)
     _reject_userinfo(split, field)
-    origin = f"{scheme}://{_authority(split, scheme, field)}"
+    host, loopback = _canonical_host(split, field)
+    if scheme == "http" and not loopback:
+        raise ConfigurationError(
+            f"{field} uses http for {host!r}. A key set or session fetched over cleartext"
+            " can be replaced by anyone on the network path, and a substituted key set is a"
+            " complete authentication bypass. http is accepted only for a loopback host"
+            f" (localhost, 127.0.0.0/8, ::1); use https for anything else."
+        )
+    origin = f"{scheme}://{host}{_port(split, scheme, field)}"
     _reject_extras(split, origin, field)
     return origin
 
@@ -75,7 +98,7 @@ def _as_text(value: object, field: str) -> str:
 def _split(text: str, field: str) -> SplitResult:
     try:
         split = urlsplit(text)
-        _port_is_parseable = split.port
+        _parseable_port = split.port
     except ValueError as exc:
         raise ConfigurationError(
             f"{field} is not a usable URL. Pass an origin such as {EXAMPLE!r}."
@@ -103,17 +126,57 @@ def _reject_userinfo(split: SplitResult, field: str) -> None:
         )
 
 
-def _authority(split: SplitResult, scheme: str, field: str) -> str:
-    host = split.hostname
-    if not host:
+def _canonical_host(split: SplitResult, field: str) -> tuple[str, bool]:
+    """The authority host, in the exact spelling that will later be dialled."""
+    raw = split.hostname
+    if not raw:
         raise ConfigurationError(
             f"{field} must include a host. Pass an origin such as {EXAMPLE!r}."
         )
-    bracketed = f"[{host}]" if ":" in host else host
+    if ":" in raw:
+        address = ip_literal(raw, field)
+        return f"[{address.compressed}]", address.is_loopback
+    if not raw.isascii():
+        raise ConfigurationError(
+            f"{field} must have an ASCII host. Several Unicode characters are IDNA label"
+            " separators, so a non-ASCII host can be fetched from a different domain than"
+            " the one it reads as. Pass the punycode ('xn--') form."
+        )
+    host = raw.removesuffix(".")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if not HOSTNAME.fullmatch(host) or len(host) > MAX_HOST_LENGTH:
+            raise ConfigurationError(
+                f"{field} has an unusable host {host!r}. A host is letters, digits, hyphens"
+                f" and dots, or an IP literal. Pass an origin such as {EXAMPLE!r}."
+            ) from None
+        return host, host == "localhost"
+    return address.compressed, address.is_loopback
+
+
+def ip_literal(raw: str, field: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    unusable = (
+        f"{field} has an unusable IPv6 host. Pass a bracketed literal such as"
+        " 'https://[::1]', with no zone identifier."
+    )
+    if "%" in raw:
+        raise ConfigurationError(unusable)
+    try:
+        return ipaddress.ip_address(raw)
+    except ValueError:
+        raise ConfigurationError(unusable) from None
+
+
+def _port(split: SplitResult, scheme: str, field: str) -> str:
     port = split.port
     if port is None or port == DEFAULT_PORTS[scheme]:
-        return bracketed
-    return f"{bracketed}:{port}"
+        return ""
+    if port == 0:
+        raise ConfigurationError(
+            f"{field} must not use port 0, which is not a port anything can be reached on."
+        )
+    return f":{port}"
 
 
 def _reject_extras(split: SplitResult, origin: str, field: str) -> None:

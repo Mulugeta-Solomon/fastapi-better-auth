@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, TypeVar, cast
 
 from fastapi import Depends
 from starlette.requests import HTTPConnection
 
-from .errors import AmbiguousCredentials, ConfigurationError, MissingCredential
+from .errors import (
+    AmbiguousCredentials,
+    BetterAuthError,
+    ConfigurationError,
+    InvalidCredential,
+    MissingCredential,
+    SessionError,
+)
 from .models import Session, User
 from .verifiers import Verifier
+
+logger = logging.getLogger("fastapi_better_auth")
 
 UserModelT = TypeVar("UserModelT", bound=User)
 
@@ -28,11 +38,11 @@ class BetterAuth:
 
         auth = BetterAuth(verifiers=[JwtVerifier(base_url="https://auth.example.com")])
 
-        CurrentSession = Annotated[Session[MyUser], Depends(auth.current_session(user_model=MyUser))]
-        MaybeSession = Annotated[Session[MyUser] | None, Depends(auth.optional_session(user_model=MyUser))]
+        Current = Annotated[Session[MyUser], Depends(auth.current_session(user_model=MyUser))]
+        Maybe = Annotated[Session[MyUser] | None, Depends(auth.optional_session(user_model=MyUser))]
 
         @app.get("/me")
-        async def me(session: CurrentSession) -> MyUser:
+        async def me(session: Current) -> MyUser:
             return session.user
 
     **Which verifier answers is decided by which credential is present**, in the order the
@@ -49,9 +59,19 @@ class BetterAuth:
       returns `None`. That is the only case in which `optional_session` returns `None`.
 
     Everything that can be wrong with the configuration is raised while the application is
-    being built - an empty verifier list, an object that is not a verifier, a user model
-    that is not a `User` - so a deployment that could not verify safely never finishes
-    starting up.
+    being built - an empty verifier list, the same verifier twice, an object that is not a
+    verifier, a user model that is not a `User` - so a deployment that could not verify
+    safely never finishes starting up. The two faults that cannot be seen until a request
+    arrives, because `Verifier` is a structural protocol, are still answered as
+    `ConfigurationError` rather than as a refusal: a `verify` that is not awaitable, and
+    one that answers with something other than a `Session` of the requested user model.
+    Degrading either into a 401 would hide a broken verifier permanently, and a `None`
+    answer taken at face value would read as "nobody asked".
+
+    An exception that escapes a verifier is contained: it is logged with its traceback and
+    answered as `InvalidCredential`. `extract` parses attacker-supplied bytes, so a crafted
+    credential that makes a parser raise would otherwise produce a 500 - the one
+    request-time answer a client can tell apart from every other.
 
     Args:
         verifiers: One or more verifiers, in the order their credentials should be looked
@@ -62,8 +82,9 @@ class BetterAuth:
         ConfigurationError: If the sequence is empty, or an entry is not a usable verifier.
     """
 
-    def __init__(self, verifiers: Sequence[Verifier]) -> None:
+    def __init__(self, *, verifiers: Sequence[Verifier]) -> None:
         self._verifiers = _validated(verifiers)
+        self._nothing = _nothing_presented(self._verifiers)
         self._resolvers: dict[type[User], Resolver] = {}
         self._required: dict[type[User], Dependency] = {}
         self._optional: dict[type[User], Dependency] = {}
@@ -74,7 +95,7 @@ class BetterAuth:
         return self._verifiers
 
     def current_session(
-        self, user_model: type[UserModelT] = User
+        self, *, user_model: type[UserModelT] = User
     ) -> Callable[..., Awaitable[Session[UserModelT]]]:
         """Build the dependency that requires a verified session.
 
@@ -96,8 +117,11 @@ class BetterAuth:
             A dependency callable to pass to `Depends`.
 
         Raises:
-            ConfigurationError: If `user_model` is not a `User` subclass.
+            ConfigurationError: If `user_model` is not a `User` subclass; at request time,
+                if a verifier answers with something that is not a `Session[user_model]`.
             MissingCredential: At request time, when no verifier found a credential.
+            AmbiguousCredentials: At request time, when two or more verifiers did.
+            SessionError: At request time, whatever the chosen verifier raised.
         """
         _validate_user_model(user_model)
         cached = self._required.get(user_model)
@@ -106,7 +130,7 @@ class BetterAuth:
         return cast("Callable[..., Awaitable[Session[UserModelT]]]", cached)
 
     def optional_session(
-        self, user_model: type[UserModelT] = User
+        self, *, user_model: type[UserModelT] = User
     ) -> Callable[..., Awaitable[Session[UserModelT] | None]]:
         """Build the dependency that allows an anonymous request through.
 
@@ -127,7 +151,9 @@ class BetterAuth:
             or `None`.
 
         Raises:
-            ConfigurationError: If `user_model` is not a `User` subclass.
+            ConfigurationError: If `user_model` is not a `User` subclass; at request time,
+                if a verifier answers with something that is not a `Session[user_model]`.
+            AmbiguousCredentials: At request time, when two or more verifiers found one.
             SessionError: At request time, for any credential that was presented and did
                 not verify.
         """
@@ -142,7 +168,7 @@ class BetterAuth:
 
         async def require(session: Session[Any] | None = Depends(resolve)) -> Session[Any]:
             if session is None:
-                raise MissingCredential(reason=self._nothing_presented())
+                raise MissingCredential(reason=self._nothing)
             return session
 
         return require
@@ -171,23 +197,92 @@ class BetterAuth:
         presented: Presented = [
             (verifier, credential)
             for verifier in self._verifiers
-            if (credential := verifier.extract(connection)) is not None
+            if (credential := _extracted(verifier, connection)) is not None
         ]
         if len(presented) > 1:
-            raise AmbiguousCredentials(reason=_ambiguity(presented))
+            names = [type(verifier).__name__ for verifier, _credential in presented]
+            presented.clear()
+            credential = None
+            raise AmbiguousCredentials(reason=_ambiguity(names))
         if not presented:
             return None
         verifier, credential = presented[0]
-        return await verifier.verify(credential, user_model)
+        presented.clear()
+        try:
+            answer = await _verified(verifier, credential, user_model)
+        finally:
+            credential = None
+        return _checked(answer, verifier, user_model)
 
-    def _nothing_presented(self) -> str:
-        asked = ", ".join(type(verifier).__name__ for verifier in self._verifiers)
-        return f"no credential presented; verifiers asked: {asked}"
+
+def _extracted(verifier: Verifier, connection: HTTPConnection) -> object | None:
+    try:
+        return verifier.extract(connection)
+    except BetterAuthError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
+        raise _contained(exc, verifier, "extract") from None
 
 
-def _ambiguity(presented: Presented) -> str:
-    names = ", ".join(type(verifier).__name__ for verifier, _credential in presented)
-    return f"{len(presented)} credentials presented at once: {names}"
+async def _verified(verifier: Verifier, credential: object, user_model: type[UserModelT]) -> Any:
+    answer = verifier.verify(credential, user_model)
+    if not inspect.isawaitable(answer):
+        raise ConfigurationError(
+            f"{type(verifier).__name__}.verify() did not return an awaitable. Declare it"
+            " with `async def`."
+        )
+    try:
+        return await answer
+    except (BetterAuthError, SessionError):
+        raise
+    except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
+        raise _contained(exc, verifier, "verify") from None
+
+
+def _contained(exc: Exception, verifier: Verifier, method: str) -> InvalidCredential:
+    """Turn an escaping exception into the uniform refusal, and log the real one.
+
+    A 500 is the only request-time answer a client can tell apart from every other, and
+    `extract` parses attacker bytes by definition - so a crafted credential that makes a
+    parser raise becomes a probe for which verifiers this deployment runs. Under a debug
+    handler the 500 body is a traceback carrying the credential out of the frame locals.
+    Operators still get the whole traceback, through the log.
+    """
+    name = type(verifier).__name__
+    logger.exception("%s.%s raised", name, method)
+    return InvalidCredential(reason=f"{type(exc).__name__} escaped {name}.{method}")
+
+
+def _checked(session: Any, verifier: Verifier, user_model: type[UserModelT]) -> Session[UserModelT]:
+    """Check the answer rather than assume it: `Verifier` is a structural protocol.
+
+    `None` is the dispatcher's absence signal, so returning it unchecked would degrade a
+    credential that *was* presented into an anonymous request - which `optional_session`
+    answers with a 200. A loud refusal is the right answer to a broken verifier; a uniform
+    401 would hide it forever.
+    """
+    name = type(verifier).__name__
+    if not isinstance(session, Session):
+        raise ConfigurationError(
+            f"{name}.verify() returned {type(session).__name__} for a credential it"
+            " accepted; it must return a Session or raise a SessionError."
+        )
+    typed = cast("Session[UserModelT]", session)
+    if not isinstance(typed.user, user_model):
+        raise ConfigurationError(
+            f"{name}.verify() ignored user_model: it returned a"
+            f" {type(typed.user).__name__} where {user_model.__name__} was asked for."
+        )
+    return typed
+
+
+def _nothing_presented(verifiers: Sequence[Verifier]) -> str:
+    asked = ", ".join(type(verifier).__name__ for verifier in verifiers)
+    return f"no credential presented; verifiers asked: {asked}"
+
+
+def _ambiguity(names: Sequence[str]) -> str:
+    return f"{len(names)} credentials presented at once: {', '.join(names)}"
 
 
 def _validated(verifiers: object) -> tuple[Verifier, ...]:
@@ -196,15 +291,23 @@ def _validated(verifiers: object) -> tuple[Verifier, ...]:
             "BetterAuth(verifiers=...) takes a sequence of verifiers, in the order their"
             f" credentials should be looked for; got {type(verifiers).__name__}."
         )
-    ordered = cast("tuple[Verifier, ...]", tuple(cast("Sequence[object]", verifiers)))
+    ordered = tuple(cast("Sequence[object]", verifiers))
     if not ordered:
         raise ConfigurationError(
             "BetterAuth(verifiers=...) needs at least one verifier: with none configured,"
             " every request would be answered as unauthenticated."
         )
+    seen: list[object] = []
     for index, verifier in enumerate(ordered):
         _validate_verifier(verifier, index)
-    return ordered
+        if any(verifier is earlier for earlier in seen):
+            raise ConfigurationError(
+                f"BetterAuth(verifiers=...) lists the same {type(verifier).__name__} twice."
+                " Both copies would find the same credential, so every request carrying it"
+                " would be ambiguous."
+            )
+        seen.append(verifier)
+    return cast("tuple[Verifier, ...]", ordered)
 
 
 def _validate_verifier(verifier: object, index: int) -> None:
@@ -215,16 +318,14 @@ def _validate_verifier(verifier: object, index: int) -> None:
             " protocol: it needs a synchronous extract(connection) and an async"
             " verify(credential, user_model)."
         )
+    for method in ("extract", "verify"):
+        if not callable(getattr(verifier, method)):
+            raise ConfigurationError(f"{where} has a {method} that is not callable.")
     if inspect.iscoroutinefunction(verifier.extract):
         raise ConfigurationError(
             f"{where} declares extract() as async. extract() is a synchronous presence"
             " check; an async one returns a coroutine object, which is never None, so this"
             " verifier would claim every request and every request would be ambiguous."
-        )
-    if not inspect.iscoroutinefunction(verifier.verify):
-        raise ConfigurationError(
-            f"{where} declares verify() as a plain function. verify() is awaited on every"
-            " request, so a synchronous one would fail at request time rather than here."
         )
 
 

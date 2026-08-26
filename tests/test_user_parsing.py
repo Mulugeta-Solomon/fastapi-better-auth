@@ -9,10 +9,11 @@ input out of it.
 
 from __future__ import annotations
 
+import traceback
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import ConfigDict, Field, ValidationError, field_validator
 
 from fastapi_better_auth import InvalidCredential, User
 from fastapi_better_auth._internal.parsing import parse_user
@@ -26,6 +27,31 @@ class AdminUser(User):
     """A deployment's own user model, with a field the upstream payload must carry."""
 
     role: str
+
+
+class StrictUser(User):
+    """`extra="forbid"` puts the rejected key - which the payload chose - into `loc`."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class TaggedUser(User):
+    """A mapping field puts the payload's own keys into `loc`."""
+
+    labels: dict[str, str] = Field(default_factory=dict)
+
+
+class ChattyUser(User):
+    """A validator that interpolates the value it rejected into its own message."""
+
+    role: str = ""
+
+    @field_validator("role")
+    @classmethod
+    def reject_unknown(cls, value: str) -> str:
+        if value not in ("admin", "member", ""):
+            raise ValueError(f"unknown role {value}")
+        return value
 
 
 MALFORMED: tuple[tuple[str, Any], ...] = (
@@ -104,11 +130,62 @@ def test_the_reason_does_not_echo_a_long_input_value_either() -> None:
     assert LEAKY_MARKER not in caught.value.reason
 
 
-def test_the_original_validation_error_stays_reachable_for_operators() -> None:
+def test_the_pydantic_error_is_not_chained_onto_the_raise() -> None:
+    """`__cause__` is rendered by `logger.exception` and walked by error reporters, so
+    chaining would put `input_value=` back in both after the summary took it out."""
     with pytest.raises(InvalidCredential) as caught:
         parse_user(User, {"id": ""})
 
-    assert isinstance(caught.value.__cause__, ValidationError)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__
+
+
+def test_the_rendered_traceback_carries_no_input_value() -> None:
+    payload = {"id": f"{LEAKY_MARKER}\x00"}
+
+    with pytest.raises(InvalidCredential) as caught:
+        parse_user(User, payload)
+    with pytest.raises(ValidationError) as pydantic_error:
+        User.model_validate(payload)
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value), caught.value, caught.value.__traceback__, chain=True
+        )
+    )
+
+    assert LEAKY_MARKER in str(pydantic_error.value), "pydantic stopped echoing; retune this"
+    assert LEAKY_MARKER not in rendered
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (StrictUser, {"id": "u1", LEAKY_MARKER: "x"}),
+        (TaggedUser, {"id": "u1", "labels": {LEAKY_MARKER: 1}}),
+    ],
+    ids=["extra-forbid-key", "dict-key"],
+)
+def test_a_payload_controlled_field_name_never_reaches_the_reason(
+    model: type[User], payload: dict[str, Any]
+) -> None:
+    """`loc` is pydantic's field path, and for these two ordinary subclass shapes the path
+    itself is attacker-supplied."""
+    with pytest.raises(ValidationError) as pydantic_error:
+        model.model_validate(payload)
+    with pytest.raises(InvalidCredential) as caught:
+        parse_user(model, payload)
+
+    assert LEAKY_MARKER in str(pydantic_error.value), "pydantic stopped echoing; retune this"
+    assert LEAKY_MARKER not in caught.value.reason
+
+
+def test_a_subclass_validator_message_never_reaches_the_reason() -> None:
+    """A user model's own `ValueError` text is not ours to trust with the value it saw."""
+    with pytest.raises(InvalidCredential) as caught:
+        parse_user(ChattyUser, {"id": "u1", "role": LEAKY_MARKER})
+
+    assert LEAKY_MARKER not in caught.value.reason
+    assert "role" in caught.value.reason
 
 
 def test_the_reason_is_bounded_however_many_fields_fail() -> None:

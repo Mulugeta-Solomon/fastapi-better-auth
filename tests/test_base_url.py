@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from fastapi_better_auth import ConfigurationError
-from fastapi_better_auth._internal.urls import normalize_base_url
+from fastapi_better_auth._internal.urls import ip_literal, normalize_base_url
 
 CANONICAL: tuple[tuple[str, str], ...] = (
     ("https://auth.example.com", "https://auth.example.com"),
@@ -23,12 +23,16 @@ CANONICAL: tuple[tuple[str, str], ...] = (
     ("http://localhost:80", "http://localhost"),
     ("http://localhost", "http://localhost"),
     ("https://auth.example.com:8443", "https://auth.example.com:8443"),
-    ("http://auth.example.com:443", "http://auth.example.com:443"),
     ("https://auth.example.com:80", "https://auth.example.com:80"),
     ("http://127.0.0.1:3000", "http://127.0.0.1:3000"),
+    ("http://[::1]:3000", "http://[::1]:3000"),
     ("https://[::1]:8443", "https://[::1]:8443"),
     ("https://[::1]:443", "https://[::1]"),
     ("  https://auth.example.com  ", "https://auth.example.com"),
+    ("https://auth.example.com.", "https://auth.example.com"),
+    ("https://[0:0:0:0:0:0:0:1]", "https://[::1]"),
+    ("https://[::FFFF:127.0.0.1]", "https://[::ffff:127.0.0.1]"),
+    ("https://Keys.example.com", "https://keys.example.com"),
 )
 
 REJECTED: tuple[tuple[str, str, str], ...] = (
@@ -49,7 +53,27 @@ REJECTED: tuple[tuple[str, str, str], ...] = (
     ("embedded-tab", "https://auth.exa\tmple.com", "whitespace"),
     ("embedded-space", "https://auth.exa mple.com", "whitespace"),
     ("control-character", "https://auth.example.com\x7f", "whitespace"),
+    ("ideographic-full-stop", "https://auth.example.com。evil.example", "ASCII"),
+    ("fullwidth-full-stop", "https://auth.example.com．evil.example", "ASCII"),
+    ("halfwidth-ideographic-stop", "https://auth.example.com｡evil.example", "ASCII"),
+    ("zero-width-space", "https://auth.exa\u200bmple.com", "ASCII"),
+    ("cyrillic-homograph", "https://аuth.example.com", "ASCII"),
+    ("backslash-host", "https://auth.example.com\\evil.example", "host"),
+    ("percent-encoded-null", "https://auth.example.com%00.evil.example", "host"),
+    ("bare-dot", "https://.", "host"),
+    ("double-dot", "https://..", "host"),
+    ("empty-label", "https://auth..example.com", "host"),
+    ("leading-hyphen-label", "https://-auth.example.com", "host"),
+    ("trailing-hyphen-label", "https://auth-.example.com", "host"),
+    ("underscore-label", "https://auth_server.example.com", "host"),
+    ("ipv6-zone-id", "https://[fe80::1%25eth0]", "host"),
+    ("port-zero", "https://auth.example.com:0", "port"),
+    ("cleartext-public-host", "http://auth.example.com", "https"),
+    ("cleartext-private-ip", "http://10.0.0.5:3000", "https"),
+    ("cleartext-link-local", "http://169.254.169.254", "https"),
 )
+
+LOOPBACK_HTTP = ("http://localhost", "http://127.0.0.1", "http://[::1]", "http://127.0.0.2:8080")
 
 
 @pytest.mark.parametrize(("raw", "expected"), CANONICAL, ids=[c[0] for c in CANONICAL])
@@ -74,6 +98,34 @@ def test_rejected_forms_raise_and_name_the_fault(raw: str, needle: str) -> None:
         normalize_base_url(raw)
 
     assert needle in str(caught.value), f"the message does not name what is wrong: {caught.value}"
+
+
+@pytest.mark.parametrize("raw", LOOPBACK_HTTP)
+def test_cleartext_is_allowed_only_for_a_loopback_host(raw: str) -> None:
+    """A local development server is the one place nobody can sit on the path."""
+    assert normalize_base_url(raw).startswith("http://")
+
+
+def test_the_canonical_host_is_the_host_that_will_be_dialled() -> None:
+    """The homograph attack this closes: U+3002 is an IDNA label separator, so a host
+    stored verbatim as `auth.example.com。evil.example` - and compared equal as an issuer -
+    is fetched from a subdomain of `evil.example`."""
+    smuggled = "auth.example.com。evil.example"
+
+    assert smuggled.encode("idna") == b"auth.example.com.evil.example", "retune this probe"
+    with pytest.raises(ConfigurationError) as caught:
+        normalize_base_url(f"https://{smuggled}")
+
+    assert "ASCII" in str(caught.value)
+
+
+def test_a_cleartext_rejection_says_what_is_actually_at_risk() -> None:
+    with pytest.raises(ConfigurationError) as caught:
+        normalize_base_url("http://auth.example.com")
+
+    message = str(caught.value)
+    assert "https" in message
+    assert "loopback" in message
 
 
 def test_credentials_in_the_url_are_rejected_and_never_echoed() -> None:
@@ -111,6 +163,15 @@ def test_a_url_python_itself_refuses_to_parse_is_a_configuration_error(raw: str)
     """`urlsplit` defers its port parsing, so the failure surfaces on attribute access."""
     with pytest.raises(ConfigurationError):
         normalize_base_url(raw)
+
+
+def test_a_bracketed_host_that_is_not_an_address_is_rejected() -> None:
+    """Driven at the helper, because `urlsplit` validates bracketed hosts itself on the
+    Pythons that carry the fix - and does not on every version this package supports."""
+    with pytest.raises(ConfigurationError) as caught:
+        ip_literal("::1::2", "base_url")
+
+    assert "IPv6" in str(caught.value)
 
 
 def test_a_non_string_is_a_configuration_error_not_a_type_error() -> None:
