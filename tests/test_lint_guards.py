@@ -4,6 +4,11 @@ Every ban here encodes a security decision that a reviewer cannot be relied on t
 re-derive. The scanner reads real code tokens only, so a trap comment naming a banned
 symbol stays legal; each ban is also fired against a synthetic violation so the
 detector itself is proven, not assumed.
+
+The D-010 rules deliberately do not name a receiver. A rule written as `request` `.` `url`
+covers exactly the one identifier nothing in `src/` is called - the connection parameter is
+`connection`, and a WebSocket-facing verifier would spell it differently again - so the
+guard would have watched a spelling that never appears.
 """
 
 from __future__ import annotations
@@ -105,16 +110,40 @@ RULES: tuple[Rule, ...] = (
         probe="algs = get_default_algorithms()\n",
     ),
     Rule(
-        id="request-url",
-        reason="request.url banned: attacker-influenced via the Host header — iss/aud/origins come from operator config",
-        pattern=(name("request"), op("."), name("url")),
-        probe="issuer = request.url\n",
+        id="url-attribute",
+        reason=".url banned on any connection: attacker-influenced via the Host header — iss/aud/origins come from operator config",
+        pattern=(op("."), name("url")),
+        probe="issuer = connection.url\n",
     ),
     Rule(
-        id="request-base-url",
-        reason="request.base_url banned: attacker-influenced via the Host header — iss/aud/origins come from operator config",
-        pattern=(name("request"), op("."), name("base_url")),
+        id="base-url-attribute",
+        reason=".base_url banned on any connection: attacker-influenced via the Host header — iss/aud/origins come from operator config",
+        pattern=(op("."), name("base_url")),
         probe="issuer = request.base_url\n",
+    ),
+    Rule(
+        id="forwarded-host-get",
+        reason='headers.get("x-forwarded-host") banned: a proxy header is as attacker-controlled as Host',
+        pattern=(op("."), name("get"), op("("), text("x-forwarded-host")),
+        probe='host = connection.headers.get("X-Forwarded-Host")\n',
+    ),
+    Rule(
+        id="forwarded-proto-get",
+        reason='headers.get("x-forwarded-proto") banned: a proxy header is as attacker-controlled as Host',
+        pattern=(op("."), name("get"), op("("), text("x-forwarded-proto")),
+        probe='scheme = connection.headers.get("x-forwarded-proto")\n',
+    ),
+    Rule(
+        id="forwarded-get",
+        reason='headers.get("forwarded") banned: a proxy header is as attacker-controlled as Host',
+        pattern=(op("."), name("get"), op("("), text("forwarded")),
+        probe='hop = connection.headers.get("Forwarded")\n',
+    ),
+    Rule(
+        id="forwarded-host-subscript",
+        reason='headers["x-forwarded-host"] banned: a proxy header is as attacker-controlled as Host',
+        pattern=(name("headers"), op("["), text("x-forwarded-host")),
+        probe='host = connection.headers["x-forwarded-host"]\n',
     ),
     Rule(
         id="host-header-subscript",

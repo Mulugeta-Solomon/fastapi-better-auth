@@ -1,0 +1,396 @@
+"""Fake verifiers — WP3 ships the dispatcher, not a mode.
+
+A fake reads its credential from one header and compares it to one expected value, which
+exercises every dispatch rule without a key, a clock or a network. Every fake materializes
+its user through `parse_user`, so the containment contract is exercised for real rather
+than described, and every fake counts its own calls, so "exactly one verification" is an
+assertion rather than a hope.
+"""
+
+from __future__ import annotations
+
+import functools
+import inspect
+from collections.abc import Awaitable, Callable, Mapping
+from datetime import datetime, timezone
+from typing import Any, TypeVar
+
+import anyio
+from fastapi import Depends, FastAPI, params
+from fastapi.testclient import TestClient
+from starlette.requests import HTTPConnection
+
+from fastapi_better_auth import (
+    BetterAuth,
+    ConfigurationError,
+    InvalidCredential,
+    Session,
+    SessionError,
+    User,
+    parse_user,
+)
+
+UserModelT = TypeVar("UserModelT", bound=User)
+
+EXPIRES_AT = datetime(2026, 9, 1, tzinfo=timezone.utc)
+GOOD_CREDENTIAL = "good-credential"
+BAD_CREDENTIAL = "forged-credential"
+VALID_PAYLOAD: Mapping[str, Any] = {"id": "u1", "email": "seed@example.com"}
+
+
+class FakeVerifier:
+    """Extracts one header, accepts one credential value, counts both calls."""
+
+    def __init__(
+        self,
+        header: str,
+        *,
+        accepts: str = GOOD_CREDENTIAL,
+        payload: Mapping[str, Any] | None = None,
+        log: list[str] | None = None,
+        source: str | None = None,
+    ) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}" if source is None else source
+        self.accepts = accepts
+        self.payload: Mapping[str, Any] = VALID_PAYLOAD if payload is None else payload
+        self.log = log
+        self.extract_calls = 0
+        self.verify_calls = 0
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        self.extract_calls += 1
+        if self.log is not None:
+            self.log.append(f"extract:{self.header}")
+        return connection.headers.get(self.header)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        self.verify_calls += 1
+        if self.log is not None:
+            self.log.append(f"verify:{self.header}")
+        if credential != self.accepts:
+            raise InvalidCredential(reason=f"fake {self.header} rejected len={len(credential)}")
+        return Session(
+            user=parse_user(user_model, self.payload),
+            expires_at=EXPIRES_AT,
+            raw=dict(self.payload),
+        )
+
+
+class FailingVerifier:
+    """Always presents a credential, always fails it — the terminal-failure half."""
+
+    def __init__(
+        self,
+        header: str,
+        error_cls: type[SessionError],
+        reason: str,
+        *,
+        source: str | None = None,
+    ) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}" if source is None else source
+        self.error_cls = error_cls
+        self.reason = reason
+        self.extract_calls = 0
+        self.verify_calls = 0
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        self.extract_calls += 1
+        return connection.headers.get(self.header)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        self.verify_calls += 1
+        raise self.error_cls(reason=self.reason)
+
+
+class NullVerifier:
+    """Accepts the credential and returns nothing — a `verify` that fell off the end.
+
+    The rogue shape that matters most: `None` is the dispatcher's absence signal, so an
+    unguarded return would downgrade a presented credential to anonymous.
+    """
+
+    def __init__(self, header: str) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}"
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get(self.header)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        return None  # pyright: ignore[reportReturnType]
+
+
+class WrongModelVerifier:
+    """Ignores `user_model` and always builds a plain `User`."""
+
+    def __init__(self, header: str) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}"
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        return Session(  # pyright: ignore[reportReturnType]
+            user=User.model_validate(VALID_PAYLOAD),
+            expires_at=EXPIRES_AT,
+            raw=dict(VALID_PAYLOAD),
+        )
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get(self.header)
+
+
+class RaisingExtractVerifier:
+    """`extract` parses attacker bytes, so `extract` can be made to raise."""
+
+    def __init__(self, header: str) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}"
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        raise RuntimeError(f"parser blew up on {connection.headers.get(self.header)!r}")
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        raise NotImplementedError
+
+
+class BrokenConfigVerifier:
+    """`extract` raises a `ConfigurationError` — a deployment fault, not a bad credential."""
+
+    def __init__(self, header: str) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}"
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        raise ConfigurationError("secondary storage was never configured")
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        raise NotImplementedError
+
+
+class RaisingVerifyVerifier:
+    """`verify` raises something that is not a `SessionError` — a bug, or a stray library error."""
+
+    def __init__(self, header: str) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}"
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get(self.header)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        raise RuntimeError(f"jwt library blew up on {credential!r}")
+
+
+def traced(function: Callable[..., Any]) -> Callable[..., Any]:
+    """A plain metrics/tracing decorator — the shape that hides `async def` from `inspect`."""
+
+    @functools.wraps(function)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
+class TracedVerifier(FakeVerifier):
+    """A perfectly good verifier whose `verify` is wrapped by a non-async decorator."""
+
+    verify = traced(FakeVerifier.verify)
+
+
+def sync_prologue(function: Callable[..., Any]) -> Callable[..., Any]:
+    """A decorator that does real work BEFORE returning the wrapped coroutine."""
+
+    @functools.wraps(function)
+    def wrapper(self: Any, credential: str, user_model: Any) -> Any:
+        if credential == BAD_CREDENTIAL:
+            raise RuntimeError(f"prologue rejected {credential!r}")
+        return function(self, credential, user_model)
+
+    return wrapper
+
+
+class SyncPrologueVerifier(FakeVerifier):
+    """A plain-callable `verify` — the shape D-054 blesses — whose sync half can raise.
+
+    Everything it does before handing back its coroutine runs outside any `await`, so a
+    containment that only wraps the `await` never sees it.
+    """
+
+    verify = sync_prologue(FakeVerifier.verify)
+
+
+async def _async_extract(self: Any, connection: HTTPConnection) -> str | None:
+    return connection.headers.get(self.header)
+
+
+class WrappedAsyncExtractVerifier(FakeVerifier):
+    """An `async def extract` behind an ordinary `functools.wraps` decorator.
+
+    `inspect.iscoroutinefunction` answers False for the wrapper, so the startup guard lets
+    it through; every call then returns a coroutine object, which is never `None`.
+    """
+
+    extract = traced(_async_extract)
+
+
+class RaisingInstanceVerifier:
+    """Raises one specific `SessionError` instance, so identity survives or it does not."""
+
+    def __init__(self, header: str, error: SessionError) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}"
+        self.error = error
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get(self.header)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        raise self.error
+
+
+class TaskGroupVerifier:
+    """Refuses from inside an `anyio` task group — the concurrency tool D-013 mandates.
+
+    A task group delivers a child's exception wrapped in a `BaseExceptionGroup`, and an
+    all-`Exception` group is itself an `Exception`, so an `except SessionError` above it
+    does not fire.
+    """
+
+    def __init__(self, header: str, error_cls: type[SessionError], reason: str) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}"
+        self.error_cls = error_cls
+        self.reason = reason
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get(self.header)
+
+    async def _refuse(self) -> None:
+        raise self.error_cls(reason=self.reason)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        async with anyio.create_task_group() as group:
+            group.start_soon(self._refuse)
+        raise NotImplementedError
+
+
+class MultiFailureTaskGroupVerifier(TaskGroupVerifier):
+    """Two children fail at once — a group with more than one leaf stays contained."""
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        async with anyio.create_task_group() as group:
+            group.start_soon(self._refuse)
+            group.start_soon(self._refuse)
+        raise NotImplementedError
+
+
+class AsyncExtractVerifier:
+    """Structurally a verifier, but `extract` is a coroutine function.
+
+    Every call would return a truthy coroutine object, so every verifier would look
+    "present" and every request would be ambiguous. Rejected at construction.
+    """
+
+    credential_source = "header:x-async"
+
+    async def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get("x-async")
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        raise NotImplementedError
+
+
+class SyncVerifyVerifier:
+    """`verify` returns a session rather than an awaitable — the forgotten `async def`."""
+
+    credential_source = "header:x-sync"
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get("x-sync")
+
+    def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        return Session(
+            user=parse_user(user_model, VALID_PAYLOAD),
+            expires_at=EXPIRES_AT,
+            raw=dict(VALID_PAYLOAD),
+        )
+
+
+class NotAVerifier:
+    """No members at all: the shape a typo or a half-written class produces."""
+
+
+class BlankSourceVerifier(FakeVerifier):
+    """Declares a whitespace-only `credential_source` — an unset label, dressed up."""
+
+    def __init__(self, header: str) -> None:
+        super().__init__(header, source="   ")
+
+
+class SessionErrorExtractVerifier:
+    """`extract` refuses the credential itself, which is `verify`'s job and not its own."""
+
+    def __init__(self, header: str, error_cls: type[SessionError], reason: str) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}"
+        self.error_cls = error_cls
+        self.reason = reason
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        raise self.error_cls(reason=self.reason)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        raise NotImplementedError
+
+
+class NonCallableVerifier:
+    """Every member exists and neither method is callable — `isinstance` still says yes."""
+
+    credential_source = "header:x-not-callable"
+    extract = "not-a-function"
+    verify = "not-a-function"
+
+
+def connection(**headers: str) -> HTTPConnection:
+    """A minimal ASGI connection — enough for `extract`, and nothing a verifier may read."""
+    raw = [(key.replace("_", "-").encode(), value.encode()) for key, value in headers.items()]
+    return HTTPConnection({"type": "http", "method": "GET", "path": "/", "headers": raw})
+
+
+def resolver_of(dependency: Callable[..., Any]) -> Callable[..., Awaitable[Session[Any] | None]]:
+    """The shared cache anchor, read exactly the way FastAPI reads it.
+
+    `current_session` and `optional_session` both hang off one resolver; FastAPI finds it
+    through the wrapper's `Depends` default, so reading it the same way means a break here
+    is a break in the per-request cache too.
+    """
+    default = inspect.signature(dependency).parameters["session"].default
+    assert isinstance(default, params.Depends), "the wrapper no longer anchors on a resolver"
+    anchored = default.dependency
+    assert anchored is not None
+    return anchored
+
+
+def client(app: FastAPI, backend: str = "asyncio") -> TestClient:
+    """Starlette supports Trio; an asyncio-only integration lane covers half the surface."""
+    return TestClient(app, backend=backend)  # pyright: ignore[reportArgumentType]
+
+
+def session_app(auth: BetterAuth, *, user_model: type[User] = User) -> FastAPI:
+    """One app carrying both dependencies, so a dispatch rule is observable on the wire."""
+    app = FastAPI()
+    required = auth.current_session(user_model=user_model)
+    optional = auth.optional_session(user_model=user_model)
+
+    async def read_required(session: Session[User] = Depends(required)) -> dict[str, Any]:
+        return {"id": session.user.id, "model": type(session.user).__name__}
+
+    async def read_optional(session: Session[User] | None = Depends(optional)) -> dict[str, Any]:
+        if session is None:
+            return {"id": None, "model": None}
+        return {"id": session.user.id, "model": type(session.user).__name__}
+
+    app.add_api_route("/required", read_required, methods=["GET"])
+    app.add_api_route("/optional", read_optional, methods=["GET"])
+    return app

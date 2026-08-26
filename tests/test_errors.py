@@ -18,11 +18,13 @@ from fastapi import HTTPException
 
 from fastapi_better_auth import (
     BEARER_CHALLENGE,
+    AmbiguousCredentials,
     AuthServiceUnavailable,
     BetterAuthError,
     ConfigurationError,
     CsrfFailure,
     InvalidCredential,
+    MissingCredential,
     SessionError,
     SessionExpired,
     SessionRevoked,
@@ -35,9 +37,16 @@ SHIPPED_NAMES = frozenset(
         "SessionExpired",
         "SessionRevoked",
         "AuthServiceUnavailable",
+        "MissingCredential",
         "CsrfFailure",
+        "AmbiguousCredentials",
     }
 )
+SANCTIONED_WIRE_SHAPES: dict[int, tuple[str, dict[str, str] | None]] = {
+    400: ("Ambiguous request", None),
+    401: ("Not authenticated", {"WWW-Authenticate": "Bearer"}),
+    403: ("Forbidden", None),
+}
 
 
 def shipped_session_errors() -> tuple[type[SessionError], ...]:
@@ -106,13 +115,10 @@ def test_reason_is_carried_on_the_exception(error_cls: type[SessionError]) -> No
 def test_every_error_renders_a_sanctioned_wire_shape(error_cls: type[SessionError]) -> None:
     error = error_cls(reason=REASON)
 
-    assert error.status_code in (401, 403)
-    if error.status_code == 401:
-        assert error.detail == "Not authenticated"
-        assert error.headers == {"WWW-Authenticate": "Bearer"}
-    else:
-        assert error.detail == "Forbidden"
-        assert error.headers is None
+    assert error.status_code in SANCTIONED_WIRE_SHAPES
+    detail, headers = SANCTIONED_WIRE_SHAPES[error.status_code]
+    assert error.detail == detail
+    assert error.headers == headers
 
 
 def test_csrf_failure_is_the_only_403() -> None:
@@ -121,10 +127,34 @@ def test_csrf_failure_is_the_only_403() -> None:
     assert by_status == {"CsrfFailure"}
 
 
-def test_the_401_family_is_exactly_the_four_credential_outcomes() -> None:
+def test_ambiguous_credentials_is_the_only_400() -> None:
+    """A 400 says the *request shape* is wrong; nothing else in the family may claim that."""
+    by_status = {cls.__name__ for cls in shipped_session_errors() if cls.response_status == 400}
+
+    assert by_status == {"AmbiguousCredentials"}
+
+
+def test_the_401_family_is_exactly_the_credential_outcomes() -> None:
     by_status = {cls.__name__ for cls in shipped_session_errors() if cls.response_status == 401}
 
-    assert by_status == SHIPPED_NAMES - {"CsrfFailure"}
+    assert by_status == SHIPPED_NAMES - {"CsrfFailure", "AmbiguousCredentials"}
+
+
+def test_a_missing_credential_is_indistinguishable_from_a_forged_one() -> None:
+    """Anonymous traffic and an attack differ for operators, never for the client."""
+    missing = MissingCredential(reason="no credential presented")
+    forged = InvalidCredential(reason=REASON)
+
+    assert (missing.status_code, missing.detail, missing.headers) == (
+        forged.status_code,
+        forged.detail,
+        forged.headers,
+    )
+
+
+def test_ambiguous_credentials_offers_no_authentication_challenge() -> None:
+    """Re-authenticating would not help: the client sent two credentials on purpose."""
+    assert AmbiguousCredentials(reason="2 credentials presented").headers is None
 
 
 def test_an_unverifiable_session_fails_closed() -> None:
@@ -208,11 +238,19 @@ def test_a_subclass_may_not_shadow_the_starlette_attributes(attribute: str, valu
     [
         ("response_status", 428),
         ("response_status", 500),
+        ("response_status", 400),
         ("response_detail", "user sub_123 is banned"),
         ("response_headers", {"X-Auth-Debug": "kid=abc"}),
         ("response_headers", None),
     ],
-    ids=["status-428", "status-500", "chatty-detail", "debug-header", "missing-challenge"],
+    ids=[
+        "status-428",
+        "status-500",
+        "status-400-without-its-body",
+        "chatty-detail",
+        "debug-header",
+        "missing-challenge",
+    ],
 )
 def test_a_subclass_may_not_leave_the_sanctioned_surface(attribute: str, value: object) -> None:
     with pytest.raises(TypeError):
