@@ -24,6 +24,7 @@ from fastapi_better_auth import (
     BetterAuth,
     ConfigurationError,
     InvalidCredential,
+    ResponseTooLarge,
     Session,
     SessionError,
     User,
@@ -232,6 +233,24 @@ class WrappedAsyncExtractVerifier(FakeVerifier):
     """
 
     extract = traced(_async_extract)
+
+
+class OversizeVerifier:
+    """`verify` lets a transport's `ResponseTooLarge` escape untranslated.
+
+    The shape that decides the size-cap failure's base class: anything dispatch *honours*
+    would leave as a 500, and containment is what makes forgetting to translate fail closed.
+    """
+
+    def __init__(self, header: str) -> None:
+        self.header = header
+        self.credential_source = f"header:{header}"
+
+    def extract(self, connection: HTTPConnection) -> str | None:
+        return connection.headers.get(self.header)
+
+    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+        raise ResponseTooLarge(max_bytes=1024)
 
 
 class RaisingInstanceVerifier:
