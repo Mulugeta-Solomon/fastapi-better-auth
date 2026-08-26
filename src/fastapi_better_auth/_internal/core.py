@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import sys
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, TypeVar, cast
@@ -29,6 +30,7 @@ from .verifiers import Verifier
 
 logger = logging.getLogger("fastapi_better_auth")
 
+BASE_URL_ENV = "BETTER_AUTH_URL"
 GROUP_TYPES: tuple[type[BaseException], ...] = (BaseExceptionGroup,)
 
 UserModelT = TypeVar("UserModelT", bound=User)
@@ -96,6 +98,46 @@ class BetterAuth:
         self._resolvers: dict[type[User], Resolver] = {}
         self._required: dict[type[User], Dependency] = {}
         self._optional: dict[type[User], Dependency] = {}
+
+    @classmethod
+    def from_env(cls) -> BetterAuth:
+        """Build a JWT-mode bridge from the environment, reading exactly one variable.
+
+        `BETTER_AUTH_URL` - the same name the Better Auth server itself reads for its
+        `baseURL`, so a deployment that already sets it needs nothing new:
+
+            auth = BetterAuth.from_env()
+
+        That is the whole of it, and it is exactly equivalent to writing
+        `BetterAuth(verifiers=[JwtVerifier(base_url=<that value>)])` by hand. **No other
+        variable is consulted.** The algorithm allowlist, `leeway`, the token-lifetime
+        ceiling, the transport, a second verifier - all of them stay constructor arguments,
+        where the code that chose them is the code you read in review. A variable that could
+        widen `leeway` would be an environment able to extend session lifetimes without a
+        deploy; one that could move the key set would be a bypass with no signature left to
+        fall back on.
+
+        Returns:
+            A `BetterAuth` composing a single `JwtVerifier` on the configured origin.
+
+        Raises:
+            ConfigurationError: If `BETTER_AUTH_URL` is missing or blank, or is not a usable
+                origin. Raised while the application is being built, so a deployment that
+                could not verify anything never finishes starting up.
+        """
+        # Imported here, not at module scope: the dispatcher knows the Verifier protocol,
+        # and nothing about which modes exist.
+        from .jwt_verifier import JwtVerifier
+
+        value = os.environ.get(BASE_URL_ENV, "")
+        if not value.strip():
+            raise ConfigurationError(
+                f"{BASE_URL_ENV} is not set. from_env() reads exactly that one variable, and"
+                " it must be your Better Auth server's origin - the same value its own"
+                " baseURL is set to, such as 'https://auth.example.com'. Everything else is a"
+                " constructor argument: BetterAuth(verifiers=[JwtVerifier(base_url=...)])."
+            )
+        return cls(verifiers=[JwtVerifier(base_url=value)])
 
     @property
     def verifiers(self) -> tuple[Verifier, ...]:

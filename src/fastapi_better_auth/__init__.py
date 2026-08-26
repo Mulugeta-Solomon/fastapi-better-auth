@@ -22,6 +22,7 @@ from ._internal.errors import (
     SessionRevoked,
 )
 from ._internal.httpx_transports import Httpx2Transport, HttpxTransport
+from ._internal.jwt_verifier import JwtVerifier
 from ._internal.models import Session, User, UserT
 from ._internal.parsing import parse_user
 from ._internal.transport import (
@@ -46,6 +47,7 @@ __all__ = [
     "Httpx2Transport",
     "HttpxTransport",
     "InvalidCredential",
+    "JwtVerifier",
     "MissingCredential",
     "ResponseTooLarge",
     "Session",
