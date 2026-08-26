@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from types import MappingProxyType, TracebackType
 from typing import TYPE_CHECKING, Protocol, TypeVar
@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Protocol, TypeVar
 import anyio
 
 from .errors import ConfigurationError
-from .transport import ResponseTooLarge, TransportResponse
+from .transport import ContentEncodingRejected, ResponseTooLarge, TransportResponse
 
 if TYPE_CHECKING:
     import httpx
@@ -31,7 +31,11 @@ TransportT = TypeVar("TransportT", bound="_HttpxFamilyTransport")
 
 
 class _StreamedResponse(Protocol):
-    """What this adapter reads off a response. Read-only, so a property satisfies it too."""
+    """What this adapter reads off a response. Read-only, so a property satisfies it too.
+
+    `aiter_raw`, never `aiter_bytes`: the raw stream is the undecoded wire, and counting it is
+    what keeps a gzip bomb from decompressing before any length is compared (D-079).
+    """
 
     @property
     def status_code(self) -> int: ...
@@ -39,7 +43,7 @@ class _StreamedResponse(Protocol):
     @property
     def headers(self) -> Mapping[str, str]: ...
 
-    def aiter_bytes(self) -> AsyncIterator[bytes]: ...
+    def aiter_raw(self) -> AsyncIterator[bytes]: ...
 
 
 class _Client(Protocol):
@@ -76,6 +80,19 @@ def _import_httpx2():
     return httpx2
 
 
+def _httpx_timeout_error() -> type[BaseException]:
+    """Resolved lazily, at translation time: an injected client must never force an import."""
+    import httpx
+
+    return httpx.TimeoutException
+
+
+def _httpx2_timeout_error() -> type[BaseException]:
+    import httpx2
+
+    return httpx2.TimeoutException
+
+
 def _validated_timeout(timeout: object) -> float:
     """`timeout` is annotated `float`; the value comes from an operator's configuration."""
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
@@ -109,20 +126,38 @@ def _request_headers(headers: Mapping[str, str] | None) -> Mapping[str, str]:
     return merged
 
 
-async def _capped(response: _StreamedResponse, max_bytes: int) -> bytes:
-    """Count while reading. `Content-Length` is not enforcement - it can be absent, or a lie.
+def _reject_content_encoding(response: _StreamedResponse) -> None:
+    """We asked for `identity`; a `Content-Encoding` means the server ignored that.
 
-    The abort is a cancellation rather than a `break`, and that is not a style choice. A
-    body arrives through a stack of five nested async generators; walking out of the loop
-    abandons every one of them mid-yield, and a generator collected before it is exhausted
-    is a `ResourceWarning` under trio and a silent late finalization under asyncio.
-    Cancelling raises inside the innermost read instead, so the whole stack unwinds on the
-    way out - the same path a timeout already takes.
+    Refuse rather than decode: an undecoded body is capped by the wire read below, but once a
+    `Content-Encoding` is present the caller would eventually decompress it, so the honest
+    answer is that this response cannot be trusted at all (D-079).
     """
+    encoding = response.headers.get("content-encoding")
+    if encoding is not None:
+        raise ContentEncodingRejected(encoding=encoding)
+
+
+async def _capped(response: _StreamedResponse, max_bytes: int) -> bytes:
+    """Count WIRE bytes, capped during the read. `Content-Length` is never consulted - it can
+    be absent, or a lie.
+
+    `aiter_raw` is the undecoded stream. Reading the *decoded* one (`aiter_bytes`) would let a
+    server that answers the pinned origin decompress a whole gzip bomb in one call before any
+    length was compared - 260 KB of wire expanding to 256 MB against a 4 KB cap (D-079). Each
+    chunk is sliced to what is left of the cap plus one before it is appended, so the buffer is
+    bounded by cap+1 whatever the chunk size, and regardless of when the cancellation lands.
+
+    The abort is a cancellation, not a `break`: a body arrives through a stack of five nested
+    async generators, and walking out of the loop abandons every one mid-yield - a
+    `ResourceWarning` under trio, a silent late finalization under asyncio. Cancelling unwinds
+    the whole stack, the same path a timeout takes.
+    """
+    _reject_content_encoding(response)
     body = bytearray()
     with anyio.CancelScope() as abort:
-        async for chunk in response.aiter_bytes():
-            body += chunk
+        async for chunk in response.aiter_raw():
+            body += chunk[: max_bytes - len(body) + 1]
             if len(body) > max_bytes:
                 abort.cancel()
     if abort.cancel_called:
@@ -130,53 +165,54 @@ async def _capped(response: _StreamedResponse, max_bytes: int) -> bytes:
     return bytes(body)
 
 
-async def _fetch(
-    client: _Client,
-    method: str,
-    url: str,
-    *,
-    headers: Mapping[str, str] | None,
-    content: bytes,
-    max_bytes: int,
-    timeout: float,
-) -> TransportResponse:
-    _validate_cap(max_bytes)
-    with anyio.fail_after(timeout + DEADLINE_GRACE):
-        async with client.stream(
-            method,
-            url,
-            headers=_request_headers(headers),
-            content=content,
-            follow_redirects=False,
-        ) as response:
-            return TransportResponse(
-                status_code=response.status_code,
-                headers=response.headers,
-                content=await _capped(response, max_bytes),
-            )
-
-
 class _HttpxFamilyTransport:
     """Everything the two adapters share, which is everything except one import."""
 
-    def __init__(self, client: _Client, *, timeout: float, owned: bool) -> None:
+    def __init__(
+        self,
+        client: _Client,
+        *,
+        timeout: float,
+        timeout_error: Callable[[], type[BaseException]],
+        owned: bool,
+    ) -> None:
         self._client = client
         self._timeout = timeout
+        self._timeout_error = timeout_error
         self._owned = owned
+
+    async def _fetch(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None,
+        content: bytes,
+        max_bytes: int,
+    ) -> TransportResponse:
+        _validate_cap(max_bytes)
+        try:
+            with anyio.fail_after(self._timeout + DEADLINE_GRACE):
+                async with self._client.stream(
+                    method,
+                    url,
+                    headers=_request_headers(headers),
+                    content=content,
+                    follow_redirects=False,
+                ) as response:
+                    return TransportResponse(
+                        status_code=response.status_code,
+                        headers=response.headers,
+                        content=await _capped(response, max_bytes),
+                    )
+        except self._timeout_error() as exc:
+            raise TimeoutError(f"{method} {url} timed out after {self._timeout}s") from exc
 
     async def get(
         self, url: str, *, headers: Mapping[str, str] | None = None, max_bytes: int
     ) -> TransportResponse:
         """Fetch `url`, reading at most `max_bytes` of body. See `Transport.get`."""
-        return await _fetch(
-            self._client,
-            "GET",
-            url,
-            headers=headers,
-            content=b"",
-            max_bytes=max_bytes,
-            timeout=self._timeout,
-        )
+        return await self._fetch("GET", url, headers=headers, content=b"", max_bytes=max_bytes)
 
     async def post(
         self,
@@ -187,15 +223,7 @@ class _HttpxFamilyTransport:
         max_bytes: int,
     ) -> TransportResponse:
         """Send `content` to `url`, reading at most `max_bytes` of body. See `Transport.post`."""
-        return await _fetch(
-            self._client,
-            "POST",
-            url,
-            headers=headers,
-            content=content,
-            max_bytes=max_bytes,
-            timeout=self._timeout,
-        )
+        return await self._fetch("POST", url, headers=headers, content=content, max_bytes=max_bytes)
 
     async def aclose(self) -> None:
         """Close the client this adapter built. An injected one is left alone: its lifetime
@@ -231,14 +259,21 @@ class HttpxTransport(_HttpxFamilyTransport):
     overrules, and it is deliberate - the URL being pinned is the whole security of the
     fetch, and a transport that could be bounced elsewhere makes the pin decorative.
 
+    The cap counts *wire* bytes: the undecoded stream is read, so a server that answers with a
+    `Content-Encoding` we did not ask for cannot decompress a gzip bomb past the cap. Such a
+    response is refused outright as `ContentEncodingRejected`, since the transport requested
+    `identity` and a server that ignored that is not one to trust the body of.
+
     `timeout` is a deadline for the *whole* exchange, not a per-operation budget. The
-    library's own connect, read, write and pool timeouts are set to it as well, so a single
-    stalled phase raises the library's own timeout error - but those reset on every byte that
-    arrives, which means they alone cannot stop a server that trickles a response out
-    forever. An `anyio` deadline covers the whole call for that case, a short grace after the
-    per-phase budget so that the library's more specific error wins whenever it applies, and
-    raises `TimeoutError` when it fires. Both propagate untranslated: a transport does not
-    know what a failed fetch means to the request that caused it.
+    library's own connect, read, write and pool timeouts are set to it as well - but those
+    reset on every byte that arrives, so they alone cannot stop a server trickling a response
+    out forever. An `anyio` deadline covers the whole call for that case, a short grace after
+    the per-phase budget. Either way the timeout a caller sees is a builtin `TimeoutError`:
+    the whole-exchange deadline raises one directly, and the library's own `TimeoutException`
+    from a stalled phase is translated to one at this boundary, so the timeout contract does
+    not leak which library is underneath. Non-timeout failures - a refused connection, a TLS
+    error, a mid-response disconnect - propagate untranslated, because a transport does not
+    know what one means to the request that caused it.
 
     Everything else about an injected client - proxies, TLS verification, the connection
     pool, and its own timeout configuration - is left exactly as it was handed over. Its
@@ -266,7 +301,7 @@ class HttpxTransport(_HttpxFamilyTransport):
         if client is None:
             module = _import_httpx()
             client = module.AsyncClient(timeout=module.Timeout(checked), follow_redirects=False)
-        super().__init__(client, timeout=checked, owned=owned)
+        super().__init__(client, timeout=checked, timeout_error=_httpx_timeout_error, owned=owned)
 
 
 class Httpx2Transport(_HttpxFamilyTransport):
@@ -283,9 +318,10 @@ class Httpx2Transport(_HttpxFamilyTransport):
     one to install is a deployment question, not a behavioural one.
 
     Every guarantee is `HttpxTransport`'s, and for the same reasons: redirects are refused
-    per request as well as per client, so an injected client cannot turn them back on;
-    `timeout` bounds the whole exchange rather than each phase of it; and nothing a failed
-    fetch raises is translated here.
+    per request as well as per client, so an injected client cannot turn them back on; the cap
+    counts wire bytes and a `Content-Encoding` is refused as `ContentEncodingRejected`;
+    `timeout` bounds the whole exchange and surfaces as a builtin `TimeoutError` whichever
+    clock fired; and non-timeout failures propagate untranslated.
 
     Args:
         timeout: Seconds. The deadline for one fetch, and the client's per-phase budget when
@@ -307,4 +343,4 @@ class Httpx2Transport(_HttpxFamilyTransport):
         if client is None:
             module = _import_httpx2()
             client = module.AsyncClient(timeout=module.Timeout(checked), follow_redirects=False)
-        super().__init__(client, timeout=checked, owned=owned)
+        super().__init__(client, timeout=checked, timeout_error=_httpx2_timeout_error, owned=owned)

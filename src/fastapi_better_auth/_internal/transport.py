@@ -8,28 +8,48 @@ from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 
-def _rebuild(max_bytes: int) -> ResponseTooLarge:
-    return ResponseTooLarge(max_bytes=max_bytes)
+class UntrustedResponse(Exception):
+    """Base for a response a transport refuses to deliver because it cannot vouch for it.
 
-
-class ResponseTooLarge(Exception):
-    """A response body outgrew the caller's `max_bytes` cap, and the read was abandoned.
-
-    Raised by a transport, caught by whatever asked it to fetch something:
+    Catch this to translate every transport-level refusal in one clause:
 
         try:
             response = await transport.get(jwks_url, max_bytes=MAX_JWKS_BYTES)
-        except (ResponseTooLarge, TimeoutError):
+        except (UntrustedResponse, TimeoutError):
             raise AuthServiceUnavailable(reason="jwks fetch failed") from None
 
     Deliberately outside this library's own taxonomy - neither a `SessionError` nor a
-    `BetterAuthError`. A transport has no request context, so it cannot know whether an
-    oversized body should answer a client with a 401 or stop the application from starting;
-    only the verifier that made the call knows that, and translating is its job. The choice
-    of base class is the safety net for the day it forgets: an escaping `BetterAuthError` is
-    honoured by dispatch and would leave as a 500 - the one request-time answer a client can
-    tell apart from every other - while this is contained as the uniform 401 like any other
-    stray exception, which is the direction a security library should fail in.
+    `BetterAuthError`. A transport has no request context, so it cannot know whether a refused
+    response should answer a client with a 401 or stop the application from starting; only the
+    verifier that made the call knows that, and translating is its job. The base-class choice
+    is the safety net for the day it forgets: an escaping `BetterAuthError` is honoured by
+    dispatch and would leave as a 500 - the one request-time answer a client can tell apart
+    from every other - while this is contained as the uniform 401 like any other stray
+    exception, which is the direction a security library should fail in.
+
+    Its two concrete forms - `ResponseTooLarge` and `ContentEncodingRejected` - are the two
+    ways a body can be refused before it is trusted. A network timeout is not one of them: it
+    is a builtin `TimeoutError` the adapter raised (see `Transport`), caught alongside this.
+    """
+
+
+def _rebuild_too_large(max_bytes: int) -> ResponseTooLarge:
+    return ResponseTooLarge(max_bytes=max_bytes)
+
+
+class ResponseTooLarge(UntrustedResponse):
+    """A response body outgrew the caller's `max_bytes` cap, and the read was abandoned.
+
+    Raised by a transport, caught by whatever asked it to fetch something - most simply
+    through the `UntrustedResponse` base, which also covers `ContentEncodingRejected`:
+
+        try:
+            response = await transport.get(jwks_url, max_bytes=MAX_JWKS_BYTES)
+        except (UntrustedResponse, TimeoutError):
+            raise AuthServiceUnavailable(reason="jwks fetch failed") from None
+
+    An `UntrustedResponse`, so it stays outside the taxonomy for the reasons stated there: an
+    untranslated one fails closed as the uniform 401 rather than escaping as a 500.
 
     Args:
         max_bytes: Keyword-only, required. The cap that was exceeded. How far past it the
@@ -44,7 +64,42 @@ class ResponseTooLarge(Exception):
 
     def __reduce__(self) -> tuple[Callable[[int], ResponseTooLarge], tuple[int]]:
         """Keyword-only `__init__` and the default `__reduce__` do not survive a pickle."""
-        return (_rebuild, (self.max_bytes,))
+        return (_rebuild_too_large, (self.max_bytes,))
+
+
+def _rebuild_bad_encoding(encoding: str) -> ContentEncodingRejected:
+    return ContentEncodingRejected(encoding=encoding)
+
+
+class ContentEncodingRejected(UntrustedResponse):
+    """The server applied a `Content-Encoding` after the transport asked for `identity`.
+
+    An `UntrustedResponse`, caught the same way and outside the taxonomy for the same reason.
+
+    The transport requests `accept-encoding: identity` and counts the *wire* bytes it reads,
+    so a compressed body can never be decompressed on unbounded input - a 260 KB gzip stream
+    expands to 256 MB, the decompression-bomb DoS this boundary exists to stop. A server that
+    answers the pinned origin with a `Content-Encoding` anyway has ignored that request: it is
+    misconfigured, or hostile, and either way its body is refused rather than decoded. The
+    JWKS and get-session bodies are small JSON served as identity, so nothing legitimate is
+    lost by refusing.
+
+    Args:
+        encoding: Keyword-only, required. The `Content-Encoding` value the server sent.
+    """
+
+    encoding: str
+
+    def __init__(self, *, encoding: str) -> None:
+        self.encoding = encoding
+        super().__init__(
+            f"server applied Content-Encoding {encoding!r} after the transport requested"
+            " identity; refusing to decode an unverified, possibly compressed body"
+        )
+
+    def __reduce__(self) -> tuple[Callable[[str], ContentEncodingRejected], tuple[str]]:
+        """Keyword-only `__init__` and the default `__reduce__` do not survive a pickle."""
+        return (_rebuild_bad_encoding, (self.encoding,))
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,19 +114,33 @@ class TransportResponse:
     Header names are lowercased on construction, so `response.headers["content-type"]` is
     the one spelling that works. HTTP header names are case-insensitive and HTTP/2 sends
     them lowercased; the type owns the normalization so that no adapter can forget it and no
-    caller has to guess. Repeated header names are collapsed, keeping the last value.
+    caller has to guess.
+
+    Repeated header names arrive **comma-joined**, exactly as the underlying HTTP client
+    produced them - two `WWW-Authenticate: ...` lines become one `"Bearer, Basic"` value. That
+    is what a single-valued header a caller reads (`content-type`, `www-authenticate`) needs.
+    It is **wrong** for `Set-Cookie`, whose values legitimately contain commas: never read
+    `Set-Cookie` or any comma-bearing header off this mapping - a join is ambiguous for them,
+    and a server could smuggle a second value past a caller's single-value check. This library
+    reads responses and never sets cookies, so the headers it consults are safe.
+
+    Instances compare by value. Formally hashable, but `hash()` raises `TypeError` at call
+    time because `headers` is a mapping - the same house rule `Session` follows. Key on
+    something else.
 
     Attributes:
         status_code: The status exactly as the server sent it. A 3xx is a real answer here,
             not a hop: see `Transport` for why nothing follows it.
         headers: Read-only, lowercased, and copied - mutating the mapping that was passed in
-            does not change a response that was already built.
-        content: The body, whole. Kept out of `repr()` because a response repr reaches logs
-            and tracebacks, and an unverified body must not ride along.
+            does not change a response that was already built. Kept out of `repr()`: a
+            response repr reaches logs and tracebacks, and a `Set-Cookie` here can carry a
+            live session cookie.
+        content: The body, whole. Kept out of `repr()` for the same reason - an unverified
+            body must not ride along.
     """
 
     status_code: int
-    headers: Mapping[str, str]
+    headers: Mapping[str, str] = field(repr=False)
     content: bytes = field(repr=False)
 
     def __post_init__(self) -> None:
@@ -112,17 +181,26 @@ class Transport(Protocol):
     somewhere else. A substituted key set is a complete authentication bypass, with no
     signature left to fall back on.
 
-    **`max_bytes` is enforced while the body is being read**, not after it has arrived. The
-    read stops and `ResponseTooLarge` is raised as soon as the cap is crossed, so the bytes
-    an implementation holds stay bounded by the cap plus one network chunk. Checking
-    `Content-Length` is not enforcement: a server may omit it, and one that means harm may
-    lie about it.
+    **`max_bytes` is enforced while the body is being read**, and against the *wire* bytes.
+    The read counts the undecoded stream and stops the instant the cap is crossed, raising
+    `ResponseTooLarge` with the buffer bounded by cap+1 - so a `Content-Encoding` a server
+    applied (which this boundary asked it not to) cannot decompress a bomb past the cap; such
+    a response is refused as `ContentEncodingRejected` before any decode. `Content-Length` is
+    not enforcement: a server may omit it, and one that means harm may lie about it. Both
+    refusals share the `UntrustedResponse` base, so one `except` clause covers them.
 
-    **Failures are left alone.** A refused connection, a TLS failure, a timeout - they
-    propagate as whatever the underlying client raises. A transport does not know what a
-    failed fetch means to the request that caused it, so it does not translate; the verifier
-    above it turns them into `AuthServiceUnavailable`. Keeping the transport dumb is what
-    keeps the security decision in one place.
+    **A timeout is a builtin `TimeoutError`; other failures are left alone.** The Protocol
+    defines its timeout type: whatever the underlying client uses internally, a fetch that
+    times out raises a builtin `TimeoutError`, so a caller's recipe does not depend on which
+    library is underneath. Every other network failure - a refused connection, a TLS error, a
+    mid-response disconnect - propagates as whatever the client raised, untranslated: a
+    transport does not know what one means to the request that caused it, and the verifier
+    above turns both timeout and refusal into `AuthServiceUnavailable`:
+
+        try:
+            response = await transport.get(jwks_url, max_bytes=MAX_JWKS_BYTES)
+        except (UntrustedResponse, TimeoutError):
+            raise AuthServiceUnavailable(reason="jwks fetch failed") from None
 
     `max_bytes` is required and has no default, because the cap is the *caller's* policy: a
     transport that picked one would be deciding how much of an unverified body its caller
@@ -152,8 +230,10 @@ class Transport(Protocol):
 
         Raises:
             ResponseTooLarge: If the body outgrew `max_bytes`. The read is abandoned.
-            Exception: Whatever the underlying HTTP client raises for a connection, TLS or
-                timeout failure, untranslated.
+            ContentEncodingRejected: If the server applied a `Content-Encoding`.
+            TimeoutError: If the fetch timed out.
+            Exception: Whatever the underlying HTTP client raises for a non-timeout
+                connection or TLS failure, untranslated.
         """
         ...
 
@@ -179,7 +259,9 @@ class Transport(Protocol):
 
         Raises:
             ResponseTooLarge: If the body outgrew `max_bytes`. The read is abandoned.
-            Exception: Whatever the underlying HTTP client raises for a connection, TLS or
-                timeout failure, untranslated.
+            ContentEncodingRejected: If the server applied a `Content-Encoding`.
+            TimeoutError: If the fetch timed out.
+            Exception: Whatever the underlying HTTP client raises for a non-timeout
+                connection or TLS failure, untranslated.
         """
         ...
