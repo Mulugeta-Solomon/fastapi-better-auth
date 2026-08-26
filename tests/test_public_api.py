@@ -21,6 +21,7 @@ EXPECTED = (
     "Httpx2Transport",
     "HttpxTransport",
     "InvalidCredential",
+    "JwtVerifier",
     "MissingCredential",
     "ResponseTooLarge",
     "Session",
