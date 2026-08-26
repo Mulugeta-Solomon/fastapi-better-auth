@@ -1,0 +1,60 @@
+"""The one sanctioned door from upstream data to a `User`."""
+
+from __future__ import annotations
+
+from typing import Any, TypeVar
+
+from pydantic import ValidationError
+from pydantic_core import ErrorDetails
+
+from .errors import InvalidCredential
+from .models import User
+
+UserModelT = TypeVar("UserModelT", bound=User)
+
+MAX_REPORTED_ERRORS = 5
+MAX_REASON_LENGTH = 500
+
+
+def parse_user(user_model: type[UserModelT], payload: Any) -> UserModelT:
+    """Build a user model from an upstream payload, or fail as a credential failure.
+
+    A `pydantic.ValidationError` escaping a verifier is answered as a 500, and a 500 is
+    distinguishable on the wire from the uniform 401 every other failure renders: it tells
+    a client that *this* payload parsed differently from the last one, and under a
+    debugging handler it echoes the payload back. Every verifier materializes its user
+    through this function so that outcome cannot happen.
+
+    The validation diagnosis survives on `InvalidCredential.reason` - which field, what
+    kind of failure - for logs and error reporters. The values that failed do not: reasons
+    are serialized by error reporters along with the rest of the exception, and an upstream
+    payload is not something to copy into one.
+
+    Args:
+        user_model: The `User` subclass this deployment declared.
+        payload: The upstream data - decoded JWT claims, or a `get-session` body.
+
+    Returns:
+        An instance of `user_model`.
+
+    Raises:
+        InvalidCredential: If the payload does not validate. Renders the uniform 401.
+    """
+    try:
+        return user_model.model_validate(payload)
+    except ValidationError as exc:
+        raise InvalidCredential(reason=_summarize(user_model, exc)) from exc
+
+
+def _summarize(user_model: type[User], exc: ValidationError) -> str:
+    total = exc.error_count()
+    reported = [_render(error) for error in exc.errors(include_url=False)[:MAX_REPORTED_ERRORS]]
+    if total > len(reported):
+        reported.append(f"+{total - len(reported)} more")
+    summary = f"{user_model.__name__} payload rejected ({total}): " + "; ".join(reported)
+    return summary[:MAX_REASON_LENGTH]
+
+
+def _render(error: ErrorDetails) -> str:
+    location = ".".join(str(part) for part in error["loc"]) or "<root>"
+    return f"{location}: {error['msg']} [{error['type']}]"
