@@ -8,6 +8,7 @@ See https://github.com/Mulugeta-Solomon/fastapi-better-auth for status.
 """
 
 from ._internal.errors import (
+    BEARER_CHALLENGE,
     AuthServiceUnavailable,
     BetterAuthError,
     ConfigurationError,
@@ -17,9 +18,10 @@ from ._internal.errors import (
     SessionExpired,
     SessionRevoked,
 )
-from ._internal.models import Session, User
+from ._internal.models import Session, User, UserT
 
 __all__ = [
+    "BEARER_CHALLENGE",
     "AuthServiceUnavailable",
     "BetterAuthError",
     "ConfigurationError",
@@ -30,6 +32,7 @@ __all__ = [
     "SessionExpired",
     "SessionRevoked",
     "User",
+    "UserT",
 ]
 
 __version__ = "0.0.1"

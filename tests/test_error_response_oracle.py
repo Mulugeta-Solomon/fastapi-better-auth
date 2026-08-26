@@ -1,10 +1,13 @@
-"""ORACLE — the executable statement of the no-leak invariant (D-005).
+"""ORACLE - the executable statement of the no-leak invariant (D-005).
 
 Every request-time failure is raised through a real FastAPI app with a distinct,
-secret-looking `reason`. What a client may observe is the status code and one uniform
-body; what an operator may observe is the exception class and its `reason`. The
-detector is fired against a deliberately leaking route in the same app, so a vacuous
-pass is not available to it.
+fingerprint-shaped `reason`. What a client may observe is the status code and one uniform
+body; what an operator may observe is the exception class, its `reason`, and its `repr`.
+
+Two control routes leak on purpose - one through the body, one through a response header -
+and the instrument-proof test asserts the detector fires on both. Every assertion runs
+twice: once with a custom `SessionError` handler registered, once on FastAPI's default
+handler, which is the path most deployments actually run.
 """
 
 from __future__ import annotations
@@ -27,17 +30,21 @@ from fastapi_better_auth import (
 )
 
 UNAUTHENTICATED_CASES: tuple[tuple[str, type[SessionError], str], ...] = (
-    ("invalid", InvalidCredential, "signature mismatch tok9f3ab21ce4"),
-    ("expired", SessionExpired, "expiry 1787240949 elapsed sid7c1de90fab"),
-    ("revoked", SessionRevoked, "revocation sid3ba57ce108 absent upstream"),
+    ("invalid", InvalidCredential, "signature mismatch kid=iRAEH8dY tok_fp=9f3ab21c"),
+    ("expired", SessionExpired, "expiry 1787241849 elapsed sid_fp=7c1de90f"),
+    ("revoked", SessionRevoked, "revocation absent upstream sid_fp=3ba57ce1"),
     ("unavailable", AuthServiceUnavailable, "jwks fetch failed https://auth.internal.example"),
 )
 CSRF_CASE: tuple[str, type[SessionError], str] = (
     "csrf",
     CsrfFailure,
-    "origin https://evil.example blocked allowlist",
+    "origin https://evil.example rejected allowlist",
 )
-LEAK_CONTROL_REASON = "signature mismatch tok9f3ab21ce4"
+ALL_CASES = (*UNAUTHENTICATED_CASES, CSRF_CASE)
+BODY_LEAK_REASON = "signature mismatch kid=iRAEH8dY tok_fp=9f3ab21c"
+HEADER_LEAK_REASON = "revocation absent upstream sid_fp=3ba57ce1"
+
+AppAndObserved = tuple[FastAPI, list[SessionError]]
 
 
 def needles(reason: str) -> tuple[str, ...]:
@@ -66,8 +73,8 @@ def raising_endpoint(error_cls: type[SessionError], reason: str) -> Callable[[],
     return endpoint
 
 
-def leaking_endpoint(reason: str) -> Callable[[], None]:
-    """The control: a hand-rolled 401 that puts the reason straight into the body."""
+def body_leaking_endpoint(reason: str) -> Callable[[], None]:
+    """Control: a hand-rolled 401 that puts the reason straight into the body."""
 
     def endpoint() -> None:
         raise HTTPException(status_code=401, detail=reason)
@@ -75,7 +82,20 @@ def leaking_endpoint(reason: str) -> Callable[[], None]:
     return endpoint
 
 
-def build_app() -> tuple[FastAPI, list[SessionError]]:
+def header_leaking_endpoint(reason: str) -> Callable[[], None]:
+    """Control: a uniform body, but the reason smuggled out on a response header."""
+
+    def endpoint() -> None:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer", "X-Auth-Debug": reason},
+        )
+
+    return endpoint
+
+
+def build_app(with_handler: bool) -> AppAndObserved:
     app = FastAPI()
     observed: list[SessionError] = []
 
@@ -84,50 +104,61 @@ def build_app() -> tuple[FastAPI, list[SessionError]]:
         observed.append(exc)
         return await http_exception_handler(request, exc)
 
-    app.add_exception_handler(SessionError, record)
-    for path, error_cls, reason in (*UNAUTHENTICATED_CASES, CSRF_CASE):
+    if with_handler:
+        app.add_exception_handler(SessionError, record)
+    for path, error_cls, reason in ALL_CASES:
         app.add_api_route(
             f"/{path}", raising_endpoint(error_cls, reason), methods=["GET"], response_model=None
         )
     app.add_api_route(
-        "/leak-control",
-        leaking_endpoint(LEAK_CONTROL_REASON),
+        "/leak-body", body_leaking_endpoint(BODY_LEAK_REASON), methods=["GET"], response_model=None
+    )
+    app.add_api_route(
+        "/leak-header",
+        header_leaking_endpoint(HEADER_LEAK_REASON),
         methods=["GET"],
         response_model=None,
     )
     return app, observed
 
 
-@pytest.fixture
-def app_and_observed() -> tuple[FastAPI, list[SessionError]]:
-    return build_app()
+@pytest.fixture(params=[True, False], ids=["custom-handler", "default-handler"])
+def app_and_observed(request: pytest.FixtureRequest) -> AppAndObserved:
+    with_handler = request.param
+    assert isinstance(with_handler, bool)
+    return build_app(with_handler)
 
 
-def test_the_leak_detector_fires_on_a_leaking_route(
-    app_and_observed: tuple[FastAPI, list[SessionError]],
+@pytest.mark.parametrize(
+    ("path", "reason"),
+    [("leak-body", BODY_LEAK_REASON), ("leak-header", HEADER_LEAK_REASON)],
+)
+def test_the_leak_detector_fires_on_both_channels(
+    app_and_observed: AppAndObserved, path: str, reason: str
 ) -> None:
     """Prove the instrument: an oracle that cannot detect a leak proves nothing."""
     app, _ = app_and_observed
     with TestClient(app) as client:
-        response = client.get("/leak-control")
+        response = client.get(f"/{path}")
 
     assert response.status_code == 401
-    assert leaked_fragments(LEAK_CONTROL_REASON, response)
+    assert leaked_fragments(reason, response)
 
 
 def test_no_response_carries_any_fragment_of_its_reason(
-    app_and_observed: tuple[FastAPI, list[SessionError]],
+    app_and_observed: AppAndObserved,
 ) -> None:
     app, _ = app_and_observed
     with TestClient(app) as client:
-        for path, _error_cls, reason in (*UNAUTHENTICATED_CASES, CSRF_CASE):
+        for path, _error_cls, reason in ALL_CASES:
             response = client.get(f"/{path}")
 
+            assert response.status_code in (401, 403), f"/{path} never reached its handler"
             assert leaked_fragments(reason, response) == (), f"/{path} leaked its reason"
 
 
 def test_the_401_family_is_indistinguishable_on_the_wire(
-    app_and_observed: tuple[FastAPI, list[SessionError]],
+    app_and_observed: AppAndObserved,
 ) -> None:
     app, _ = app_and_observed
     with TestClient(app) as client:
@@ -142,9 +173,7 @@ def test_the_401_family_is_indistinguishable_on_the_wire(
     assert all(response.headers["www-authenticate"] == "Bearer" for response in responses)
 
 
-def test_csrf_failure_is_a_403_with_no_challenge(
-    app_and_observed: tuple[FastAPI, list[SessionError]],
-) -> None:
+def test_csrf_failure_is_a_403_with_no_challenge(app_and_observed: AppAndObserved) -> None:
     app, _ = app_and_observed
     with TestClient(app) as client:
         response = client.get(f"/{CSRF_CASE[0]}")
@@ -154,14 +183,12 @@ def test_csrf_failure_is_a_403_with_no_challenge(
     assert "www-authenticate" not in response.headers
 
 
-def test_the_operator_side_still_sees_every_reason(
-    app_and_observed: tuple[FastAPI, list[SessionError]],
-) -> None:
-    app, observed = app_and_observed
-    cases = (*UNAUTHENTICATED_CASES, CSRF_CASE)
+def test_the_operator_side_still_sees_every_reason() -> None:
+    app, observed = build_app(with_handler=True)
     with TestClient(app) as client:
-        for path, _error_cls, _reason in cases:
+        for path, _error_cls, _reason in ALL_CASES:
             client.get(f"/{path}")
 
-    assert [type(exc) for exc in observed] == [error_cls for _p, error_cls, _r in cases]
-    assert [exc.reason for exc in observed] == [reason for _p, _cls, reason in cases]
+    assert [type(exc) for exc in observed] == [error_cls for _p, error_cls, _r in ALL_CASES]
+    assert [exc.reason for exc in observed] == [reason for _p, _cls, reason in ALL_CASES]
+    assert all(exc.reason in repr(exc) for exc in observed)
