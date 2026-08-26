@@ -21,8 +21,24 @@ COMPOSE_FILE = pathlib.Path(__file__).resolve().parents[2] / "harness" / "docker
 
 def _harness_sql(sql: str) -> None:
     subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T", "postgres",
-         "psql", "-U", "harness", "-d", "harness", "-v", "ON_ERROR_STOP=1", "-c", sql],
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "exec",
+            "-T",
+            "postgres",
+            "psql",
+            "-U",
+            "harness",
+            "-d",
+            "harness",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ],
         check=True,
         capture_output=True,
     )
@@ -36,26 +52,30 @@ def _split(raw_cookie: str) -> tuple[str, str]:
 
 
 class TestSessionCookieWireFormat:
-    def test_token_is_32_alnum(self, signed_in):
+    def test_token_is_32_alnum(self, signed_in: dict[str, str]) -> None:
         token, _ = _split(signed_in["cookie"])
         assert len(token) == 32
         assert token.isalnum()
 
-    def test_signature_is_44_char_padded_standard_base64(self, signed_in):
+    def test_signature_is_44_char_padded_standard_base64(self, signed_in: dict[str, str]) -> None:
         _, sig = _split(signed_in["cookie"])
         assert len(sig) == 44
         assert sig.endswith("=")
         # Standard alphabet: decodes with the non-url alphabet, exactly 32 HMAC bytes.
         assert len(base64.b64decode(sig, validate=True)) == 32
 
-    def test_signature_is_hmac_sha256_of_token(self, signed_in, secret):
+    def test_signature_is_hmac_sha256_of_token(
+        self, signed_in: dict[str, str], secret: bytes
+    ) -> None:
         token, sig = _split(signed_in["cookie"])
         expected = base64.b64encode(hmac.new(secret, token.encode(), hashlib.sha256).digest())
         assert hmac.compare_digest(sig.encode(), expected)
 
 
 class TestGetSession:
-    def test_roundtrip_returns_user_and_matching_token(self, harness, signed_in):
+    def test_roundtrip_returns_user_and_matching_token(
+        self, harness: str, signed_in: dict[str, str]
+    ) -> None:
         resp = httpx.get(
             f"{harness}/api/auth/get-session",
             cookies={SESSION_COOKIE: signed_in["cookie"]},
@@ -66,12 +86,14 @@ class TestGetSession:
         assert body["session"]["token"] == token
         assert "@" in body["user"]["email"]
 
-    def test_anonymous_is_200_with_null_body_not_401(self, harness):
+    def test_anonymous_is_200_with_null_body_not_401(self, harness: str) -> None:
         resp = httpx.get(f"{harness}/api/auth/get-session")
         assert resp.status_code == 200
         assert json.loads(resp.text) is None
 
-    def test_tampered_signature_yields_null_session(self, harness, signed_in):
+    def test_tampered_signature_yields_null_session(
+        self, harness: str, signed_in: dict[str, str]
+    ) -> None:
         token, sig = _split(signed_in["cookie"])
         flipped = ("A" if sig[0] != "A" else "B") + sig[1:]
         tampered = urllib.parse.quote(f"{token}.{flipped}")
@@ -84,7 +106,7 @@ class TestGetSession:
 
 
 class TestExpiry:
-    def test_route_layer_rejects_expired_session(self, harness):
+    def test_route_layer_rejects_expired_session(self, harness: str) -> None:
         """Documents WHY the library must enforce expiresAt itself in Mode A: upstream's route
         layer rejects expired sessions, but a bare store lookup (findSession) does not check."""
         resp = httpx.post(
@@ -92,6 +114,7 @@ class TestExpiry:
             json={"email": SEED_EMAIL, "password": SEED_PASSWORD},
         )
         raw = resp.cookies.get(SESSION_COOKIE)
+        assert raw is not None, f"no {SESSION_COOKIE} cookie on sign-in"
         token, _ = _split(raw)
         try:
             _harness_sql(
@@ -105,7 +128,9 @@ class TestExpiry:
 
 
 class TestJwtPlugin:
-    def test_token_endpoint_issues_eddsa_jwt_with_15min_exp(self, harness, signed_in):
+    def test_token_endpoint_issues_eddsa_jwt_with_15min_exp(
+        self, harness: str, signed_in: dict[str, str]
+    ) -> None:
         resp = httpx.get(
             f"{harness}/api/auth/token",
             cookies={SESSION_COOKIE: signed_in["cookie"]},
@@ -121,7 +146,7 @@ class TestJwtPlugin:
         assert claims["aud"] == harness
         assert claims["exp"] - claims["iat"] == 900
 
-    def test_jwks_emits_alg_and_never_use(self, harness):
+    def test_jwks_emits_alg_and_never_use(self, harness: str) -> None:
         resp = httpx.get(f"{harness}/api/auth/jwks")
         assert resp.status_code == 200
         keys = resp.json()["keys"]

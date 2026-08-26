@@ -23,6 +23,8 @@ jobs:
         run: uv sync
       - name: Lint
         run: uv run ruff check .
+      - name: Format
+        run: uv run ruff format --check .
       - name: Build
         run: uv build
       - name: Wheel must ship py.typed
@@ -30,18 +32,68 @@ jobs:
       - name: Test
         run: uv run pytest -q
 
-  e2e:
-    name: e2e conformance
+  types:
+    name: pyright strict (py3.13)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Sync (dev group)
+        run: uv sync
+      - name: Pyright (strict, src + tests)
+        run: uv run pyright
+
+  os:
+    name: unit (${{ matrix.os }}, py3.13)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Sync (dev group)
+        run: uv sync
+      - name: Test (unit lane)
+        run: uv run pytest -q
+
+  prerelease:
+    # Advisory only: a red here never blocks a merge. uv resolves "3.15" to the newest
+    # 3.15 pre-release because no stable 3.15 exists yet.
+    name: unit (py3.15 pre-release, advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.15"
+      - name: Sync (dev group)
+        run: uv sync
+      - name: Test (unit lane)
+        run: uv run pytest -q
+
+  e2e:
+    name: e2e conformance + combined coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
       - name: Start harness
         run: docker compose -f harness/docker-compose.yml up --build -d --wait
       - name: Sync (dev group)
         run: uv sync
-      - name: Conformance lane
-        run: uv run pytest -m e2e -q
+      - name: Unit lane (coverage, no gate)
+        run: uv run pytest -q --cov=fastapi_better_auth --cov-append
+      - name: Conformance lane (gate on combined unit + e2e coverage)
+        run: uv run pytest -m e2e -q --cov=fastapi_better_auth --cov-append --cov-fail-under=80
       - name: Harness logs
         if: failure()
         run: docker compose -f harness/docker-compose.yml logs
