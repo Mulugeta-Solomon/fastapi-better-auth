@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any, TypeVar, cast
+from typing import Any, NoReturn, TypeVar, cast
 
 if sys.version_info >= (3, 11):  # pragma: no cover - one branch per interpreter
     from builtins import BaseExceptionGroup
@@ -26,6 +26,7 @@ from .errors import (
     SessionError,
 )
 from .models import Session, User
+from .openapi import declaring, schemes_for
 from .verifiers import Verifier
 
 logger = logging.getLogger("fastapi_better_auth")
@@ -33,11 +34,48 @@ logger = logging.getLogger("fastapi_better_auth")
 BASE_URL_ENV = "BETTER_AUTH_URL"
 GROUP_TYPES: tuple[type[BaseException], ...] = (BaseExceptionGroup,)
 
+BARE_FACTORY = (
+    "current_session / optional_session was passed to Depends() without being called. Write"
+    " Depends(auth.current_session()) or Depends(auth.optional_session()) - with the"
+    " parentheses. Passed bare, the factory itself becomes the dependency: FastAPI calls it,"
+    " discards the dependency it returns, and nothing verifies the request. At router level"
+    " that is a silent bypass of every route under the router, so it is refused rather than"
+    " run: while the route is being registered, or on the first request touching it if the"
+    " factory was assigned into app.dependency_overrides."
+)
+
 UserModelT = TypeVar("UserModelT", bound=User)
 
 Resolver = Callable[[HTTPConnection], Awaitable["Session[Any] | None"]]
 Dependency = Callable[..., Awaitable[Any]]
 Presented = list["tuple[Verifier, Any]"]
+
+
+class _NotADependency:
+    """The type of the guard parameter on both factories, and never a dependency's type.
+
+    FastAPI builds a pydantic field for every parameter of a dependency it does not recognize
+    as one of its own, and it does so while the route is being registered. A factory passed to
+    `Depends` *without* being called therefore reaches this hook at import time - the last
+    moment before an application carrying a silent authentication bypass would have booted
+    healthy. A normal call never touches pydantic, so nothing about the supported spelling
+    changes.
+
+    The one planting it cannot reach that early is `app.dependency_overrides`, a plain dict
+    with no hook to refuse an assignment; FastAPI builds the dependant for an override on the
+    first request that uses it, so the hook fires there instead, and the request fails closed
+    (D-107).
+    """
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: object, handler: object) -> NoReturn:
+        raise ConfigurationError(BARE_FACTORY)
+
+    def __repr__(self) -> str:
+        return "<not a dependency>"
+
+
+NOT_A_DEPENDENCY = _NotADependency()
 
 
 class BetterAuth:
@@ -89,12 +127,20 @@ class BetterAuth:
             configuration in its own `__init__`.
 
     Raises:
-        ConfigurationError: If the sequence is empty, or an entry is not a usable verifier.
+        ConfigurationError: For every construction-time refusal, all of them before a request
+            exists: the sequence is empty or is not a sequence; an entry does not implement
+            `Verifier`, has a non-callable `extract`/`verify`, declares an `async def extract`,
+            or declares a blank `credential_source`; the same verifier appears twice; two
+            verifiers declare the same `credential_source`, so every request carrying it would
+            be ambiguous; or two `credential_source` labels would be published under one
+            OpenAPI security-scheme name, where one definition would silently replace the
+            other.
     """
 
     def __init__(self, *, verifiers: Sequence[Verifier]) -> None:
         self._verifiers = _validated(verifiers)
         self._nothing = _nothing_presented(self._verifiers)
+        self._declared = declaring(schemes_for(self._verifiers))
         self._resolvers: dict[type[User], Resolver] = {}
         self._required: dict[type[User], Dependency] = {}
         self._optional: dict[type[User], Dependency] = {}
@@ -145,7 +191,10 @@ class BetterAuth:
         return self._verifiers
 
     def current_session(
-        self, *, user_model: type[UserModelT] = User
+        self,
+        *,
+        user_model: type[UserModelT] = User,
+        _guard: _NotADependency = NOT_A_DEPENDENCY,
     ) -> Callable[..., Awaitable[Session[UserModelT]]]:
         """Build the dependency that requires a verified session.
 
@@ -160,12 +209,21 @@ class BetterAuth:
         route also verifies once.
 
         **Call it.** `Depends(auth.current_session())`, with the parentheses. Passing the
-        factory itself - `Depends(auth.current_session)` - is a bypass, not an error: at
-        router level FastAPI resolves it as a dependency that takes an optional
-        `user_model` argument, calls it, discards the callable it returns, and **no
-        verification happens on any route under that router**. At route level it surfaces
-        as a type mismatch instead, so the two spellings fail very differently. Nothing
-        detects the router-level form at runtime today.
+        factory itself - `Depends(auth.current_session)` - used to be a bypass rather than an
+        error: at router level FastAPI resolved *it* as the dependency, called it, discarded
+        the callable it returned, and no verification happened on any route under that router.
+        It is now refused with a `ConfigurationError` naming the missing parentheses. Every
+        `Depends` and `Security` planting - on a route, a router, or the application - is
+        refused while the route is being registered, so a deployment carrying that mistake
+        never starts up. The one exception is a bare factory assigned into
+        `app.dependency_overrides`, a dict this library has no hook into: there it is not seen
+        until the first request touching that dependency, where it raises the same error and
+        still verifies nothing.
+
+        Routes built from this dependency declare a security scheme derived from the
+        verifiers' own `credential_source` labels, so `/docs` gets a working Authorize
+        button. The scheme is documentation only: what it would extract is never read, and
+        every credential still comes from the verifier that owns it.
 
         Args:
             user_model: The `User` subclass to parse the upstream payload into. The
@@ -175,8 +233,11 @@ class BetterAuth:
             A dependency callable to pass to `Depends`.
 
         Raises:
-            ConfigurationError: If `user_model` is not a `User` subclass; at request time,
-                if a verifier answers with something that is not a `Session[user_model]`.
+            ConfigurationError: If `user_model` is not a `User` subclass; while a route is
+                being registered, if this factory was passed to `Depends` or `Security`
+                without being called (at the first request instead, if it was assigned into
+                `app.dependency_overrides`); at request time, if a verifier answers with
+                something that is not a `Session[user_model]`.
             MissingCredential: At request time, when no verifier found a credential.
             AmbiguousCredentials: At request time, when two or more verifiers did.
             SessionError: At request time, whatever the chosen verifier raised.
@@ -188,7 +249,10 @@ class BetterAuth:
         return cast("Callable[..., Awaitable[Session[UserModelT]]]", cached)
 
     def optional_session(
-        self, *, user_model: type[UserModelT] = User
+        self,
+        *,
+        user_model: type[UserModelT] = User,
+        _guard: _NotADependency = NOT_A_DEPENDENCY,
     ) -> Callable[..., Awaitable[Session[UserModelT] | None]]:
         """Build the dependency that allows an anonymous request through.
 
@@ -202,8 +266,13 @@ class BetterAuth:
         reasons in that method's documentation.
 
         **Call it.** `Depends(auth.optional_session())`, with the parentheses - passing the
-        factory itself silently runs no verification at router level. See
-        `current_session` for what that failure looks like.
+        factory itself is refused while the route is registered, or at the first request if it
+        was assigned into `app.dependency_overrides`. See `current_session`.
+
+        A route built from this dependency declares the same security scheme a required one
+        does. OpenAPI cannot say "optional" from inside a dependency, and a route Swagger
+        would not send a credential to could not be exercised from `/docs` at all - which is
+        the failure that would actually reach somebody reading the page.
 
         Args:
             user_model: The `User` subclass to parse the upstream payload into.
@@ -213,8 +282,11 @@ class BetterAuth:
             or `None`.
 
         Raises:
-            ConfigurationError: If `user_model` is not a `User` subclass; at request time,
-                if a verifier answers with something that is not a `Session[user_model]`.
+            ConfigurationError: If `user_model` is not a `User` subclass; while a route is
+                being registered, if this factory was passed to `Depends` or `Security`
+                without being called (at the first request instead, if it was assigned into
+                `app.dependency_overrides`); at request time, if a verifier answers with
+                something that is not a `Session[user_model]`.
             AmbiguousCredentials: At request time, when two or more verifiers found one.
             SessionError: At request time, for any credential that was presented and did
                 not verify.
@@ -247,11 +319,28 @@ class BetterAuth:
         cached = self._resolvers.get(user_model)
         if cached is not None:
             return cached
+        return self._resolvers.setdefault(user_model, self._resolve(user_model))
 
-        async def resolve(connection: HTTPConnection) -> Session[UserModelT] | None:
+    def _resolve(self, user_model: type[UserModelT]) -> Resolver:
+        """The one anchor both dependencies hang off - and so the one place a scheme is hung.
+
+        Declaring on the shared resolver rather than on each wrapper is what makes a route
+        carrying `current_session`, `optional_session` or both document itself identically.
+        """
+        declared = self._declared
+        if declared is None:
+
+            async def resolve(connection: HTTPConnection) -> Session[UserModelT] | None:
+                return await self._authenticate(connection, user_model)
+
+            return resolve
+
+        async def documented(
+            connection: HTTPConnection, _declared: None = Depends(declared)
+        ) -> Session[UserModelT] | None:
             return await self._authenticate(connection, user_model)
 
-        return self._resolvers.setdefault(user_model, resolve)
+        return documented
 
     async def _authenticate(
         self, connection: HTTPConnection, user_model: type[UserModelT]
