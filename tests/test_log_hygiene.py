@@ -6,12 +6,22 @@ label. Individual suites assert it for the `reason` each refusal builds. This on
 for the artefact those reasons actually end up in - a `logging.LogRecord`, rendered the way a
 handler renders it, traceback included.
 
-**Why the enumeration exists.** Two confirmed members of a set are not the set. `LOG_SITES`
-is collected from `src/` by walking the AST for calls on a logger, and `COVERED_BY` names the
-test that drives each one; the two are asserted equal, so a future work package that adds a
-log site fails here until it is exercised rather than escaping silently. Each scenario then
-asserts *its own* template appeared among the records, which is what keeps the manifest from
-being a declaration nobody checks.
+**Why the enumeration exists.** Two confirmed members of a set are not the set. `log_sites()`
+is collected from `src/` by walking the AST, and `COVERED_BY` names the test that drives each
+one; the two are asserted equal, so a future work package that adds a log site fails here until
+it is exercised rather than escaping silently. Each scenario then asserts *its own* template
+appeared among the records, which is what keeps the manifest from being a declaration nobody
+checks.
+
+**The collector reads the call, never the receiver's name** (D-104). An earlier cut matched the
+receiver against log-shaped words, so `audit = logging.getLogger(...)`, `_L`, and `self._sink`
+were all invisible - the enumeration was blind to precisely the site nobody anticipated, which
+is the only kind it exists to catch. Every call of a logging method is collected whatever its
+receiver is called; over-collection fails loud and gets classified on purpose, and two
+structural pins keep that cheap to read: `getLogger` may only be bound to a module-level
+`logger`, and a log message must be a literal `%`-style template (which is also the
+log-injection-safe form - `logging` renders the arguments, so nothing a client chose can become
+the template).
 
 **The limit, stated because it is real.** `core._contained` logs the traceback of an
 exception that escaped somebody else's verifier. If that verifier put the raw credential into
@@ -26,7 +36,6 @@ from __future__ import annotations
 import ast
 import logging
 import pathlib
-import re
 import sys
 import time
 from collections.abc import Iterator, Mapping
@@ -66,7 +75,9 @@ LIBRARY_LOGGER = "fastapi_better_auth"
 CONSUMER_LOGGER = "some.application"
 
 LEVELS = frozenset({"critical", "debug", "error", "exception", "info", "log", "warn", "warning"})
-LOGGER_WORDS = frozenset({"log", "logger", "logging", "logs"})
+LOGGER_BINDING = "logger"
+NON_LITERAL = "<non-literal>"
+"""What `_template` returns for a message that is not a string literal - and never a real one."""
 MIN_NEEDLE = 8
 """A needle shorter than this matches by accident, not by leak."""
 
@@ -97,38 +108,80 @@ class LogSite:
     template: str
 
 
-def _words(identifier: str) -> frozenset[str]:
+def _template(call: ast.Call) -> str:
+    """The literal `%`-style template, or `NON_LITERAL` for anything the enumeration cannot key.
+
+    A message built at the call site - an f-string, a pre-assembled variable - is unclassifiable
+    here *and* is the shape that carries interpolated values into a log line in the first place.
+    It is not silently tolerated: it becomes a sentinel that fails its own test (B4).
+    """
+    first = call.args[0] if call.args else None
+    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+        return first.value
+    return NON_LITERAL
+
+
+def collect_log_sites(tree: ast.Module, module: str) -> frozenset[LogSite]:
+    """Every call of a logging method, whatever its receiver is called.
+
+    Receiver spelling is *not* consulted (B3). A previous cut matched the receiver against
+    log-shaped words, which meant `audit = logging.getLogger(...); audit.warning(...)` - or
+    `_L`, or `self._sink` - was invisible to the enumeration whose entire job is to notice a
+    new log site. Over-collection is the correct failure mode here: a non-logger `.warning(...)`
+    landing in `src/` fails this suite loudly and gets classified on purpose.
+    """
     return frozenset(
-        part for part in re.split(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])", identifier) if part
+        LogSite(module=module, level=node.func.attr, template=_template(node))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in LEVELS
     )
 
 
-def _is_logger(receiver: ast.expr) -> bool:
-    """`logger`, `LOGGER`, `self._logger`, `logging.getLogger("x")` - but never `self.dialog`."""
-    named = {word.lower() for word in _words(ast.unparse(receiver))}
-    return bool(named & LOGGER_WORDS)
+def _is_get_logger(func: ast.expr) -> bool:
+    return (isinstance(func, ast.Attribute) and func.attr == "getLogger") or (
+        isinstance(func, ast.Name) and func.id == "getLogger"
+    )
 
 
-def _template(call: ast.Call) -> str:
-    first = call.args[0] if call.args else None
-    return first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else ""
+def logger_binding_violations(tree: ast.Module, module: str) -> tuple[str, ...]:
+    """Every `getLogger` call that is not bound to a module-level name `logger`.
+
+    The convention is what makes B3's over-collection cheap to read: one logger per module,
+    one name, bound where `grep` finds it. An inline `logging.getLogger("x").warning(...)`,
+    a binding inside a function, and an alias all fail here.
+    """
+    bound = {
+        id(statement.value): target.id
+        for statement in tree.body
+        if isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Call)
+        if _is_get_logger(statement.value.func)
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    }
+    return tuple(
+        f"{module}:{call.lineno} binds getLogger to {bound.get(id(call), '<nothing>')!r};"
+        f" this package binds it once per module to a module-level `{LOGGER_BINDING}`"
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call) and _is_get_logger(call.func)
+        if bound.get(id(call)) != LOGGER_BINDING
+    )
 
 
 def src_files() -> Iterator[pathlib.Path]:
     return (p for p in SRC.rglob("*.py") if "__pycache__" not in p.parts)
 
 
-def log_sites() -> frozenset[LogSite]:
-    found: set[LogSite] = set()
+def parsed_src() -> Iterator[tuple[str, ast.Module]]:
     for path in src_files():
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-                continue
-            if node.func.attr not in LEVELS or not _is_logger(node.func.value):
-                continue
-            found.add(LogSite(module=path.stem, level=node.func.attr, template=_template(node)))
-    return frozenset(found)
+        yield path.stem, ast.parse(path.read_text(encoding="utf-8"))
+
+
+def log_sites() -> frozenset[LogSite]:
+    return frozenset(
+        site for module, tree in parsed_src() for site in collect_log_sites(tree, module)
+    )
 
 
 COVERED_BY: Mapping[LogSite, str] = {
@@ -229,45 +282,96 @@ def test_the_collector_is_not_reading_an_empty_file_set() -> None:
 
 
 @pytest.mark.parametrize(
-    ("source", "expected"),
+    ("source", "level"),
     [
-        ("logger.warning('x')", True),
-        ("LOGGER.error('x')", True),
-        ("self._logger.info('x')", True),
-        ("logging.getLogger('a').debug('x')", True),
-        ("self.dialog.error('x')", False),
-        ("catalogue.info('x')", False),
+        ("logger.warning('hi %s', v)", "warning"),
+        ("audit = logging.getLogger('x')\naudit.warning('hi %s', v)", "warning"),
+        ("_L = logging.getLogger('x')\n_L.info('hi %s', v)", "info"),
+        ("self._sink.error('hi %s', v)", "error"),
+        ("AUDIT.exception('hi %s', v)", "exception"),
+        ("logging.getLogger('x').critical('hi %s', v)", "critical"),
+        ("from logging import getLogger\ntrail = getLogger('x')\ntrail.debug('hi %s', v)", "debug"),
     ],
-    ids=["logger", "upper", "attribute", "inline", "dialog", "catalogue"],
+    ids=["logger", "aliased", "initial", "method-receiver", "upper", "inline", "from-import"],
 )
-def test_the_collector_recognizes_a_logger_without_mistaking_a_word_for_one(
-    source: str, expected: bool
+def test_the_collector_sees_a_log_call_whatever_its_receiver_is_called(
+    source: str, level: str
 ) -> None:
-    """Prove the instrument. `dialog` and `catalogue` both contain "log"; neither is one."""
-    call = ast.parse(source).body[0]
-    assert isinstance(call, ast.Expr) and isinstance(call.value, ast.Call)
-    func = call.value.func
-    assert isinstance(func, ast.Attribute)
+    """B3, as reproduced. Every one of these was invisible to the previous collector, which
+    matched the receiver against log-shaped words - so the one thing this enumeration exists to
+    catch, a log site added under a name nobody anticipated, was exactly what it could not see.
+    """
+    sites = collect_log_sites(ast.parse(source), "probe")
 
-    assert _is_logger(func.value) is expected
+    assert LogSite("probe", level, "hi %s") in sites
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["logger.info(f'hi {v}')", "logger.info(msg)", "logger.info()", "logger.info(TEMPLATE % v)"],
+    ids=["f-string", "variable", "no-args", "pre-formatted"],
+)
+def test_a_message_that_is_not_a_literal_is_marked_rather_than_swallowed(source: str) -> None:
+    """B4. All four used to collapse to `""`, which is a *valid-looking* template - so the site
+    joined the enumeration under a key that says nothing and matched nothing."""
+    sites = collect_log_sites(ast.parse(source), "probe")
+
+    assert {site.template for site in sites} == {NON_LITERAL}
+
+
+def test_every_log_call_in_src_passes_a_literal_template() -> None:
+    """B4 over the real tree. A `%`-style literal plus arguments is also the log-injection-safe
+    form: `logging` renders the arguments, so nothing a client chose becomes the template."""
+    offenders = [site for site in log_sites() if site.template == NON_LITERAL]
+
+    assert not offenders, (
+        "these log calls build their message at the call site rather than passing a literal"
+        f" template and arguments: {sorted((s.module, s.level) for s in offenders)}"
+    )
+
+
+def test_get_logger_is_only_ever_bound_to_a_module_level_logger() -> None:
+    """The convention that makes B3's over-collection cheap: one logger per module, one name.
+
+    Without it, `collect_log_sites` catching every `.warning(...)` would be noise; with it, a
+    reviewer knows any logging call in `src/` goes through the one binding at the top of the file.
+    """
+    offenders = [
+        problem
+        for module, tree in parsed_src()
+        for problem in logger_binding_violations(tree, module)
+    ]
+
+    assert not offenders, "\n".join(offenders)
+
+
+@pytest.mark.parametrize(
+    ("source", "compliant"),
+    [
+        ("import logging\nlogger = logging.getLogger('x')\n", True),
+        ("from logging import getLogger\nlogger = getLogger('x')\n", True),
+        ("import logging\naudit = logging.getLogger('x')\n", False),
+        ("import logging\nlogging.getLogger('x').info('hi')\n", False),
+        ("import logging\ndef f():\n    logger = logging.getLogger('x')\n", False),
+        ("import logging\nself.logger = logging.getLogger('x')\n", False),
+    ],
+    ids=["module-level", "from-import", "aliased", "inline", "in-function", "attribute"],
+)
+def test_the_binding_pin_fires_on_every_way_of_getting_it_wrong(
+    source: str, compliant: bool
+) -> None:
+    """Prove the instrument, both directions: a pin that never fires pins nothing."""
+    assert (logger_binding_violations(ast.parse(source), "probe") == ()) is compliant
 
 
 def test_the_collector_finds_a_synthetic_site_in_a_planted_file(tmp_path: pathlib.Path) -> None:
     """The scan is exercised end to end against a file it has never seen."""
     planted = tmp_path / "planted.py"
-    planted.write_text("import logging\nlogger = logging.getLogger()\nlogger.info('hi %s', x)\n")
+    planted.write_text(
+        "import logging\nlogger = logging.getLogger()\nlogger.info('hi %s', x)\n", encoding="utf-8"
+    )
 
-    tree = ast.parse(planted.read_text(encoding="utf-8"))
-    calls = [
-        n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-    ]
-    sites = {
-        LogSite(planted.stem, call.func.attr, _template(call))
-        for call in calls
-        if isinstance(call.func, ast.Attribute)
-        and call.func.attr in LEVELS
-        and _is_logger(call.func.value)
-    }
+    sites = collect_log_sites(ast.parse(planted.read_text(encoding="utf-8")), planted.stem)
 
     assert LogSite("planted", "info", "hi %s") in sites
 
