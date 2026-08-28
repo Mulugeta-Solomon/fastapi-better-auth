@@ -121,7 +121,14 @@ class BetterAuth:
             configuration in its own `__init__`.
 
     Raises:
-        ConfigurationError: If the sequence is empty, or an entry is not a usable verifier.
+        ConfigurationError: For every construction-time refusal, all of them before a request
+            exists: the sequence is empty or is not a sequence; an entry does not implement
+            `Verifier`, has a non-callable `extract`/`verify`, declares an `async def extract`,
+            or declares a blank `credential_source`; the same verifier appears twice; two
+            verifiers declare the same `credential_source`, so every request carrying it would
+            be ambiguous; or two `credential_source` labels would be published under one
+            OpenAPI security-scheme name, where one definition would silently replace the
+            other.
     """
 
     def __init__(self, *, verifiers: Sequence[Verifier]) -> None:
