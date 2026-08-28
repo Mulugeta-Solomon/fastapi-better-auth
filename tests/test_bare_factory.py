@@ -8,10 +8,17 @@ authentication bypass on an application that started up healthy and answered 200
 
 `test_the_unguarded_shape_is_a_silent_bypass` is that failure, reproduced and kept: it builds
 a factory with the same signature minus the guard and shows an anonymous request being
-answered 200 with the verifier untouched. Every other test here asserts that the real
-factories no longer allow it — and that they refuse **while the application is being built**,
-which is the whole of the choice recorded in D-107: an application carrying this bug now never
-finishes starting up, so there is no window in which it serves unauthenticated traffic.
+answered 200 with the verifier untouched. The tests after it assert that the real factories no
+longer allow it, and that they refuse **while the application is being built** — the whole of
+the choice recorded in D-107: an application whose routes carry this bug never finishes
+starting up, so there is no window in which it serves unauthenticated traffic.
+
+One planting is outside that guarantee and is pinned here rather than left implied.
+`app.dependency_overrides` is a plain dict FastAPI owns and we do not, so the same typo written
+as an override *value* is assigned without a hook to refuse it: the application starts healthy
+and the guard fires at the first request instead. It still fails closed — an untranslated 500,
+nothing extracted, nothing verified, no 2xx — which is what makes it a limit rather than a
+second bypass.
 """
 
 from __future__ import annotations
@@ -22,9 +29,11 @@ from typing import Any
 
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, Security, WebSocket
+from fastapi.testclient import TestClient
 
 from fastapi_better_auth import BetterAuth, ConfigurationError, Session, User
-from tests.fakes import FakeVerifier, client
+from fastapi_better_auth._internal.core import BARE_FACTORY
+from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, client
 
 HEADER = "x-cred-a"
 Factory = Callable[..., Callable[..., Awaitable[Any]]]
@@ -177,6 +186,65 @@ def test_calling_the_factory_normally_is_unaffected(which: str) -> None:
     assert factory(user_model=User) is factory(user_model=User)
 
 
+# --- the one planting the build-time guarantee cannot reach ----------------------------
+
+
+def overridden_app(which: str) -> tuple[FakeVerifier, FastAPI]:
+    """A correctly built app, with the missing-parentheses typo written into the override map."""
+    verifier, auth = one_verifier()
+    required = auth.current_session()
+
+    async def endpoint(session: Session[User] = Depends(required)) -> dict[str, str]:
+        return {"id": session.user.id}
+
+    app = FastAPI()
+    app.add_api_route("/me", endpoint, methods=["GET"], response_model=None)
+    app.dependency_overrides[required] = getattr(auth, which)
+    return verifier, app
+
+
+@pytest.mark.parametrize("which", ["current_session", "optional_session"])
+def test_a_bare_factory_in_the_override_map_is_not_seen_until_the_first_request(
+    which: str,
+) -> None:
+    """The limit of the build-time guarantee, pinned rather than implied.
+
+    `app.dependency_overrides` is a plain dict FastAPI owns and we do not. Assigning into it
+    runs no code of ours and offers no hook, so the same typo written as an override *value*
+    cannot be refused when it is written: the application builds, starts, and reports healthy.
+    The guard still fires, with the same message, at the first request that touches the
+    overridden dependency - which is why the docstrings claim build-time refusal for every
+    `Depends` / `Security` planting and name this one separately (D-107).
+    """
+    verifier, app = overridden_app(which)
+
+    with client(app) as http, pytest.raises(ConfigurationError) as caught:
+        http.get("/me", headers={HEADER: GOOD_CREDENTIAL})
+
+    assert str(caught.value) == BARE_FACTORY
+    assert verifier.extract_calls == 0
+    assert verifier.verify_calls == 0
+
+
+@pytest.mark.parametrize("which", ["current_session", "optional_session"])
+def test_the_override_planting_still_fails_closed(which: str) -> None:
+    """What makes it a limit rather than a bypass. The answer is an untranslated 500 instead of
+    this library's refusal shape, and no request is served either way: nothing is extracted,
+    nothing is verified, and no 2xx is produced - with a credential or without one. A guarantee
+    that degrades to *unavailable* is a limit; one that degrades to *authenticated* would be the
+    WP3 bypass again."""
+    verifier, app = overridden_app(which)
+
+    with TestClient(app, raise_server_exceptions=False) as http:
+        credentialed = http.get("/me", headers={HEADER: GOOD_CREDENTIAL})
+        anonymous = http.get("/me")
+
+    assert credentialed.status_code == 500
+    assert anonymous.status_code == 500
+    assert verifier.extract_calls == 0
+    assert verifier.verify_calls == 0
+
+
 def test_the_guard_default_renders_as_what_it_is() -> None:
     """It is the default of a parameter on a public method, so it is printed by `help()` and
     by every signature dump. A memory address there says nothing and changes every run."""
@@ -195,7 +263,7 @@ def test_a_correctly_called_factory_builds_a_working_route(client_backend: str) 
 
     with client(app, client_backend) as http:
         anonymous = http.get("/me")
-        authorized = http.get("/me", headers={HEADER: "good-credential"})
+        authorized = http.get("/me", headers={HEADER: GOOD_CREDENTIAL})
 
     assert anonymous.status_code == 401
     assert authorized.status_code == 200

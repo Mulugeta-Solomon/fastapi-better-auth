@@ -39,8 +39,9 @@ BARE_FACTORY = (
     " Depends(auth.current_session()) or Depends(auth.optional_session()) - with the"
     " parentheses. Passed bare, the factory itself becomes the dependency: FastAPI calls it,"
     " discards the dependency it returns, and nothing verifies the request. At router level"
-    " that is a silent bypass of every route under the router, which is why it is refused"
-    " here, while the application is still being built."
+    " that is a silent bypass of every route under the router, so it is refused rather than"
+    " run: while the route is being registered, or on the first request touching it if the"
+    " factory was assigned into app.dependency_overrides."
 )
 
 UserModelT = TypeVar("UserModelT", bound=User)
@@ -59,6 +60,11 @@ class _NotADependency:
     moment before an application carrying a silent authentication bypass would have booted
     healthy. A normal call never touches pydantic, so nothing about the supported spelling
     changes.
+
+    The one planting it cannot reach that early is `app.dependency_overrides`, a plain dict
+    with no hook to refuse an assignment; FastAPI builds the dependant for an override on the
+    first request that uses it, so the hook fires there instead, and the request fails closed
+    (D-107).
     """
 
     @classmethod
@@ -206,9 +212,13 @@ class BetterAuth:
         factory itself - `Depends(auth.current_session)` - used to be a bypass rather than an
         error: at router level FastAPI resolved *it* as the dependency, called it, discarded
         the callable it returned, and no verification happened on any route under that router.
-        It is now refused with a `ConfigurationError` naming the missing parentheses, and
-        refused while the application is being built rather than on a request, so a deployment
-        carrying that mistake never starts up.
+        It is now refused with a `ConfigurationError` naming the missing parentheses. Every
+        `Depends` and `Security` planting - on a route, a router, or the application - is
+        refused while the route is being registered, so a deployment carrying that mistake
+        never starts up. The one exception is a bare factory assigned into
+        `app.dependency_overrides`, a dict this library has no hook into: there it is not seen
+        until the first request touching that dependency, where it raises the same error and
+        still verifies nothing.
 
         Routes built from this dependency declare a security scheme derived from the
         verifiers' own `credential_source` labels, so `/docs` gets a working Authorize
@@ -223,10 +233,11 @@ class BetterAuth:
             A dependency callable to pass to `Depends`.
 
         Raises:
-            ConfigurationError: If `user_model` is not a `User` subclass; while the
-                application is being built, if this factory was passed to `Depends` without
-                being called; at request time, if a verifier answers with something that is
-                not a `Session[user_model]`.
+            ConfigurationError: If `user_model` is not a `User` subclass; while a route is
+                being registered, if this factory was passed to `Depends` or `Security`
+                without being called (at the first request instead, if it was assigned into
+                `app.dependency_overrides`); at request time, if a verifier answers with
+                something that is not a `Session[user_model]`.
             MissingCredential: At request time, when no verifier found a credential.
             AmbiguousCredentials: At request time, when two or more verifiers did.
             SessionError: At request time, whatever the chosen verifier raised.
@@ -255,7 +266,8 @@ class BetterAuth:
         reasons in that method's documentation.
 
         **Call it.** `Depends(auth.optional_session())`, with the parentheses - passing the
-        factory itself is refused while the application is built. See `current_session`.
+        factory itself is refused while the route is registered, or at the first request if it
+        was assigned into `app.dependency_overrides`. See `current_session`.
 
         A route built from this dependency declares the same security scheme a required one
         does. OpenAPI cannot say "optional" from inside a dependency, and a route Swagger
@@ -270,10 +282,11 @@ class BetterAuth:
             or `None`.
 
         Raises:
-            ConfigurationError: If `user_model` is not a `User` subclass; while the
-                application is being built, if this factory was passed to `Depends` without
-                being called; at request time, if a verifier answers with something that is
-                not a `Session[user_model]`.
+            ConfigurationError: If `user_model` is not a `User` subclass; while a route is
+                being registered, if this factory was passed to `Depends` or `Security`
+                without being called (at the first request instead, if it was assigned into
+                `app.dependency_overrides`); at request time, if a verifier answers with
+                something that is not a `Session[user_model]`.
             AmbiguousCredentials: At request time, when two or more verifiers found one.
             SessionError: At request time, for any credential that was presented and did
                 not verify.
