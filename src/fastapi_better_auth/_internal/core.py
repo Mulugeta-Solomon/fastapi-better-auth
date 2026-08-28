@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any, TypeVar, cast
+from typing import Any, NoReturn, TypeVar, cast
 
 if sys.version_info >= (3, 11):  # pragma: no cover - one branch per interpreter
     from builtins import BaseExceptionGroup
@@ -33,11 +33,42 @@ logger = logging.getLogger("fastapi_better_auth")
 BASE_URL_ENV = "BETTER_AUTH_URL"
 GROUP_TYPES: tuple[type[BaseException], ...] = (BaseExceptionGroup,)
 
+BARE_FACTORY = (
+    "current_session / optional_session was passed to Depends() without being called. Write"
+    " Depends(auth.current_session()) or Depends(auth.optional_session()) - with the"
+    " parentheses. Passed bare, the factory itself becomes the dependency: FastAPI calls it,"
+    " discards the dependency it returns, and nothing verifies the request. At router level"
+    " that is a silent bypass of every route under the router, which is why it is refused"
+    " here, while the application is still being built."
+)
+
 UserModelT = TypeVar("UserModelT", bound=User)
 
 Resolver = Callable[[HTTPConnection], Awaitable["Session[Any] | None"]]
 Dependency = Callable[..., Awaitable[Any]]
 Presented = list["tuple[Verifier, Any]"]
+
+
+class _NotADependency:
+    """The type of the guard parameter on both factories, and never a dependency's type.
+
+    FastAPI builds a pydantic field for every parameter of a dependency it does not recognize
+    as one of its own, and it does so while the route is being registered. A factory passed to
+    `Depends` *without* being called therefore reaches this hook at import time - the last
+    moment before an application carrying a silent authentication bypass would have booted
+    healthy. A normal call never touches pydantic, so nothing about the supported spelling
+    changes.
+    """
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: object, handler: object) -> NoReturn:
+        raise ConfigurationError(BARE_FACTORY)
+
+    def __repr__(self) -> str:
+        return "<not a dependency>"
+
+
+NOT_A_DEPENDENCY = _NotADependency()
 
 
 class BetterAuth:
@@ -145,7 +176,10 @@ class BetterAuth:
         return self._verifiers
 
     def current_session(
-        self, *, user_model: type[UserModelT] = User
+        self,
+        *,
+        user_model: type[UserModelT] = User,
+        _guard: _NotADependency = NOT_A_DEPENDENCY,
     ) -> Callable[..., Awaitable[Session[UserModelT]]]:
         """Build the dependency that requires a verified session.
 
@@ -160,12 +194,12 @@ class BetterAuth:
         route also verifies once.
 
         **Call it.** `Depends(auth.current_session())`, with the parentheses. Passing the
-        factory itself - `Depends(auth.current_session)` - is a bypass, not an error: at
-        router level FastAPI resolves it as a dependency that takes an optional
-        `user_model` argument, calls it, discards the callable it returns, and **no
-        verification happens on any route under that router**. At route level it surfaces
-        as a type mismatch instead, so the two spellings fail very differently. Nothing
-        detects the router-level form at runtime today.
+        factory itself - `Depends(auth.current_session)` - used to be a bypass rather than an
+        error: at router level FastAPI resolved *it* as the dependency, called it, discarded
+        the callable it returned, and no verification happened on any route under that router.
+        It is now refused with a `ConfigurationError` naming the missing parentheses, and
+        refused while the application is being built rather than on a request, so a deployment
+        carrying that mistake never starts up.
 
         Args:
             user_model: The `User` subclass to parse the upstream payload into. The
@@ -175,8 +209,10 @@ class BetterAuth:
             A dependency callable to pass to `Depends`.
 
         Raises:
-            ConfigurationError: If `user_model` is not a `User` subclass; at request time,
-                if a verifier answers with something that is not a `Session[user_model]`.
+            ConfigurationError: If `user_model` is not a `User` subclass; while the
+                application is being built, if this factory was passed to `Depends` without
+                being called; at request time, if a verifier answers with something that is
+                not a `Session[user_model]`.
             MissingCredential: At request time, when no verifier found a credential.
             AmbiguousCredentials: At request time, when two or more verifiers did.
             SessionError: At request time, whatever the chosen verifier raised.
@@ -188,7 +224,10 @@ class BetterAuth:
         return cast("Callable[..., Awaitable[Session[UserModelT]]]", cached)
 
     def optional_session(
-        self, *, user_model: type[UserModelT] = User
+        self,
+        *,
+        user_model: type[UserModelT] = User,
+        _guard: _NotADependency = NOT_A_DEPENDENCY,
     ) -> Callable[..., Awaitable[Session[UserModelT] | None]]:
         """Build the dependency that allows an anonymous request through.
 
@@ -202,8 +241,7 @@ class BetterAuth:
         reasons in that method's documentation.
 
         **Call it.** `Depends(auth.optional_session())`, with the parentheses - passing the
-        factory itself silently runs no verification at router level. See
-        `current_session` for what that failure looks like.
+        factory itself is refused while the application is built. See `current_session`.
 
         Args:
             user_model: The `User` subclass to parse the upstream payload into.
@@ -213,8 +251,10 @@ class BetterAuth:
             or `None`.
 
         Raises:
-            ConfigurationError: If `user_model` is not a `User` subclass; at request time,
-                if a verifier answers with something that is not a `Session[user_model]`.
+            ConfigurationError: If `user_model` is not a `User` subclass; while the
+                application is being built, if this factory was passed to `Depends` without
+                being called; at request time, if a verifier answers with something that is
+                not a `Session[user_model]`.
             AmbiguousCredentials: At request time, when two or more verifiers found one.
             SessionError: At request time, for any credential that was presented and did
                 not verify.
