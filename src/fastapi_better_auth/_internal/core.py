@@ -26,6 +26,7 @@ from .errors import (
     SessionError,
 )
 from .models import Session, User
+from .openapi import declaring, schemes_for
 from .verifiers import Verifier
 
 logger = logging.getLogger("fastapi_better_auth")
@@ -126,6 +127,7 @@ class BetterAuth:
     def __init__(self, *, verifiers: Sequence[Verifier]) -> None:
         self._verifiers = _validated(verifiers)
         self._nothing = _nothing_presented(self._verifiers)
+        self._declared = declaring(schemes_for(self._verifiers))
         self._resolvers: dict[type[User], Resolver] = {}
         self._required: dict[type[User], Dependency] = {}
         self._optional: dict[type[User], Dependency] = {}
@@ -201,6 +203,11 @@ class BetterAuth:
         refused while the application is being built rather than on a request, so a deployment
         carrying that mistake never starts up.
 
+        Routes built from this dependency declare a security scheme derived from the
+        verifiers' own `credential_source` labels, so `/docs` gets a working Authorize
+        button. The scheme is documentation only: what it would extract is never read, and
+        every credential still comes from the verifier that owns it.
+
         Args:
             user_model: The `User` subclass to parse the upstream payload into. The
                 returned dependency is typed `Session[user_model]`.
@@ -242,6 +249,11 @@ class BetterAuth:
 
         **Call it.** `Depends(auth.optional_session())`, with the parentheses - passing the
         factory itself is refused while the application is built. See `current_session`.
+
+        A route built from this dependency declares the same security scheme a required one
+        does. OpenAPI cannot say "optional" from inside a dependency, and a route Swagger
+        would not send a credential to could not be exercised from `/docs` at all - which is
+        the failure that would actually reach somebody reading the page.
 
         Args:
             user_model: The `User` subclass to parse the upstream payload into.
@@ -287,11 +299,28 @@ class BetterAuth:
         cached = self._resolvers.get(user_model)
         if cached is not None:
             return cached
+        return self._resolvers.setdefault(user_model, self._resolve(user_model))
 
-        async def resolve(connection: HTTPConnection) -> Session[UserModelT] | None:
+    def _resolve(self, user_model: type[UserModelT]) -> Resolver:
+        """The one anchor both dependencies hang off - and so the one place a scheme is hung.
+
+        Declaring on the shared resolver rather than on each wrapper is what makes a route
+        carrying `current_session`, `optional_session` or both document itself identically.
+        """
+        declared = self._declared
+        if declared is None:
+
+            async def resolve(connection: HTTPConnection) -> Session[UserModelT] | None:
+                return await self._authenticate(connection, user_model)
+
+            return resolve
+
+        async def documented(
+            connection: HTTPConnection, _declared: None = Depends(declared)
+        ) -> Session[UserModelT] | None:
             return await self._authenticate(connection, user_model)
 
-        return self._resolvers.setdefault(user_model, resolve)
+        return documented
 
     async def _authenticate(
         self, connection: HTTPConnection, user_model: type[UserModelT]

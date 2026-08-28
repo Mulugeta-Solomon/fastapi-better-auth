@@ -7,6 +7,8 @@ through a real FastAPI request, because a verifier that works in isolation and n
 `Depends` has not worked.
 """
 
+from typing import Any
+
 import httpx
 import pytest
 
@@ -19,6 +21,8 @@ from .conftest import SESSION_COOKIE
 pytestmark = pytest.mark.e2e
 
 LIFETIME = 900
+BEARER_NAME = "BetterAuthBearer"
+BEARER_DEFINITION = {"type": "http", "scheme": "bearer"}
 
 
 @pytest.fixture
@@ -80,6 +84,41 @@ async def test_a_live_token_authenticates_a_real_route(harness: str, live_token:
     assert anonymous.status_code == 401
     assert forged.status_code == 401
     assert anonymous.content == forged.content
+
+
+@pytest.mark.anyio
+async def test_the_docs_page_authorizes_a_live_token(harness: str, live_token: str) -> None:
+    """The Authorize button, end to end, against a real server.
+
+    `/docs` can only offer one when the document defines a scheme and the operation requires
+    it - so the document is asserted first, and then the request Swagger builds from it
+    (`Authorization: Bearer <token>`) is sent to the same route and has to verify. Asserting
+    the document alone would prove a lock icon and nothing behind it.
+    """
+    async with HttpxTransport() as transport:
+        auth = BetterAuth(verifiers=[JwtVerifier(base_url=harness, transport=transport)])
+        app = session_app(auth)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://bridge"
+        ) as client:
+            document = await client.get("/openapi.json")
+            docs = await client.get("/docs")
+            authorized = await client.get(
+                "/required", headers={"Authorization": f"Bearer {live_token}"}
+            )
+
+    published: dict[str, Any] = document.json()
+    definition: dict[str, Any] = published["components"]["securitySchemes"][BEARER_NAME]
+
+    assert document.status_code == 200
+    assert {key: definition[key] for key in BEARER_DEFINITION} == BEARER_DEFINITION
+    assert definition["description"]
+    for path in ("/required", "/optional"):
+        assert published["paths"][path]["get"]["security"] == [{BEARER_NAME: []}]
+    assert docs.status_code == 200
+    assert "swagger" in docs.text.lower()
+    assert authorized.status_code == 200
+    assert authorized.json()["id"]
 
 
 @pytest.mark.anyio
