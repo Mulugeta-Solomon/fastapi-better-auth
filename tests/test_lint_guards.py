@@ -19,6 +19,15 @@ credential-into-`reason` ban is one: the difference between `reason=f"{token}"` 
 and literal text, which tokens do not distinguish. It is also the version-stable choice -
 see below.
 
+That ban is written **closed-form** (D-100, tightened): a credential-named identifier anywhere
+in the `reason=` expression fires unless it sits inside a call to `fingerprint` *verified
+imported from `.reasons`* in that module. The first cut enumerated shapes - f-string,
+`.format()`, `%`, concat - and every shape not on the list was a bypass: `token[:8]`,
+`token or fallback`, a ternary, `format_map`, `str(token)`, `token.upper()`. `safe_label` was
+an exemption and should never have been: it renders an identifier-shaped value **verbatim**, so
+`safe_label(token)` prints the token. It sanitizes a `kid` or an `alg` - names that are not in
+the credential set - and stays legal for those.
+
 **The cross-version trap this file had to close (D-099).** An f-string tokenizes differently
 across the supported matrix: on 3.10/3.11 the whole literal is one STRING token and its
 interior is invisible to a token scanner, while on 3.12+ it arrives as FSTRING_START /
@@ -217,12 +226,18 @@ a substring rule could not tell them apart. `key` is deliberately absent: in thi
 key is a published *public* key, and banning the word would refuse the safe thing.
 """
 
-SANITIZERS = frozenset({"fingerprint", "safe_label"})
-"""`reason=f"{fingerprint(token)}"` is the sanctioned form, so a sanitized subtree is skipped.
+FINGERPRINT = "fingerprint"
+REASONS_MODULE = "reasons"
+"""The single sanctioned sanitizer for *credential* material, and the module it must come from.
 
-`len` is deliberately not here. `f"{len(token)}"` is safe, and the ban still fires on it - the
-fix is to bind `length = len(token)` before the reason, which is what `src/` already does and
-what makes a reason reviewable line by line.
+`safe_label` is deliberately **not** an exemption. It renders a value that already matches
+`[A-Za-z0-9_.:+-]{1,64}` **verbatim** - which is most short credentials - so `safe_label(token)`
+prints the token. It sanitizes a `kid` or an `alg`, names that are not in the credential set at
+all, and it stays legal for those.
+
+`len` is not an exemption either. `f"{len(token)}"` is safe and is still refused, because the
+fix is to bind `length = len(token)` before the reason - which is what `src/` already does, and
+what keeps a reason reviewable line by line.
 """
 
 WORD_BOUNDARY = re.compile(r"_+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
@@ -237,57 +252,50 @@ def names_a_credential(identifier: str) -> bool:
     return bool(identifier_words(identifier) & CREDENTIAL_WORDS)
 
 
-def _sanitized(node: ast.expr) -> bool:
-    if not isinstance(node, ast.Call):
-        return False
-    func = node.func
-    if isinstance(func, ast.Name):
-        return func.id in SANITIZERS
-    return isinstance(func, ast.Attribute) and func.attr in SANITIZERS
+def fingerprint_bindings(tree: ast.Module) -> frozenset[str]:
+    """The names in this module that are *verifiably* `reasons.fingerprint`.
 
-
-def bare_credentials(node: ast.AST) -> Iterator[str]:
-    """Credential-shaped identifiers reachable without passing through a sanitizer.
-
-    A manual descent rather than `ast.walk`, because the whole point is to *stop* at a
-    sanitizer call and not read the credential it was handed.
+    The exemption is on the binding, not on the spelling. Matching the bare name `fingerprint`
+    would exempt a local helper, a shadow, or an import of something else entirely that happens
+    to be called that - which is an exemption an attacker of the review process writes for free.
     """
-    if isinstance(node, ast.expr) and _sanitized(node):
+    return frozenset(
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        if (node.module or "").split(".")[-1] == REASONS_MODULE
+        for alias in node.names
+        if alias.name == FINGERPRINT
+    )
+
+
+def credentials_in(node: ast.AST, exempt: frozenset[str]) -> Iterator[str]:
+    """Every credential-named identifier reachable without passing through `fingerprint`.
+
+    A manual descent rather than `ast.walk`, because the whole point is to *stop* at a verified
+    fingerprint call and not read the credential it was handed. Everything else is descended
+    into, whatever its shape - which is what makes the rule closed-form rather than a list of
+    the constructs somebody thought of.
+    """
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in exempt:
         return
     if isinstance(node, ast.Name) and names_a_credential(node.id):
         yield node.id
     if isinstance(node, ast.Attribute) and names_a_credential(node.attr):
         yield node.attr
     for child in ast.iter_child_nodes(node):
-        yield from bare_credentials(child)
-
-
-def _built_from_expressions(value: ast.expr) -> ast.expr | None:
-    """The `reason=` shapes that can carry a value, or `None` for the ones that cannot.
-
-    A plain call - `reason=_ambiguity(names)` - is not one of them: what a helper puts in a
-    reason is the helper's contract, and flagging it would flag every sanctioned form too.
-    """
-    if isinstance(value, (ast.JoinedStr, ast.Name, ast.Attribute)):
-        return value
-    if isinstance(value, ast.BinOp) and isinstance(value.op, (ast.Mod, ast.Add)):
-        return value
-    if isinstance(value, ast.Call):
-        func = value.func
-        if isinstance(func, ast.Attribute) and func.attr == "format":
-            return value
-    return None
+        yield from credentials_in(child, exempt)
 
 
 def reason_interpolations(tree: ast.Module) -> Iterator[int]:
+    exempt = fingerprint_bindings(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         for keyword in node.keywords:
             if keyword.arg != "reason":
                 continue
-            target = _built_from_expressions(keyword.value)
-            if target is not None and next(bare_credentials(target), None) is not None:
+            if next(credentials_in(keyword.value, exempt), None) is not None:
                 yield keyword.value.lineno
 
 
@@ -298,13 +306,19 @@ AST_RULES: tuple[AstRule, ...] = (
         find=reason_interpolations,
         probe='raise InvalidCredential(reason=f"rejected {token}")\n',
         legal=(
-            'raise InvalidCredential(reason=f"rejected {fingerprint(token)}")\n',
-            'raise InvalidCredential(reason=f"alg={safe_label(alg)} is not allowed {marker}")\n',
-            'raise InvalidCredential(reason=f"token rejected [{failure}] {marker}")\n',
-            'raise InvalidCredential(reason=f"token is {length} bytes, over the cap {marker}")\n',
+            'from .reasons import fingerprint\nraise E(reason=f"rejected {fingerprint(token)}")\n',
+            "from .reasons import fingerprint as fp\nraise E(reason=fp(token))\n",
+            (
+                "from fastapi_better_auth._internal.reasons import fingerprint\n"
+                "raise E(reason=fingerprint(token))\n"
+            ),
+            'from .reasons import safe_label\nraise E(reason=f"alg={safe_label(alg)} bad {marker}")\n',
+            'raise E(reason=f"token rejected [{failure}] {marker}")\n',
+            'raise E(reason=f"token is {length} bytes, over the cap {marker}")\n',
             "raise AmbiguousCredentials(reason=_ambiguity(names))\n",
             "raise MissingCredential(reason=self._nothing)\n",
-            'raise InvalidCredential(reason="the credential is not a token")\n',
+            'raise E(reason="the credential is not a token, and no secret is named here")\n',
+            'raise E(reason=f"no published key for kid={safe_label(kid)} {marker}")\n',
         ),
     ),
 )
@@ -518,35 +532,81 @@ def test_an_identifier_is_matched_by_word_and_never_by_substring(
     assert names_a_credential(identifier) is expected
 
 
-@pytest.mark.parametrize(
-    "probe",
-    [
-        'raise InvalidCredential(reason=f"rejected {token}")\n',
-        'raise InvalidCredential(reason=f"rejected {raw_token}")\n',
-        'raise InvalidCredential(reason=f"rejected {self._secret}")\n',
-        'raise InvalidCredential(reason="rejected {}".format(session_token))\n',
-        'raise InvalidCredential(reason="rejected %s" % (credential,))\n',
-        'raise InvalidCredential(reason="rejected " + signature)\n',
-        "raise InvalidCredential(reason=token)\n",
-        'raise InvalidCredential(reason=f"{fingerprint(token)} then {token}")\n',
-    ],
-    ids=[
-        "f-string",
-        "compound-name",
-        "attribute",
-        "format-method",
-        "percent",
-        "concat",
-        "bare-name",
-        "sanitized-then-not",
-    ],
+IMPORT = "from .reasons import fingerprint, safe_label\n"
+
+CAUGHT: tuple[tuple[str, str], ...] = (
+    ("f-string", 'raise E(reason=f"rejected {token}")\n'),
+    ("compound-name", 'raise E(reason=f"rejected {raw_token}")\n'),
+    ("attribute", 'raise E(reason=f"rejected {self._secret}")\n'),
+    ("format-method", 'raise E(reason="rejected {}".format(session_token))\n'),
+    ("percent", 'raise E(reason="rejected %s" % (credential,))\n'),
+    ("concat", 'raise E(reason="rejected " + signature)\n'),
+    ("bare-name", "raise E(reason=token)\n"),
+    ("sanitized-then-not", IMPORT + 'raise E(reason=f"{fingerprint(token)} then {token}")\n'),
+    # B5: every one of these was a confirmed bypass of the shape-enumerated rule.
+    ("safe-label-launders", IMPORT + "raise E(reason=safe_label(token))\n"),
+    ("subscript", "raise E(reason=token[:8])\n"),
+    ("boolop", "raise E(reason=token or fallback)\n"),
+    ("boolop-after-sanitizer", IMPORT + "raise E(reason=fingerprint(token) or token)\n"),
+    ("ternary", IMPORT + "raise E(reason=fingerprint(token) if ok else token)\n"),
+    ("format-map", 'raise E(reason="{t}".format_map({"t": token}))\n'),
+    ("str-wrap", "raise E(reason=str(token))\n"),
+    ("method-wrap", "raise E(reason=token.upper())\n"),
+    ("unimported-fingerprint", "raise E(reason=fingerprint(token))\n"),
+    (
+        "fingerprint-from-elsewhere",
+        "from .util import fingerprint\nraise E(reason=fingerprint(token))\n",
+    ),
+    ("joined-list", 'raise E(reason=", ".join([marker, token]))\n'),
+    ("keyword-arg", "raise E(reason=render(value=token))\n"),
+    ("nested-fstring", "raise E(reason=f\"{f'{token}'}\")\n"),
 )
-def test_every_interpolation_shape_is_caught(probe: str) -> None:
-    """One shape left out is the shape the next leak uses. The last case matters most: a
-    sanitized subtree is skipped, and that must not make the rest of the reason invisible."""
+
+
+@pytest.mark.parametrize("probe", [case[1] for case in CAUGHT], ids=[c[0] for c in CAUGHT])
+def test_every_way_of_getting_a_credential_into_a_reason_is_caught(probe: str) -> None:
+    """B5. The rule is closed-form, not a list of shapes: a credential-named identifier
+    *anywhere* in the reason expression fires unless it is inside a verified `fingerprint`
+    call. Enumerating shapes is what left `token[:8]`, `token or fp` and `str(token)` legal.
+
+    `safe_label` is here rather than in the legal list on purpose: it renders an
+    identifier-shaped value **verbatim**, so `safe_label(token)` prints the credential. It
+    sanitizes labels a client chose; it does not sanitize credentials.
+    """
     fired = {v.rule.id for v in scan(probe, pathlib.Path("<probe>"))}
 
     assert "credential-in-reason" in fired
+
+
+def test_the_exemption_is_the_binding_and_not_the_word_fingerprint() -> None:
+    """The same source fires or does not fire depending only on where `fingerprint` came from.
+
+    Matching the bare name would exempt a local helper, a shadow, or an unrelated import - an
+    exemption anyone could write for themselves without a reviewer noticing.
+    """
+    body = "raise E(reason=fingerprint(token))\n"
+
+    assert fingerprint_bindings(ast.parse("from .reasons import fingerprint\n")) == {"fingerprint"}
+    assert fingerprint_bindings(ast.parse("from .util import fingerprint\n")) == frozenset()
+    assert "credential-in-reason" not in {
+        v.rule.id for v in scan("from .reasons import fingerprint\n" + body, pathlib.Path("<p>"))
+    }
+    assert "credential-in-reason" in {
+        v.rule.id for v in scan("def fingerprint(x):\n    return x\n" + body, pathlib.Path("<p>"))
+    }
+
+
+def test_aliasing_the_value_is_out_of_scope_and_stays_that_way() -> None:
+    """The limit, pinned rather than implied. The ban is on credential-*named* identifiers, so
+    `marker = token` followed by `reason=f"{marker}"` is invisible to it and always will be -
+    tracking a value through an assignment is dataflow analysis, not a lint guard.
+
+    What backs the gap up is the frame-locals and reason-hygiene suites, which assert on what
+    the reason actually *contains* at runtime rather than on how it was spelled.
+    """
+    laundered = 'marker = token\nraise E(reason=f"rejected {marker}")\n'
+
+    assert "credential-in-reason" not in {v.rule.id for v in scan(laundered, pathlib.Path("<p>"))}
 
 
 def test_src_is_free_of_banned_constructs() -> None:
