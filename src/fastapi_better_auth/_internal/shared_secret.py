@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hmac
-from collections.abc import Callable
+from typing import Any, NoReturn
 
 from .errors import ConfigurationError
 from .reasons import fingerprint
@@ -47,9 +47,11 @@ class SharedSecret:
     becoming a 500 on the first request that carries a cookie. Refused: anything that is not
     a `str`; an empty or whitespace-only value; a value with leading or trailing whitespace
     (a secret read from a file keeps its newline, and an HMAC over a *trimmed* copy would
-    silently disagree with upstream's over the untrimmed one); a known placeholder, including
-    better-auth's own default secret; a value shorter than 32 characters; and a value that is
-    one short unit repeated, whose strength is only that unit's.
+    silently disagree with upstream's over the untrimmed one); a value with no UTF-8 encoding,
+    which `os.environ` produces on POSIX from an undecodable byte and which could never match
+    the bytes upstream signs with; a known placeholder, including better-auth's own default
+    secret; a value shorter than 32 characters; and a value that is one short unit repeated,
+    whose strength is only that unit's.
 
     Upstream *warns* below 32 characters and refuses its own default only in production. This
     refuses both, always: a secret this library cannot vouch for is one it will not carry.
@@ -57,8 +59,10 @@ class SharedSecret:
     **It redacts everywhere else.** `repr()`, `str()`, `format()` and `%s` all render
     `SharedSecret(tok_fp=<8 hex>)` - enough for an operator to tell two secrets apart in a
     boot log, and useless to anyone else. The value has exactly one door, `get_secret_value()`,
-    so every use of it is visible in review. Instances are immutable, carry no `__dict__` for
-    a reporter to serialize, and compare in constant time.
+    so every use of it is visible in review; **pickling is refused** rather than allowed to be
+    a second, ungreppable one, while `copy` and `deepcopy` hand back the same instance so a
+    config object holding one still copies. Instances are immutable, carry no `__dict__` for a
+    reporter to serialize, and compare in constant time without ever raising.
 
     Args:
         value: The secret, exactly as the Better Auth server has it.
@@ -123,13 +127,22 @@ class SharedSecret:
     def __delattr__(self, name: str) -> None:
         raise AttributeError(f"{type(self).__name__} is immutable; construct a new one instead")
 
-    def __reduce__(self) -> tuple[Callable[[str], SharedSecret], tuple[str]]:
-        """Rebuild through the constructor, so an unpickled secret is a validated one."""
-        return (_rebuild, (self._value,))
+    def __reduce__(self) -> NoReturn:
+        """Refuse to pickle. A pickle would carry the value in plain text, which is a second
+        door - and one nobody greps for, unlike `get_secret_value()`."""
+        raise TypeError(
+            f"{type(self).__name__} cannot be pickled: the byte stream would carry the secret"
+            " in plain text through multiprocessing arguments, a pickle-backed cache or a task"
+            " queue payload. Send the *name* of the environment variable across the boundary"
+            f" and build a {type(self).__name__} on the far side."
+        )
 
+    def __copy__(self) -> SharedSecret:
+        """An immutable value object is its own copy - and no second live copy is made."""
+        return self
 
-def _rebuild(value: str) -> SharedSecret:
-    return SharedSecret(value)
+    def __deepcopy__(self, memo: dict[int, Any]) -> SharedSecret:
+        return self
 
 
 def _accepted(value: object) -> str:
@@ -160,6 +173,13 @@ def _refusal(value: str) -> str | None:
             " would compute different HMACs over the same request and every session would"
             " fail to verify with nothing to see."
         )
+    if not _encodable(value):
+        return (
+            "cannot be encoded as UTF-8, so it has no bytes to HMAC with and could never match"
+            " what the Node side computes. A lone surrogate is what an undecodable byte in the"
+            " environment looks like by the time os.environ hands it over; read the secret from"
+            " a source whose encoding you control."
+        )
     if value.casefold() in PLACEHOLDER_SECRETS:
         return (
             "is a known placeholder secret, so anyone can forge a session for this deployment."
@@ -178,6 +198,20 @@ def _refusal(value: str) -> str | None:
             " repetition."
         )
     return None
+
+
+def _encodable(value: str) -> bool:
+    """Whether the value has UTF-8 bytes at all, answered without ever holding the error.
+
+    `UnicodeEncodeError.object` is the *whole* value, so the exception is never bound and never
+    escapes: it is swallowed here, in a frame that returns rather than raises, which is what
+    keeps it off the refusal's `__cause__` and `__context__` (D-102).
+    """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _repeating_unit(value: str) -> str:

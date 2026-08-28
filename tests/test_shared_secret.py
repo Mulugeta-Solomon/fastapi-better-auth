@@ -15,6 +15,7 @@ D-018/D-094 channel an error reporter reads.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import hmac
 import pickle
@@ -36,6 +37,18 @@ from fastapi_better_auth._internal.shared_secret import (
 LEAK_MARKER = "leak-marker-must-never-be-rendered"
 GOOD = "Zt7Qv1oXbK4mPr9wCyHnLdEuAsJf2Ng6"
 OTHER = "Ku3Bx8sVaW5tQe0rYiPmLdNcZgHj7Of4"
+PASSPHRASE = "pässwörd-är-inte-ett-lösenord-här-nu"
+
+SURROGATE_MARKER = "surrogate-leak-marker-abcdefgh"
+SURROGATE = f"{SURROGATE_MARKER}\udcff\udcfe"
+"""32 characters, so the length floor is not what refuses it.
+
+`os.environ` hands back `surrogateescape`'d text on POSIX, so an undecodable byte in the
+environment arrives as a lone surrogate rather than as an error - which is how a value with
+no UTF-8 encoding at all reaches the constructor the docstring's own example uses.
+"""
+
+ACCEPTED: tuple[str, ...] = (GOOD, OTHER, PASSPHRASE, f"abab{GOOD}", GOOD[:MIN_SECRET_LENGTH])
 
 
 def _library_frames(error: BaseException) -> list[Any]:
@@ -49,16 +62,37 @@ def _library_frames(error: BaseException) -> list[Any]:
     return frames
 
 
-REFUSED: tuple[tuple[str, object, str], ...] = (
-    ("not-a-string", LEAK_MARKER.encode(), "must be a str"),
-    ("empty", "", "is empty"),
-    ("whitespace-only", "   \t\n ", "is empty"),
-    ("leading-whitespace", f"  {GOOD}", "leading or trailing whitespace"),
-    ("trailing-newline", f"{GOOD}\n", "leading or trailing whitespace"),
-    ("placeholder", BETTER_AUTH_DEFAULT_SECRET, "known placeholder"),
-    ("too-short", LEAK_MARKER[:20], "at least"),
-    ("repeated-unit", "changeme" * 4, "repeats"),
+def _chained(error: BaseException) -> list[BaseException]:
+    """Every exception a reporter would follow from this one: `__cause__` and `__context__`."""
+    seen: list[BaseException] = []
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.append(current)
+        pending.extend(linked for linked in (current.__cause__, current.__context__) if linked)
+    return seen
+
+
+REFUSED: tuple[tuple[str, object, str, str], ...] = (
+    ("not-a-string", LEAK_MARKER.encode(), "must be a str", LEAK_MARKER),
+    ("empty", "", "is empty", ""),
+    ("whitespace-only", "   \t\n ", "is empty", ""),
+    ("leading-whitespace", f"  {GOOD}", "leading or trailing whitespace", GOOD),
+    ("trailing-newline", f"{GOOD}\n", "leading or trailing whitespace", GOOD),
+    ("non-utf8", SURROGATE, "UTF-8", SURROGATE_MARKER),
+    ("placeholder", BETTER_AUTH_DEFAULT_SECRET, "known placeholder", BETTER_AUTH_DEFAULT_SECRET),
+    ("too-short", LEAK_MARKER[:20], "at least", LEAK_MARKER[:20]),
+    ("repeated-unit", "changeme" * 4, "repeats", "changeme" * 4),
 )
+"""Each case carries the needle it must not leak, separately from the value.
+
+The needle is not always the value: `repr()` escapes a lone surrogate, so asserting the raw
+surrogate string is absent from a rendered frame would pass whether or not it was there. The
+ASCII prefix is what a reporter would actually print.
+"""
+
 REFUSED_IDS = tuple(case[0] for case in REFUSED)
 
 
@@ -80,8 +114,8 @@ def test_an_unusable_secret_is_refused_at_construction(value: object, expected: 
     assert expected in str(caught.value)
 
 
-@pytest.mark.parametrize("value", [c[1] for c in REFUSED], ids=REFUSED_IDS)
-def test_a_refusal_names_the_secret_only_by_fingerprint(value: object) -> None:
+@pytest.mark.parametrize(("value", "needle"), [(c[1], c[3]) for c in REFUSED], ids=REFUSED_IDS)
+def test_a_refusal_names_the_secret_only_by_fingerprint(value: object, needle: str) -> None:
     """The message reaches a boot log. It may say *which* secret and never *what* it is."""
     with pytest.raises(ConfigurationError) as caught:
         SharedSecret(value)  # pyright: ignore[reportArgumentType]
@@ -89,12 +123,12 @@ def test_a_refusal_names_the_secret_only_by_fingerprint(value: object) -> None:
     rendered = str(caught.value)
     assert LEAK_MARKER not in rendered
     assert GOOD not in rendered
-    if isinstance(value, str) and value:
-        assert value not in rendered
+    if needle:
+        assert needle not in rendered
 
 
-@pytest.mark.parametrize("value", [c[1] for c in REFUSED], ids=REFUSED_IDS)
-def test_no_refused_secret_survives_in_a_library_frame(value: object) -> None:
+@pytest.mark.parametrize(("value", "needle"), [(c[1], c[3]) for c in REFUSED], ids=REFUSED_IDS)
+def test_no_refused_secret_survives_in_a_library_frame(value: object, needle: str) -> None:
     """A reporter captures frame locals, so every raise path inside the type scrubs its own
     (D-094). The caller's frame still holds the value, and never was ours to clear."""
     with pytest.raises(ConfigurationError) as caught:
@@ -105,11 +139,29 @@ def test_no_refused_secret_survives_in_a_library_frame(value: object) -> None:
     assert rendered, "no library frame was captured; retune this probe"
     assert LEAK_MARKER not in rendered
     assert GOOD not in rendered
-    # Each case must assert its OWN value, not two fixed markers: five of the eight shapes
-    # carry neither, and would pass this test with the scrub deleted.
-    if isinstance(value, str) and len(value) >= 8:
-        assert value not in rendered
-        assert value.strip() not in rendered
+    # Each case must assert its OWN needle, not two fixed markers: most of the shapes carry
+    # neither, and would pass this test with the scrub deleted.
+    if needle:
+        assert needle not in rendered
+        assert needle.strip() not in rendered
+
+
+@pytest.mark.parametrize(("value", "needle"), [(c[1], c[3]) for c in REFUSED], ids=REFUSED_IDS)
+def test_no_refused_secret_survives_on_a_chained_exception(value: object, needle: str) -> None:
+    """The second channel a reporter follows. A refusal built by catching something whose own
+    attributes hold the value - `UnicodeEncodeError.object` is the whole secret - would hand it
+    straight back through `__cause__` or `__context__` even with every frame scrubbed."""
+    with pytest.raises(ConfigurationError) as caught:
+        SharedSecret(value)  # pyright: ignore[reportArgumentType]
+
+    linked = _chained(caught.value)
+    rendered = " ".join(f"{type(e).__name__} {e!r} {vars(e)!r}" for e in linked)
+
+    assert linked[0] is caught.value
+    assert LEAK_MARKER not in rendered
+    assert GOOD not in rendered
+    if needle:
+        assert needle not in rendered
 
 
 def test_a_refusal_is_a_configuration_error_and_not_a_request_time_answer() -> None:
@@ -280,9 +332,53 @@ def test_equality_goes_through_a_constant_time_comparison(monkeypatch: pytest.Mo
 def test_a_non_ascii_secret_still_compares() -> None:
     """The bug the bytes encoding exists for: `compare_digest` raises `TypeError` on two
     non-ASCII `str`s, so a passphrase secret would crash the comparison rather than fail it."""
-    value = "pässwörd-är-inte-ett-lösenord-här-nu"
+    assert SharedSecret(PASSPHRASE) == SharedSecret(PASSPHRASE)
 
+
+def test_a_value_with_no_utf8_encoding_is_refused_at_construction() -> None:
+    """B1. A lone surrogate has no UTF-8 bytes, so it could never equal the bytes the Node
+    side HMACs with - it could not authenticate anything, whatever else is true of it.
+
+    Left accepted, it detonated on the *comparison* path instead: `__eq__` encodes strictly,
+    so `==` raised `UnicodeEncodeError` whose `.object` is the complete raw secret. That is
+    both the 500 this type's docstring promises cannot happen and a D-094 leak on the primary
+    path. Refusing at the root is what makes the comparison total.
+    """
+    assert len(SURROGATE) >= MIN_SECRET_LENGTH, "retune: the length floor must not be the refuser"
+
+    with pytest.raises(ConfigurationError) as caught:
+        SharedSecret(SURROGATE)
+
+    assert "UTF-8" in str(caught.value)
+
+
+@pytest.mark.parametrize("value", ACCEPTED)
+def test_every_accepted_secret_has_utf8_bytes(value: str) -> None:
+    """The property behind B1, stated as a property: if construction succeeded, the value has
+    bytes. Everything downstream - `__eq__`, and Phase 2's HMAC - depends on exactly this."""
+    assert SharedSecret(value).get_secret_value().encode("utf-8")
+
+
+@pytest.mark.parametrize("value", ACCEPTED)
+def test_equality_can_no_longer_raise_for_a_constructible_secret(value: str) -> None:
+    """B1 from the other end: whatever survives the gate compares without raising."""
     assert SharedSecret(value) == SharedSecret(value)
+    assert SharedSecret(value) != SharedSecret(GOOD if value != GOOD else OTHER)
+
+
+def test_the_utf8_refusal_leaves_no_live_encode_error_behind() -> None:
+    """The caught `UnicodeEncodeError` carries the raw value on `.object`, so it must be dead
+    by the time the refusal is raised - not on a frame, not on `__cause__`, not on
+    `__context__`. Asserted directly rather than trusted to `except`'s cleanup."""
+    with pytest.raises(ConfigurationError) as caught:
+        SharedSecret(SURROGATE)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    frames = " ".join(repr(frame.f_locals) for frame in _library_frames(caught.value))
+    assert not any(isinstance(e, UnicodeEncodeError) for e in _chained(caught.value))
+    assert "UnicodeEncodeError" not in frames
+    assert SURROGATE_MARKER not in frames
 
 
 def test_the_hash_keys_on_the_fingerprint_and_not_on_the_value() -> None:
@@ -325,9 +421,43 @@ def test_a_secret_carries_no_instance_dict_to_walk() -> None:
     assert not hasattr(SharedSecret(GOOD), "__dict__")
 
 
-def test_a_secret_survives_a_round_trip_through_copy() -> None:
-    """`deepcopy` of a config object holding one must still hold a usable secret."""
-    restored: SharedSecret = pickle.loads(pickle.dumps(SharedSecret(GOOD)))
+def test_a_secret_refuses_to_be_pickled() -> None:
+    """B2. Pickling wrote the raw value into the byte stream - a second door, and one nobody
+    greps for: multiprocessing arguments, a pickle-backed cache, a Celery or joblib payload.
+    "Exactly one door" has to be true, so this one is closed rather than narrowed."""
+    with pytest.raises(TypeError) as caught:
+        pickle.dumps(SharedSecret(GOOD))
 
-    assert restored == SharedSecret(GOOD)
-    assert restored.get_secret_value() == GOOD
+    assert GOOD not in str(caught.value)
+    assert "environment" in str(caught.value), "the refusal must say what to do instead"
+
+
+def test_the_pickle_refusal_is_what_keeps_the_value_out_of_the_stream() -> None:
+    """Prove the instrument rather than the exception: no byte stream is produced at all."""
+    secret = SharedSecret(GOOD)
+
+    for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+        with pytest.raises(TypeError):
+            pickle.dumps(secret, protocol)
+
+
+@pytest.mark.parametrize("clone", [copy.copy, copy.deepcopy], ids=["copy", "deepcopy"])
+def test_copying_a_secret_hands_back_the_very_same_instance(
+    clone: Callable[[SharedSecret], SharedSecret],
+) -> None:
+    """`copy` and `deepcopy` reach for `__reduce__` unless told otherwise, so closing pickle
+    would have broken every config object holding one. An immutable value object is its own
+    copy - which also means no second live copy of the secret exists to be found."""
+    secret = SharedSecret(GOOD)
+
+    assert clone(secret) is secret
+
+
+def test_deepcopying_a_config_that_holds_a_secret_still_works() -> None:
+    """The realistic shape, not the bare type: a settings object someone deep-copies."""
+    config = {"auth": {"secret": SharedSecret(GOOD), "issuer": "https://auth.example.com"}}
+
+    restored = copy.deepcopy(config)
+
+    assert restored["auth"]["secret"] is config["auth"]["secret"]
+    assert restored is not config
