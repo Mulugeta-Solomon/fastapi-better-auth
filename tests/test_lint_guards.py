@@ -302,7 +302,7 @@ def reason_interpolations(tree: ast.Module) -> Iterator[int]:
 AST_RULES: tuple[AstRule, ...] = (
     AstRule(
         id="credential-in-reason",
-        reason="a credential-named value interpolated into reason=: error reporters serialize exc.__dict__ and capture locals — pass it through fingerprint() or safe_label()",
+        reason="a credential-named identifier reaches reason=: error reporters serialize exc.__dict__ and capture locals — pass it through fingerprint() imported from .reasons, which is the ONLY exemption (safe_label renders identifier-shaped values verbatim, so it launders a credential rather than sanitizing one)",
         find=reason_interpolations,
         probe='raise InvalidCredential(reason=f"rejected {token}")\n',
         legal=(
