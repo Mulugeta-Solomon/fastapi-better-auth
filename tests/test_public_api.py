@@ -28,6 +28,7 @@ EXPECTED = (
     "SessionError",
     "SessionExpired",
     "SessionRevoked",
+    "SharedSecret",
     "Transport",
     "TransportResponse",
     "UntrustedResponse",
