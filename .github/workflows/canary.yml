@@ -15,8 +15,8 @@ permissions:
 
 jobs:
   upstream-check:
-    # Only the daily watch is gated on upstream activity. The weekly cron and manual
-    # dispatch skip this job, so a red or slow npm registry never suppresses them.
+    # Only the daily watch narrows the sweep. The weekly cron and manual dispatch skip this
+    # job, and a failure here widens the sweep rather than cancelling it - see the gates below.
     name: upstream release watch
     if: github.event_name == 'schedule' && github.event.schedule == '37 18 * * *'
     runs-on: ubuntu-latest
@@ -28,13 +28,26 @@ jobs:
       - name: Did better-auth publish a release in the last 26 hours?
         id: watch
         run: python3 .github/scripts/upstream_release_watch.py --window-hours 26
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="canary: upstream release watch cannot read the npm registry"
+          BODY="The daily watch could not decide whether better-auth published a release. Today's sweep ran anyway - the gates fail open - so this is not a missed canary, but the watch is no longer narrowing anything and every daily tick will now run the full matrix until it is fixed. Run: ${RUN_URL}"
+          gh label create canary --color D93F0B --description "automated conformance canary" 2>/dev/null || true
+          EXISTING=$(gh issue list --state open --label canary --limit 100 --json title --jq ".[].title" | grep -Fx "$TITLE" || true)
+          if [ -z "$EXISTING" ]; then
+            gh issue create --title "$TITLE" --label canary --body "$BODY"
+          fi
 
   conformance:
     name: better-auth@${{ matrix.version }}
     needs: upstream-check
     if: >-
       ${{ !cancelled()
-      && (needs.upstream-check.result == 'skipped'
+      && (needs.upstream-check.result != 'success'
       || needs.upstream-check.outputs.should-run == 'true') }}
     runs-on: ubuntu-latest
     strategy:
@@ -54,7 +67,7 @@ jobs:
         if: failure()
         run: docker compose -f harness/docker-compose.yml logs
       - name: Open issue on failure
-        if: failure()
+        if: failure() || cancelled()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -72,7 +85,7 @@ jobs:
     needs: upstream-check
     if: >-
       ${{ !cancelled()
-      && (needs.upstream-check.result == 'skipped'
+      && (needs.upstream-check.result != 'success'
       || needs.upstream-check.outputs.should-run == 'true') }}
     runs-on: ubuntu-latest
     strategy:
@@ -104,7 +117,7 @@ jobs:
         if: failure()
         run: docker compose -f harness/docker-compose.yml logs
       - name: Open issue on failure
-        if: failure()
+        if: failure() || cancelled()
         env:
           GH_TOKEN: ${{ github.token }}
           WHEEL_VERSION: ${{ steps.guard.outputs.version || 'unknown' }}
