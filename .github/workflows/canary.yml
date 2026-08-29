@@ -104,6 +104,7 @@ jobs:
         run: |
           uv venv --python 3.13 "$WHEEL_VENV"
           uv pip install --python "$WHEEL_VENV/bin/python" --refresh \
+            --index-url https://pypi.org/simple/ \
             "fastapi-better-auth-bridge[httpx,httpx2]" "pytest>=8" "trio>=0.27"
       - name: Instrument liveness — the library under test must be the installed wheel
         id: guard

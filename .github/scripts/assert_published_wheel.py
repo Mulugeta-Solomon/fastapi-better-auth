@@ -84,11 +84,15 @@ def check(dist_name: str, module_name: str) -> list[str]:
             f"path, a VCS or a direct URL, not from the package index"
         )
 
-    installed_at = pathlib.Path(str(dist.locate_file(module_name))).resolve()
-    if installed_at != module_file.parent:
+    # A package's __file__ is its __init__.py; a single-file module IS the file.
+    is_package = module_file.name == "__init__.py"
+    entry = module_name if is_package else f"{module_name}.py"
+    imported_at = module_file.parent if is_package else module_file
+    recorded_at = pathlib.Path(str(dist.locate_file(entry))).resolve()
+    if recorded_at != imported_at:
         problems.append(
-            f"{dist_name} {version} is recorded at {installed_at} but {module_name} imported "
-            f"from {module_file.parent}; two copies are on the path"
+            f"{dist_name} {version} records {entry} at {recorded_at} but {module_name} imported "
+            f"from {imported_at}; two copies are on the path"
         )
     return problems
 
