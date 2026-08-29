@@ -98,8 +98,25 @@ def _insert(table: str, row: Mapping[str, Any], columns: Sequence[tuple[str, str
     return f'INSERT INTO "{table}" ({quoted}) VALUES ({placeholders})'
 
 
+SQLITE_DATETIME = "%Y-%m-%d %H:%M:%S.%f"
+"""Exactly what SQLAlchemy's SQLite `DATETIME` writes, and the only thing its reader parses.
+
+Seeded as a string rather than as a `datetime`, because binding one through the DBAPI would go
+through `sqlite3`'s *default datetime adapter* - deprecated since Python 3.12, and this project
+turns warnings into errors, so the fixture would be red on every interpreter from 3.12 up. The
+value is normalized to UTC first: SQLite columns carry no offset, better-auth writes UTC into
+them, and that is the trap the store is being tested against.
+"""
+
+
+def _bound(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).strftime(SQLITE_DATETIME)
+    return value
+
+
 def _values(row: Mapping[str, Any], columns: Sequence[tuple[str, str]]) -> dict[str, Any]:
-    return {name: row.get(name) for name, _ in columns}
+    return {name: _bound(row.get(name)) for name, _ in columns}
 
 
 def _relaxed(
