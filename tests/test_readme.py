@@ -3,11 +3,12 @@
 Documentation drifts silently: a factory grows a keyword, a name moves, a route stops being
 refused — and the snippet that taught every reader how to use the library keeps rendering
 perfectly on PyPI while describing an API that no longer exists. This file removes the silence.
-Every ```python fence in the shipped documents is extracted, executed in a fresh namespace, and
-the applications those snippets build are driven over the wire: the protected route has to
-answer 401 to a forged credential, and the document has to publish the bearer scheme `/docs`
-needs before it can show an Authorize button. Executing a snippet proves it parses; asking it
-for a refusal proves it is the real API doing real enforcement.
+Every python fence in the shipped documents is extracted, executed in a fresh namespace, and the
+applications those snippets build are driven over the wire: the protected route has to answer 401
+to a forged credential, and the document has to publish the bearer scheme `/docs` needs before it
+can show an Authorize button. Executing a snippet proves it parses; asking it for a refusal proves
+it is the real API doing real enforcement. "Every" is enforced by a census wider than the
+extractor's own gate, so a fence spelled some other way fails loudly instead of vanishing.
 
 Nothing here touches the network, and that is asserted rather than assumed: every snippet
 refuses its credential on shape alone, before a key set is ever wanted, and `refuse_network`
@@ -17,6 +18,7 @@ records any fetch the shipped transport attempts anyway.
 from __future__ import annotations
 
 import pathlib
+import re
 from collections.abc import Mapping
 from typing import Any, NamedTuple
 
@@ -41,6 +43,18 @@ FORGED = ("not-a-jwt", "a.b.c")
 
 BASE_URL = "https://auth.example.com"
 BROKEN_SNIPPET = "```python\nfrom fastapi_better_auth import BetterAuht\n```\n"
+
+UNOPENED_SPELLINGS = ("```py", "~~~python", "```python3", "   ```python")
+"""Fence openers a reader calls python and `snippets` does not open. None may be silent."""
+
+FENCE_OPENER = re.compile(r"^[ \t]*(?:`{3,}|~{3,})[ \t]*py", re.IGNORECASE | re.MULTILINE)
+"""Deliberately looser than the extractor's gate: a backtick *or* tilde run, indented or not,
+whose info string starts with `py`. A closing fence carries no info string and never matches."""
+
+
+def python_fence_openers(text: str) -> int:
+    """Count every fence a reader would call a python block, however it is spelled."""
+    return len(FENCE_OPENER.findall(text))
 
 
 class Snippet(NamedTuple):
@@ -127,14 +141,34 @@ def refuse_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 def test_every_python_fence_in_the_documents_is_extracted() -> None:
-    """The count the extractor reports against the count the raw text carries.
+    """The census of what a reader calls a python block, against what the extractor opened.
 
     An extractor that quietly found nothing would make every other test in this file pass on an
     empty parameter list, which is the failure mode that looks exactly like success.
     """
     for path in DOCUMENTS:
-        assert len(snippets(path)) == path.read_text(encoding="utf-8").count(PYTHON_FENCE)
+        text = path.read_text(encoding="utf-8")
+        assert len(snippets(path)) == python_fence_openers(text), path.name
     assert len(ALL_SNIPPETS) >= 3
+
+
+@pytest.mark.parametrize("opener", UNOPENED_SPELLINGS)
+def test_a_python_fence_the_extractor_will_not_open_is_never_silent(
+    opener: str, tmp_path: pathlib.Path
+) -> None:
+    """The census has to be wider than the gate, or a variant spelling escapes both.
+
+    `snippets` opens one spelling on purpose — a exact ```` ```python ```` line — because an
+    extractor that guesses would start executing prose. The hazard is a fence a *reader* calls
+    python that the extractor never opens: it would be missed by the extraction and by the guard
+    above at once, with no signal anywhere. Counting openers more loosely than they are opened is
+    what turns that silence into a failure.
+    """
+    document = tmp_path / "VARIANT.md"
+    document.write_text(f"{opener}\nimport fastapi_better_auth\n```\n", encoding="utf-8")
+
+    assert python_fence_openers(document.read_text(encoding="utf-8")) == 1
+    assert snippets(document) == ()
 
 
 def test_the_extractor_catches_a_snippet_that_stopped_working(tmp_path: pathlib.Path) -> None:
