@@ -26,6 +26,14 @@ from ._internal.jwt_verifier import JwtVerifier
 from ._internal.models import Session, User, UserT
 from ._internal.parsing import parse_user
 from ._internal.shared_secret import SharedSecret
+from ._internal.stores import (
+    RedisSessionStore,
+    SessionStore,
+    SqlAlchemySessionStore,
+    StoredSession,
+    StoredUser,
+    SyncStoreAdapter,
+)
 from ._internal.transport import (
     ContentEncodingRejected,
     ResponseTooLarge,
@@ -50,12 +58,18 @@ __all__ = [
     "InvalidCredential",
     "JwtVerifier",
     "MissingCredential",
+    "RedisSessionStore",
     "ResponseTooLarge",
     "Session",
     "SessionError",
     "SessionExpired",
     "SessionRevoked",
+    "SessionStore",
     "SharedSecret",
+    "SqlAlchemySessionStore",
+    "StoredSession",
+    "StoredUser",
+    "SyncStoreAdapter",
     "Transport",
     "TransportResponse",
     "UntrustedResponse",
