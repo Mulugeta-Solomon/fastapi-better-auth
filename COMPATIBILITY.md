@@ -79,15 +79,17 @@ The floor-resolution lane is what found it.
 - **Mode B (JWT / JWKS)** — semver-style. Within a major version, configuration that verified a
   token keeps verifying it, and no release narrows what is accepted except to close a security
   hole, which is a patch release with an advisory.
-- **Mode A (cookie + shared session store)**, when it ships, reads Better Auth's *internal*
-  formats: the signed cookie's HMAC construction and the session store's own layout. It will be
-  pinned to the better-auth versions the conformance lane exercises, and an upstream change to
-  either may force a change here inside a minor release. Stated now rather than discovered later.
-  The stores are the first piece of it to land, and they read three internal shapes: the
-  `session` and `user` tables' column names, the secondary-storage key (the raw session token,
-  with no namespace), and the JSON that key holds (`{session, user}`). All three are asserted
-  against a running better-auth in the conformance lane, in both of its topologies.
-- **Mode C (remote get-session)** — after Mode A.
+- **Mode A (cookie + shared session store)** reads Better Auth's *internal* formats: the signed
+  cookie's HMAC construction and the session store's own layout. It is **tested against
+  better-auth 1.7.1** — the version the conformance lane pins — verified on **2026-08-29**, and an
+  upstream change to either the cookie signing or the store layout may force a change here inside a
+  minor release. That coupling is stated rather than hidden: the format-independent path is Mode C
+  (remote `get-session`), which asks the server instead of reading its internals and so rides out
+  such a change — it comes after Mode A and is not yet shipped. The stores read three internal
+  shapes, all asserted against a running better-auth in the conformance lane, in both of its
+  topologies: the `session` and `user` tables' column names, the secondary-storage key (the raw
+  session token, with no namespace), and the JSON that key holds (`{session, user}`).
+- **Mode C (remote get-session)** — after Mode A. Not yet shipped.
 
 Security fixes are released for the latest version only while this project is pre-1.0; see
 [SECURITY.md](SECURITY.md).

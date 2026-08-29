@@ -21,6 +21,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import Depends, FastAPI
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from fastapi_better_auth import (
@@ -28,7 +29,9 @@ from fastapi_better_auth import (
     CsrfDisabled,
     HttpxTransport,
     OriginCheck,
+    Session,
     SharedSecret,
+    User,
 )
 from fastapi_better_auth._internal.cookie_verifier import CookieVerifier
 from fastapi_better_auth._internal.jwt_verifier import JwtVerifier
@@ -261,3 +264,65 @@ class TestComposition:
         named = {name for requirement in required for name in requirement}
         assert named == {BEARER_SCHEME, COOKIE_SCHEME}
         assert docs.status_code == 200
+
+
+class TestCsrf:
+    """`OriginCheck` against a live cookie: a cross-site write is a 403, decided before the store.
+
+    The unit lane proves the rung in isolation; this proves it on the wire, with a cookie a real
+    Better Auth signed, driven through a real FastAPI `POST` route. The same-origin request is the
+    anti-vacuum control: it returns 200 only because the cookie, its signature and its stored session
+    are all genuinely valid, so the cross-site 403 is the CSRF rung refusing and nothing else - not a
+    broken cookie answering 401. CSRF runs before the signature and before the store is touched
+    (the pinned pipeline order), so this is store-agnostic and one topology is the whole proof.
+    """
+
+    ALLOWED = "https://app.example.com"
+    CROSS = "https://evil.example.com"
+
+    def csrf_app(self, auth: BetterAuth) -> FastAPI:
+        app = FastAPI()
+        required = auth.current_session()
+
+        async def write(session: Session[User] = Depends(required)) -> dict[str, Any]:
+            return {"id": session.user.id}
+
+        app.add_api_route("/write", write, methods=["POST"])
+        return app
+
+    async def post(self, app: FastAPI, origin: str | None, cookie: str) -> httpx.Response:
+        request_headers = dict(cookie_header(cookie))
+        if origin is not None:
+            request_headers["Origin"] = origin
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://bridge"
+        ) as client:
+            return await client.post("/write", headers=request_headers)
+
+    @pytest.mark.anyio
+    async def test_a_cross_site_write_is_403_a_same_site_write_is_200(
+        self, harness: str, secret: SharedSecret, engine: AsyncEngine
+    ) -> None:
+        cookie = sign_in(harness, SEED_EMAIL, SEED_PASSWORD)
+        auth = BetterAuth(
+            verifiers=[
+                CookieVerifier(
+                    secret=secret,
+                    store=SqlAlchemySessionStore(engine=engine),
+                    csrf=OriginCheck(allowed_origins=[self.ALLOWED]),
+                )
+            ]
+        )
+        app = self.csrf_app(auth)
+
+        same_site = await self.post(app, self.ALLOWED, cookie)
+        cross_site = await self.post(app, self.CROSS, cookie)
+        no_origin = await self.post(app, None, cookie)
+
+        assert same_site.status_code == 200, same_site.text
+        assert same_site.json()["id"]
+        assert cross_site.status_code == 403, cross_site.text
+        assert cross_site.json() == {"detail": "Forbidden"}
+        assert "www-authenticate" not in cross_site.headers
+        assert no_origin.status_code == 403, no_origin.text
+        sign_out(harness, cookie)
