@@ -11,13 +11,17 @@ The server this library bridges to. The conformance suite runs against a real Be
 | better-auth | Lane | When |
 |---|---|---|
 | 1.7.1 | conformance, gating | every pull request, and every push to `main` |
-| 1.6.30 | conformance, canary | weekly |
-| 1.7.1 | conformance, canary | weekly |
-| `latest` | conformance, canary | weekly |
+| 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes |
+| 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes |
+| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes |
 
 The gating lane pins `better-auth@1.7.1`, so no change lands without passing against it. The canary
-runs the same suite against the matrix above on a schedule and opens an issue in this repository
-automatically when a version fails.
+runs the same suite twice against the matrix above — once from the repository HEAD, and once
+against the wheel currently published on PyPI, with a guard that refuses to run unless the
+library under test really is that installed wheel. It fires weekly, and again on any day a watch
+of npm's registry sees a fresh better-auth release; if the watch itself cannot be answered, the
+sweep runs anyway rather than assuming upstream stood still. A failing version opens an issue in
+this repository automatically, named for the artifact that failed.
 
 Better Auth publishes no wire-format stability contract. Cookie signing, session-store layout and
 the JWT plugin's claims are internal details, and they have moved across minor releases. That is
