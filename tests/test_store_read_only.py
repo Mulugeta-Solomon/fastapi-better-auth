@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -81,11 +82,13 @@ CALLS = frozenset(
         "drop_all",
         "eval",
         "evalsha",
+        "exec_driver_sql",
         "execute_command",
         "expire",
         "flushall",
         "flushdb",
         "getdel",
+        "getex",
         "getset",
         "insert",
         "pexpire",
@@ -111,8 +114,25 @@ SQLAlchemy constructs - `set` and `update` as bare names are a builtin and a com
 banning those would be a rule people route around rather than obey.
 """
 
-NAMES = frozenset({"Delete", "Insert", "Update", "delete", "insert", "update"})
-"""Banned as a bare name: `insert(table)`, or an imported `sqlalchemy.update`."""
+NAMES = frozenset({"Delete", "Insert", "Update", "delete", "insert", "text", "update"})
+"""Banned as a bare name: `insert(table)`, an imported `sqlalchemy.update`, or `text("UPDATE ...")`.
+
+`text` is here because `connection.execute(text("UPDATE ..."))` is how a write sneaks past a guard
+that only knows Core constructs - and a `text(some_runtime_string)` carries a write the
+`DML_KEYWORDS` string scan below cannot see. The stores use SQLAlchemy Core exclusively and never
+`text()`; a legitimate local that happened to be called `text` was renamed out of `upstream.py`
+so this ban does not false-positive on it.
+"""
+
+DML_KEYWORDS = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|REPLACE|COMMIT|DROP|ALTER|GRANT)\b", re.IGNORECASE
+)
+"""A write spelled as raw SQL in a string literal - `exec_driver_sql("UPDATE ...")`, or a string
+handed to `text()`. Word-boundaried so `updatedAt` and `dropped` do not trip it, and run over
+string CONSTANTS only, with docstrings excluded: `sqlalchemy_store.py` documents the ban in prose
+("No INSERT, no UPDATE, no DELETE"), and a scan that tripped on the sentence stating the rule is
+the [[raw-guards-propped-by-comments]] trap. Every source of truth stays the code, not a comment.
+"""
 
 PROBES: tuple[Ban, ...] = (
     Ban("sqlalchemy-insert-call", "attribute", "await connection.execute(table.insert())\n"),
@@ -127,6 +147,10 @@ PROBES: tuple[Ban, ...] = (
     Ban("redis-expire", "attribute", "await client.expire(key, 60)\n"),
     Ban("redis-eval", "attribute", "await client.eval(script, 1, key)\n"),
     Ban("redis-pipeline", "attribute", "async with client.pipeline() as pipe:\n    pass\n"),
+    Ban("redis-getex", "attribute", "await client.getex(key)\n"),
+    Ban("sqlalchemy-exec-driver-sql", "attribute", "connection.exec_driver_sql('SELECT 1')\n"),
+    Ban("sqlalchemy-text-name", "name", "connection.execute(text('SELECT 1'))\n"),
+    Ban("raw-sql-dml-string", "constant", "run('DELETE FROM \"session\" WHERE token = 1')\n"),
 )
 
 LEGAL: tuple[tuple[str, str], ...] = (
@@ -138,15 +162,51 @@ LEGAL: tuple[tuple[str, str], ...] = (
     ("connect", "async with engine.connect() as connection:\n    pass\n"),
     ("get", "value = await client.get(key)\n"),
     ("inspect", "columns = inspect(connection).get_columns(name)\n"),
+    # A column name that CONTAINS a DML keyword but is not one - the word boundary must hold.
+    ("camelcase-columns", "cols = ('createdAt', 'updatedAt', 'banExpires', 'impersonatedBy')\n"),
+    ("dml-word-inside-a-word", "note = 'the row was dropped and the id updated'\n"),
+    # A docstring stating the ban must not be read as the ban being broken.
+    ("module-docstring-states-the-ban", '"""This module issues no INSERT, UPDATE or DELETE."""\n'),
+    (
+        "function-docstring-states-the-ban",
+        "def f():\n    '''No DROP, no TRUNCATE here.'''\n    return 1\n",
+    ),
 )
 
 
+def _docstring_nodes(tree: ast.AST) -> set[int]:
+    """The `id()` of every module/class/function docstring Constant, so the DML scan skips them.
+
+    The ban is stated in prose in `sqlalchemy_store.py`'s own docstring; a scan that tripped on
+    the sentence stating the rule would be the raw-guard-propped-by-a-comment trap.
+    """
+    ids: set[int] = set()
+    holders = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(node, holders) or not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            ids.add(id(first.value))
+    return ids
+
+
 def writes_in(tree: ast.AST) -> Iterator[str]:
+    docstrings = _docstring_nodes(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr in CALLS:
             yield node.attr
         if isinstance(node, ast.Name) and node.id in NAMES:
             yield node.id
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            match = DML_KEYWORDS.search(node.value)
+            if match is not None and id(node) not in docstrings:
+                yield match.group(0).upper()
 
 
 def store_sources() -> tuple[pathlib.Path, ...]:

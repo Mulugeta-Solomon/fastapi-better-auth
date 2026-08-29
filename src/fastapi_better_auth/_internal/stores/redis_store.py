@@ -9,6 +9,7 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
 from ..errors import ConfigurationError
+from ..reasons import safe_label
 from .diagnostics import unusable
 from .records import StoredSession, StoredUser
 from .upstream import as_flag, as_moment, as_text
@@ -74,6 +75,27 @@ def _import_redis() -> Any:
     return Redis
 
 
+def _built_client(url: object) -> Any:
+    """Build a client from `url`, refusing a bad one at construction rather than at first fetch.
+
+    The `Raises:` contract promises a `ConfigurationError` for every construction failure, and a
+    bare `url=7` would otherwise be an `AttributeError` from `from_url`. Neither the value nor
+    redis-py's own error is echoed: a redis URL can carry a password (`redis://user:pass@host`),
+    so the refusal names what to check and chains `from None` so the credential cannot ride out
+    on `__cause__`.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise ConfigurationError(
+            "url must be a non-empty redis URL string, like 'redis://host:6379/0'."
+        )
+    try:
+        return _import_redis().from_url(url)
+    except (ValueError, TypeError):
+        raise ConfigurationError(
+            "the url= given was rejected by redis-py; check its scheme, host and port"
+        ) from None
+
+
 class RedisSessionStore:
     """Better Auth's `secondaryStorage`, read directly - and treated as the only truth there is.
 
@@ -100,7 +122,9 @@ class RedisSessionStore:
     fallback above.
 
     **It never writes.** No `SET`, no `DEL`, no `EXPIRE` refreshed on read - the last would make
-    a revoked session outlive its revocation. `GET` is the only command this store knows.
+    a revoked session outlive its revocation. `GET` is the only command this store issues against
+    your keyspace (a client built from `url=` also does redis-py's own `HELLO`/`CLIENT SETINFO`
+    handshake on connect, which touches no key).
 
     **A value it cannot read is a miss, with a warning naming a fingerprint of the key.** Not
     JSON, not an object, no session, no user, no usable `expiresAt`, or a stored session naming a
@@ -108,6 +132,11 @@ class RedisSessionStore:
     compared in constant time and is the one that matters - honouring it would authenticate
     whoever wrote that key. A failure of Redis itself propagates untranslated, because a store
     cannot know what an unreachable cache means to the request that needed it.
+
+    The token is compared as UTF-8 bytes. A `str` carrying an unpaired surrogate cannot be
+    encoded and raises rather than returning a miss - but it is unreachable through the real entry
+    point (Starlette latin-1-decodes the cookie header, which cannot carry a surrogate), so a
+    surrogate here is direct API misuse, where a loud error is more use than a silent miss.
 
     Args:
         url: A Redis URL to build a client from. Needs the `[redis]` extra. Exactly one of this
@@ -145,7 +174,7 @@ class RedisSessionStore:
         # leave a connection pool nobody holds a reference to and nobody closes.
         self._prefix = _validated_prefix(key_prefix)
         self._max_bytes = _validated_cap(max_bytes)
-        built = None if client is not None else _import_redis().from_url(url)
+        built = None if client is not None else _built_client(url)
         # Only a client this store BUILT is ever closed; a borrowed pool is not ours to shut.
         self._built: Any | None = built
         self._client: _Client = cast("_Client", client if client is not None else built)
@@ -197,9 +226,14 @@ class RedisSessionStore:
 
     def _document(self, value: object, key: str) -> Mapping[str, Any] | None:
         if not isinstance(value, (bytes, bytearray, str)):
-            unusable(SESSION_KEY, f"redis answered a {type(value).__name__}", key)
+            # `safe_label` the type name (D2): it is the only interpolated part of any `unusable`
+            # reason, and a crafted `__name__` with a newline would forge a second log line.
+            unusable(SESSION_KEY, f"redis answered a {safe_label(type(value).__name__)}", key)
             return None
-        if len(value) > self._max_bytes:
+        # Count bytes, not characters (D1): a `decode_responses=True` client answers `str`, and a
+        # multibyte character is more than one byte on the wire the cap is about.
+        size = len(value.encode("utf-8")) if isinstance(value, str) else len(value)
+        if size > self._max_bytes:
             unusable(SESSION_KEY, f"it is over the {self._max_bytes}-byte cap", key)
             return None
         try:

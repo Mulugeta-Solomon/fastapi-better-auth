@@ -117,6 +117,17 @@ class TestStoredUser:
         with pytest.raises(TypeError):
             record.payload["banned"] = True  # type: ignore[index]
 
+    def test_the_payload_is_absent_from_the_repr(self) -> None:
+        """C2. `payload` is `field(repr=False)` because it carries the user's own data - email,
+        name, banReason - and a record reaches tracebacks and error reporters. The session side
+        is caught only incidentally (its payload holds the token); the user side needs its own
+        pin, or dropping `repr=False` leaks the email into every traceback with the suite green."""
+        rendered = repr(a_user())
+
+        assert "seed@example.com" not in rendered
+        assert "Seed User" not in rendered
+        assert USER_ID in rendered
+
 
 class TestSessionStoreProtocol:
     def test_both_shipped_stores_satisfy_it(self, tmp_path: Any) -> None:

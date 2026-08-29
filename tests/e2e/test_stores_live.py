@@ -285,18 +285,32 @@ class TestRedisTopology:
     async def test_reading_writes_no_key_back(
         self, redis_harness: str, redis_store: RedisSessionStore
     ) -> None:
-        """Read-only against a real Redis: the session's own TTL is what would move if this
-        store refreshed an expiry on read, and a refreshed TTL outlives a revocation."""
+        """Read-only against a real Redis, watched at the one place a write would show: the key's
+        TTL. `expires_at` and `payload` do not move under an `EXPIRE`/`GETEX` on read - a planted
+        `expire(key, ...)` leaves them identical - so the read-only claim is only really tested by
+        reading the PTTL, since a refreshed TTL is exactly how a revoked session outlives its
+        revocation. This is the only instrument pointed at a real redis-py client."""
+        import redis.asyncio as aioredis
+
         cookie = sign_in(redis_harness, SEED_EMAIL, SEED_PASSWORD)
         token = raw_token(cookie)
-        first = await redis_store.fetch_session_by_token(token)
+        raw = aioredis.from_url(REDIS_URL)
+        try:
+            first = await redis_store.fetch_session_by_token(token)
+            pttl_before = await raw.pttl(token)
+            for _ in range(3):
+                await redis_store.fetch_session_by_token(token)
+            again = await redis_store.fetch_session_by_token(token)
+            pttl_after = await raw.pttl(token)
+        finally:
+            await raw.aclose()
 
-        for _ in range(3):
-            await redis_store.fetch_session_by_token(token)
-
-        again = await redis_store.fetch_session_by_token(token)
         assert first is not None
         assert again is not None
         assert again.expires_at == first.expires_at
         assert dict(again.payload) == dict(first.payload)
+        # better-auth sets the key's TTL to the session lifetime, so it must be positive - and it
+        # only ever *decreases* as time passes. A store that refreshed it on read would raise it.
+        assert pttl_before > 0, "the session key carries no TTL; this assertion would prove nothing"
+        assert pttl_after <= pttl_before
         sign_out(redis_harness, cookie)

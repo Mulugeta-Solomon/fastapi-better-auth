@@ -9,6 +9,7 @@ store that fell back to the database on a miss would therefore resurrect revoked
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import sys
@@ -21,6 +22,8 @@ from fastapi_better_auth import (
     RedisSessionStore,
     SessionStore,
 )
+from fastapi_better_auth._internal.reasons import REDACTED
+from fastapi_better_auth._internal.stores import redis_store as redis_store_module
 from tests.stores import (
     ADMIN_ID,
     EXPIRES_AT,
@@ -81,6 +84,21 @@ class TestFetchSessionByToken:
         """`JSON.stringify(new Date())` writes `...Z`, which `datetime.fromisoformat` did not
         accept before 3.11 - so this is the one parse the store cannot delegate."""
         store, _client = store_over(**{TOKEN: stored()})
+
+        record = await store.fetch_session_by_token(TOKEN)
+
+        assert record is not None
+        assert record.expires_at.tzinfo is not None
+        assert record.expires_at == EXPIRES_AT
+
+    @pytest.mark.anyio
+    async def test_an_iso_expiry_without_a_z_is_still_read_as_utc(self) -> None:
+        """C6. A custom `secondaryStorage` that serializes a `Date` without the trailing `Z`
+        answers a naive ISO string; `as_moment` still reads it as UTC. Reachable, so pinned - the
+        alternative reading (leave it naive) would fail `StoredSession`'s aware-only contract."""
+        # Same instant as EXPIRES_AT, but written without the trailing `Z` fromisoformat needs.
+        value = stored(session=wire_session(expiresAt="2026-09-05T12:00:00.000"))
+        store, _client = store_over(**{TOKEN: value})
 
         record = await store.fetch_session_by_token(TOKEN)
 
@@ -258,6 +276,49 @@ class TestMalformedValues:
         assert SESSION_ID not in written
         assert USER_ID not in written
 
+    @pytest.mark.anyio
+    async def test_the_cap_counts_bytes_not_characters(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """D1. A `decode_responses=True` client answers `str`; a multibyte character is more than
+        one byte on the wire the cap is about. This value is under the cap in characters and over
+        it in bytes, so only a byte count refuses it - the reason is `cap`, not `not JSON`."""
+        value = "é" * 40  # 40 characters, 80 UTF-8 bytes
+        assert len(value) < 50 < len(value.encode("utf-8"))
+        client = DecodingRedis({TOKEN: value})
+        store = RedisSessionStore(client=client, max_bytes=50)
+
+        with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
+            record = await store.fetch_session_by_token(TOKEN)
+
+        assert record is None
+        assert any("cap" in entry.getMessage() for entry in caplog.records)
+
+    @pytest.mark.anyio
+    async def test_a_hostile_type_name_cannot_forge_a_second_log_line(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """D2. The type name is the only interpolated part of an `unusable` reason. A client
+        answering an object whose class name carries a newline must not forge a WARNING line."""
+
+        class Odd:
+            pass
+
+        Odd.__name__ = "bytes\n2026-01-01 CRITICAL forged log line"
+
+        class Weird:
+            async def get(self, name: str) -> object:
+                return Odd()
+
+        store = RedisSessionStore(client=Weird())
+
+        with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
+            assert await store.fetch_session_by_token(TOKEN) is None
+
+        written = " ".join(entry.getMessage() for entry in caplog.records)
+        assert "forged log line" not in written
+        assert REDACTED in written
+
 
 class TestFetchUserById:
     @pytest.mark.anyio
@@ -326,6 +387,25 @@ class TestConstruction:
         with pytest.raises(ConfigurationError, match="url"):
             RedisSessionStore()
 
+    @pytest.mark.parametrize("bad", [7, "", "   "], ids=["int", "empty", "blank"])
+    def test_a_url_that_is_not_a_usable_string_is_refused(self, bad: Any) -> None:
+        """D3. `url=` was unvalidated while the `Raises:` block promises a `ConfigurationError`
+        for every construction failure; `url=7` was an `AttributeError` from `from_url`."""
+        with pytest.raises(ConfigurationError, match="url"):
+            RedisSessionStore(url=bad)
+
+    def test_a_rejected_url_does_not_echo_its_value(self) -> None:
+        """A redis URL can carry a password; the refusal for a bad one must not put it in the
+        message or on `__cause__`."""
+        secret = (
+            "gopher://user:sup3r-secret-pw@host:6379/0"  # unsupported scheme -> from_url rejects
+        )
+        with pytest.raises(ConfigurationError) as caught:
+            RedisSessionStore(url=secret)
+
+        assert "sup3r-secret-pw" not in str(caught.value)
+        assert caught.value.__cause__ is None
+
     @pytest.mark.parametrize(
         "cap", [0, -1, 1.5, True, "8192"], ids=["zero", "negative", "float", "bool", "string"]
     )
@@ -390,6 +470,27 @@ class TestConstruction:
 
         assert not client.closed
 
+    @pytest.mark.anyio
+    async def test_closing_a_store_closes_the_client_it_built(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """C3, the other branch: the `url=` path owns the client it built, so it must close it -
+        a no-op close is a pool leak on every `url=` store. The only existing close assertion
+        covers the *borrowed* branch, so this one is outcome-unpinned without it."""
+        built = RecordingRedis()
+
+        class FakeRedis:
+            @staticmethod
+            def from_url(url: str) -> RecordingRedis:
+                return built
+
+        monkeypatch.setattr(redis_store_module, "_import_redis", lambda: FakeRedis)
+
+        async with RedisSessionStore(url="redis://localhost:6379/0") as store:
+            assert isinstance(store, SessionStore)
+
+        assert built.closed
+
 
 class TestFailures:
     @pytest.mark.anyio
@@ -410,9 +511,34 @@ class TestFailures:
     async def test_the_store_holds_no_database_to_fall_back_to(self) -> None:
         """Structural, not behavioural: there is no engine, no session maker and no URL for a
         database anywhere on this object, so the fallback D-008 forbids cannot be added by
-        accident."""
+        accident. C5: an allowlist, not a type denylist - a `_fallback_dsn = "postgresql://..."`
+        is a `str` and would slip a name-based check, so this asserts the store's attributes ARE
+        exactly the four it should have and nothing has crept in."""
         store, _client = store_over(**{TOKEN: stored()})
 
-        held = {type(value).__name__ for value in vars(store).values()}
+        assert set(vars(store)) == {"_built", "_client", "_prefix", "_max_bytes"}
 
-        assert not any("Engine" in name or "Connection" in name for name in held)
+
+class TestConstantTimeTokenCompare:
+    @pytest.mark.anyio
+    async def test_the_stored_token_check_goes_through_compare_digest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """C1. A mismatch is a miss whether the compare is `==` or `compare_digest`, so the
+        constant-time property is outcome-invisible and pinned only by reaching the call. The
+        token repeated in the stored value is a secret, and a `==` there is a timing oracle."""
+        seen: list[tuple[object, object]] = []
+        real = hmac.compare_digest
+
+        def spy(left: Any, right: Any) -> bool:
+            seen.append((left, right))
+            return real(left, right)
+
+        monkeypatch.setattr(hmac, "compare_digest", spy)
+        store, _client = store_over(**{TOKEN: stored()})
+
+        assert await store.fetch_session_by_token(TOKEN) is not None
+        assert seen, "the stored-token check did not reach hmac.compare_digest"
+        assert all(isinstance(side, bytes) for pair in seen for side in pair), (
+            "compare_digest must be handed bytes, or it raises on a non-ASCII token"
+        )

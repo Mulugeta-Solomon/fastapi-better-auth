@@ -20,6 +20,7 @@ and not a syntax error in production.
 
 from __future__ import annotations
 
+import hmac
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -38,12 +39,18 @@ from sqlalchemy import (
     inspect,
     select,
 )
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from ..errors import ConfigurationError
+from ..errors import AuthServiceUnavailable, ConfigurationError
+from ..reasons import fingerprint
 from .diagnostics import drifted, unusable
 from .records import StoredSession, StoredUser
-from .upstream import as_flag, as_moment, as_text
+from .upstream import as_db_flag, as_moment, as_text
+
+# Re-exported so `sqlalchemy_store` can name the exception class in an `except` without importing
+# `sqlalchemy` itself - that module has to import cleanly when the extra is absent (D-146).
+__all__ = ["SQLAlchemyError"]
 
 SESSION_REQUIRED: tuple[str, ...] = ("id", "token", "expiresAt", "userId")
 SESSION_OPTIONAL: tuple[str, ...] = ("createdAt", "updatedAt", "ipAddress", "userAgent")
@@ -64,7 +71,12 @@ USER_COLUMNS = USER_REQUIRED + USER_OPTIONAL + USER_ADMIN
 KNOWN = frozenset(SESSION_COLUMNS + USER_COLUMNS)
 
 MOMENTS = frozenset({"expiresAt", "createdAt", "updatedAt", "banExpires"})
-FLAGS = frozenset({"emailVerified", "banned"})
+# `emailVerified` keeps SQLAlchemy's `Boolean`, which coerces the 0/1 SQLite/MySQL store back to
+# a bool for the payload. `banned` deliberately does NOT: it is promoted to the record and a
+# security decision keys on it, so it is read raw and validated by `as_db_flag` (A3), which lets
+# a malformed value be a miss instead of a coerced `True`.
+TYPED_BOOL = frozenset({"emailVerified"})
+RAW_FLAGS = frozenset({"banned"})
 
 SESSION_PREFIX = "s_"
 USER_PREFIX = "u_"
@@ -141,9 +153,9 @@ def _column(name: str) -> Column[Any]:
     """
     if name in MOMENTS:
         return Column(name, DateTime(timezone=True))
-    if name in FLAGS:
+    if name in TYPED_BOOL:
         return Column(name, Boolean)
-    if name in KNOWN:
+    if name in KNOWN and name not in RAW_FLAGS:
         return Column(name, Text)
     return Column(name)
 
@@ -236,6 +248,13 @@ def session_from(rows: Sequence[Mapping[str, Any]], plan: Plan, token: str) -> S
     if expires_at is None or user_id is None or stored_token is None or user is None:
         unusable("session", _why(expires_at, user_id, stored_token, user), token)
         return None
+    # Equality was delegated to `WHERE token = :token`, i.e. to the DB collation. A
+    # case/accent/pad-insensitive collation (MySQL's `utf8mb4_0900_ai_ci` default) folds a
+    # different token onto this row, so the stored token is checked against the presented one -
+    # constant-time, the same guard the Redis store calls the one that matters (A2, D-160).
+    if not hmac.compare_digest(stored_token.encode("utf-8"), token.encode("utf-8")):
+        unusable("session", "it names a different session than the token it was found under", token)
+        return None
     return StoredSession(
         token=stored_token,
         user_id=user_id,
@@ -255,10 +274,21 @@ def user_from(rows: Sequence[Mapping[str, Any]], plan: Plan, subject: str) -> St
     if identifier is None:
         unusable("user", "its id is null or blank", subject)
         return None
+    raw_banned = payload.get("banned")
+    banned = as_db_flag(raw_banned)
+    if raw_banned is not None and banned is None:
+        # Present but not a readable boolean - the Redis store refuses this, so the SQL store
+        # must too, or the two answer the same session differently (A3, D-160).
+        unusable("user", "its banned field is not a boolean", subject)
+        return None
+    if "banned" in payload:
+        # Normalize the raw 0/1 a SQLite/MySQL column answers to a bool, so both stores put the
+        # same value on the payload they hand `parse_user`.
+        payload["banned"] = banned
     return StoredUser(
         id=identifier,
         payload=payload,
-        banned=as_flag(payload.get("banned")),
+        banned=banned,
         ban_expires=as_moment(payload.get("banExpires")),
     )
 
@@ -320,6 +350,25 @@ def reflected(
 def rows(result: Any) -> list[Mapping[str, Any]]:
     """At most `ROW_LIMIT` rows, materialized before the connection closes."""
     return [dict(row) for row in result.mappings().fetchmany(ROW_LIMIT)]
+
+
+def lookup_unavailable(params: Mapping[str, Any]) -> AuthServiceUnavailable:
+    """The failure a query-time database error must be turned into - carrying NO parameter.
+
+    SQLAlchemy's `DBAPIError.__str__` embeds the bound parameters (`[parameters: ('<token>',)]`)
+    because an operator-built engine defaults to `hide_parameters=False`, so an untranslated error
+    from `connection.execute` puts the raw session token into any `logger.exception` a consumer
+    writes (A1, D-160). This is the one thing the whole store is built to prevent - it is why
+    `StoredSession.token` is `repr=False`. The escaping error carries a fingerprint of the subject
+    and nothing else; the caller raises it `from None` so the original never rides along on
+    `__cause__`/`__context__`. `AuthServiceUnavailable` because a lookup that could not complete is
+    a refusal, the same family as a JWKS fetch that could not complete - which is what lets the
+    verifier answer the uniform 401.
+    """
+    subject = next((value for value in params.values() if isinstance(value, str)), "")
+    return AuthServiceUnavailable(
+        reason=f"session store lookup could not complete [{fingerprint(subject)}]"
+    )
 
 
 def validated_async_engine(engine: object) -> AsyncEngine:

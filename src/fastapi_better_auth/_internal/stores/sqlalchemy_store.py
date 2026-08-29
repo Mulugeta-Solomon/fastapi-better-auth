@@ -157,6 +157,11 @@ class SqlAlchemySessionStore(_CoreStore):
     UTC, which is what Better Auth wrote. A column holding local time would be misread by
     exactly its offset.
 
+    **Every column of the two tables is read**, including a deployment's own `additionalFields`,
+    so they reach the record's `payload` the same way they reach the Redis store's. That payload
+    is handed to `parse_user`, so do not store a secret on the `user` or `session` table that a
+    verified request should not see - a column added there is readable through the record.
+
     Args:
         engine: An `AsyncEngine`. Always injected, never built here: the pool, the TLS
             configuration and the lifecycle belong to the application, and this store must not
@@ -195,8 +200,14 @@ class SqlAlchemySessionStore(_CoreStore):
         return await connection.run_sync(self._reflected)
 
     async def _select(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
-        async with self._engine.connect() as connection:
-            return self._sql.rows(await connection.execute(statement, dict(params)))
+        try:
+            async with self._engine.connect() as connection:
+                return self._sql.rows(await connection.execute(statement, dict(params)))
+        except self._sql.SQLAlchemyError:
+            failure = self._sql.lookup_unavailable(params)
+        # Raised outside the `except` so no `__context__` links back to the DBAPIError whose
+        # str() embeds the token; `from None` clears `__cause__` as well (A1).
+        raise failure from None
 
 
 class SyncStoreAdapter(_CoreStore):
@@ -259,5 +270,9 @@ class SyncStoreAdapter(_CoreStore):
         return await run_sync(self._queried, statement, dict(params))
 
     def _queried(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
-        with self._engine.connect() as connection:
-            return self._sql.rows(connection.execute(statement, dict(params)))
+        try:
+            with self._engine.connect() as connection:
+                return self._sql.rows(connection.execute(statement, dict(params)))
+        except self._sql.SQLAlchemyError:
+            failure = self._sql.lookup_unavailable(params)
+        raise failure from None

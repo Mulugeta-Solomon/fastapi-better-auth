@@ -25,10 +25,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine
+from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from fastapi_better_auth import (
+    AuthServiceUnavailable,
     ConfigurationError,
     SessionStore,
     SqlAlchemySessionStore,
@@ -504,6 +505,19 @@ class TestStatements:
 
         assert TOKEN not in " ".join(log.statements)
 
+    @pytest.mark.anyio
+    async def test_both_statements_carry_a_row_limit(self, build: Build) -> None:
+        """C6. `fetchmany` + the ambiguous-row check preserve the behaviour even without it, so
+        the DB-side `LIMIT` is a mutation survivor - but it is what stops the database from
+        materializing a large duplicate result before the client caps it. Pinned on the SQL."""
+        store, log = build()
+
+        await store.fetch_session_by_token(TOKEN)
+        await store.fetch_user_by_id(USER_ID)
+
+        for statement in selects(log):
+            assert "LIMIT" in statement.upper()
+
 
 class TestConstruction:
     def test_a_string_url_is_refused_at_construction(self) -> None:
@@ -565,3 +579,179 @@ class TestConstruction:
             SqlAlchemySessionStore(engine=object())  # type: ignore[arg-type]
 
         assert "fastapi-better-auth-bridge[sqlalchemy]" in str(caught.value)
+
+
+class TestQueryErrorTranslation:
+    """A1. SQLAlchemy's `DBAPIError.str()` embeds the bound parameters, so a query-time database
+    error - a timeout, a deadlock, a failover mid-query - carries the raw session token unless the
+    store translates it. A DB error during auth is routine, not exotic."""
+
+    @pytest.mark.anyio
+    async def test_a_query_error_becomes_an_auth_service_unavailable_with_no_token(
+        self, build: Build, tmp_path: pathlib.Path
+    ) -> None:
+        store, _log = build()
+        await connect(store)
+        # Break the query itself, after the schema was discovered: the next SELECT carries the
+        # token as a bound parameter and fails at the driver, the shape a timeout/failover takes.
+        breaker = sync_engine(tmp_path / "harness0.sqlite")
+        with breaker.begin() as connection:
+            connection.execute(text('DROP TABLE "session"'))
+        breaker.dispose()
+
+        with pytest.raises(AuthServiceUnavailable) as caught:
+            await store.fetch_session_by_token(TOKEN)
+
+        rendered = _leak_surface(caught.value)
+        assert TOKEN not in rendered
+        assert "tok_fp=" in caught.value.reason
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+
+    @pytest.mark.anyio
+    async def test_a_user_lookup_error_carries_no_user_id(
+        self, build: Build, tmp_path: pathlib.Path
+    ) -> None:
+        store, _log = build()
+        await connect(store)
+        breaker = sync_engine(tmp_path / "harness0.sqlite")
+        with breaker.begin() as connection:
+            connection.execute(text('DROP TABLE "user"'))
+        breaker.dispose()
+
+        with pytest.raises(AuthServiceUnavailable) as caught:
+            await store.fetch_user_by_id(USER_ID)
+
+        assert USER_ID not in _leak_surface(caught.value)
+
+
+class TestCollationFolding:
+    """A2. Equality was delegated to `WHERE token = :token`, i.e. to the DB collation. On MySQL's
+    default `utf8mb4_0900_ai_ci` a folded token matches a different row; WP11 derives the CSRF
+    double-submit token from `session_token`, so a `.token` that is not the presented credential
+    breaks that binding. The reproduction is the test."""
+
+    @pytest.mark.anyio
+    async def test_a_case_folded_token_does_not_return_a_wrong_record(
+        self, build: Build, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        store, _log = build(token_collation="NOCASE")
+        asked = TOKEN.swapcase()
+        assert asked != TOKEN
+
+        with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
+            record = await store.fetch_session_by_token(asked)
+
+        assert record is None
+        assert any("different session" in entry.getMessage() for entry in caplog.records)
+
+    @pytest.mark.anyio
+    async def test_the_exact_token_still_matches_under_a_folding_collation(
+        self, build: Build
+    ) -> None:
+        """The compare must not reject the legitimate request that the collation also matched."""
+        store, _log = build(token_collation="NOCASE")
+
+        record = await store.fetch_session_by_token(TOKEN)
+
+        assert record is not None
+        assert record.token == TOKEN
+
+
+class TestMalformedBanned:
+    """A3. The Redis store refuses a present-but-not-boolean `banned`; the SQL store must too, or
+    the two answer the same session differently - the exact divergence `plan_for` exists to
+    prevent. SQLAlchemy's lenient `Boolean` would coerce a stray `'false'` to `True` unseen, so
+    `banned` is read raw and validated."""
+
+    @pytest.mark.anyio
+    async def test_a_nonboolean_banned_is_a_miss(
+        self, build: Build, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        store, _log = build(users=({**USER_ROW, "banned": "false"},))
+
+        with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
+            record = await store.fetch_user_by_id(USER_ID)
+
+        assert record is None
+        assert any("banned field is not a boolean" in e.getMessage() for e in caplog.records)
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("stored", "expected"),
+        [(True, True), (False, False), (1, True), (0, False)],
+        ids=["bool-true", "bool-false", "int-1", "int-0"],
+    )
+    async def test_a_native_boolean_encoding_reads_correctly(
+        self, build: Build, stored: object, expected: bool
+    ) -> None:
+        """Postgres answers a real bool; SQLite and MySQL store it as the integer 0/1. Both must
+        read as the same bool, and land the same bool on the payload (parity with Redis)."""
+        store, _log = build(users=({**USER_ROW, "banned": stored},))
+
+        record = await store.fetch_user_by_id(USER_ID)
+
+        assert record is not None
+        assert record.banned is expected
+        assert record.payload["banned"] is expected
+
+    @pytest.mark.anyio
+    async def test_a_mapper_row_with_a_nonboolean_banned_is_refused(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The mapper directly, the way `test_a_user_row_with_no_usable_id...` drives it - so the
+        guard is pinned whatever a future column typing feeds it."""
+        plan = plan_for("session", "user", None, {"session": SESSION_COLUMNS, "user": USER_COLUMNS})
+        row: dict[str, Any] = {f"u_{name}": None for name in plan.user_columns}
+        row["u_id"] = USER_ID
+        row["u_banned"] = 2  # neither a bool nor the 0/1 a database boolean encodes to
+
+        with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
+            assert user_from([row], plan, "probe") is None
+
+        assert any("banned field is not a boolean" in e.getMessage() for e in caplog.records)
+
+
+class TestConcurrentDiscovery:
+    """C4. The double-checked lock's inner `if self._plan is None:` is the package's only branch a
+    single-threaded test cannot exercise. A burst of first fetches must inspect the schema once."""
+
+    @pytest.mark.anyio
+    async def test_a_burst_of_first_fetches_inspects_the_schema_once(
+        self, build: Build, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import anyio
+
+        from fastapi_better_auth._internal.stores import sqlalchemy_core
+
+        calls = 0
+        real = sqlalchemy_core.reflected
+
+        def counting(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(sqlalchemy_core, "reflected", counting)
+        store, _log = build()
+
+        async with anyio.create_task_group() as tg:
+            for _ in range(20):
+                tg.start_soon(store.fetch_session_by_token, TOKEN)
+
+        assert calls == 1
+
+
+def _leak_surface(exc: BaseException) -> str:
+    """Everything an error reporter can reach off an exception - str, args, and the whole
+    __cause__/__context__ chain - so a token hiding on a chained DBAPIError is caught."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(str(current))
+        parts.append(repr(current.args))
+        parts.append(getattr(current, "reason", ""))
+        current = current.__cause__ or current.__context__
+    return "\n".join(parts)

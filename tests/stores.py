@@ -140,6 +140,7 @@ def build_schema(
     extra_session_columns: Sequence[tuple[str, str]] = (),
     extra_user_columns: Sequence[tuple[str, str]] = (),
     unique_token: bool = True,
+    token_collation: str | None = None,
     session_table: str = "session",
     user_table: str = "user",
 ) -> None:
@@ -150,6 +151,13 @@ def build_schema(
         tuple(c for c in session_columns if c[0] not in drop_session_columns),
         relax_session_columns,
     )
+    if token_collation is not None:
+        # A case/accent/pad-insensitive collation on the token column - MySQL's own default
+        # `utf8mb4_0900_ai_ci`, in SQLite's spelling - so a folded token matches the WHERE clause.
+        session_columns = tuple(
+            (name, f"{kind} COLLATE {token_collation}") if name == "token" else (name, kind)
+            for name, kind in session_columns
+        )
     if not unique_token:
         # A hand-rolled migration that dropped the constraint upstream relies on: two rows can
         # then answer one token, and the store has to notice rather than pick one.
