@@ -76,8 +76,13 @@ auth = BetterAuth.from_env()
 ```
 
 **Call the factory** — `Depends(auth.current_session())`, with the parentheses. Passed bare it would
-make the factory itself the dependency, a silent bypass of every route beneath a router, so it is
-refused with a `ConfigurationError` while the route is registered and the application never starts.
+make the factory itself the dependency, a silent bypass of every route beneath a router, so every
+`Depends` and `Security` planting of a bare factory is refused with a `ConfigurationError` while
+the route is registered and the application never starts. The one exception is a bare factory
+assigned into `app.dependency_overrides`, a plain dict this library has no hook into: there the
+application does start, and the same refusal fires on the first request touching that dependency —
+still verifying nothing, and still serving nobody.
+
 `/docs` needs no wiring: the security scheme is derived from each verifier's own credential source,
 so the Authorize button works out of the box.
 
@@ -125,11 +130,13 @@ the wire, deliberately — a client must not be able to tell them apart and use 
 probe. Two credentials on one request are a `400` (`{"detail": "Ambiguous request"}`), decided
 before anything is verified.
 
-Why a request was refused lives on the exception and in this library's log, never in the response.
-Read it off `.reason`; if you want it in your own logs, register a FastAPI exception handler for
-`SessionError` and log that attribute explicitly — `logging.exception()` renders `str(exc)`, which
-deliberately does not carry it. A `reason` holds identifiers and fingerprints — a key id, a
-truncated hash — never a raw credential.
+Why a request was refused lives on the exception, as `.reason`, and nowhere else. **This library
+does not log ordinary refusals** — a forged, expired or malformed token, an unknown key id, a
+missing or ambiguous credential — and that is deliberate rather than an omission: what to record
+about a failed authentication, and where, is the deployment's decision. If you want them, register
+a FastAPI exception handler for `SessionError` and log `exc.reason` explicitly; note that
+`logging.exception()` renders `str(exc)`, which does not carry it. A `reason` holds identifiers and
+fingerprints — a key id, a truncated hash — never a raw credential.
 
 ## Do I need to run a Node service?
 
@@ -142,7 +149,7 @@ it issues. Two topologies:
   issues: nothing shared at all for Mode B, a shared Postgres/Redis once Mode A lands.
 - **No JS server (static SPA, mobile app, pure API):** deploy one tiny Node service whose only job
   is mounting Better Auth, and keep 100% of the business logic in FastAPI. This repository's
-  conformance harness is exactly that service, in under sixty lines of Hono: `harness/`.
+  conformance harness (`harness/`) is exactly that service, in Hono.
 
 Either way the browser or app performs its login flows against Better Auth, then presents the
 resulting JWT to FastAPI, where this library verifies it.
