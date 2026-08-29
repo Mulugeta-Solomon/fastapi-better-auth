@@ -29,13 +29,13 @@ issue here before it reaches your deployment.
 | Python | Lane |
 |---|---|
 | 3.10 | unit (Linux), and the declared-floors lane below |
+| 3.11 | unit (Linux) |
 | 3.12 | unit (Linux) |
 | 3.13 | unit (Linux, macOS, Windows), and pyright strict |
 | 3.14 | unit (Linux) |
 | 3.15 pre-release | unit, advisory only — a failure here never blocks a merge |
 
-`requires-python` is `>=3.10`. 3.11 is not currently exercised by a lane of its own; it sits
-between two that are.
+`requires-python` is `>=3.10`.
 
 ## Dependency floors
 
