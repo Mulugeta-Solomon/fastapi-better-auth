@@ -63,8 +63,17 @@ services:
       REDIS_URL: redis://redis:6379
     ports:
       - "3101:3101"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3101/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      # Both containers run `auth migrate` against the same database on start; waiting for
+      # the first to be serving is what keeps the two migrations from racing each other.
+      auth:
         condition: service_healthy

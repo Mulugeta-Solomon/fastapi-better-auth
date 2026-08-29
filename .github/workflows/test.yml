@@ -103,8 +103,10 @@ jobs:
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: "3.13"
-      - name: Start harness
-        run: docker compose -f harness/docker-compose.yml up --build -d --wait
+      - name: Start harness (both topologies)
+        # --profile redis brings up auth-redis on :3101 alongside the default :3100 server.
+        # Both gate: the stores answer two different truths and only one of them is Postgres.
+        run: docker compose -f harness/docker-compose.yml --profile redis up --build -d --wait
       - name: Sync (dev group)
         run: uv sync
       - name: Unit lane (coverage, no gate)
@@ -113,7 +115,7 @@ jobs:
         run: uv run pytest -m e2e -q --cov=fastapi_better_auth --cov-append --cov-fail-under=80
       - name: Harness logs
         if: failure()
-        run: docker compose -f harness/docker-compose.yml logs
+        run: docker compose -f harness/docker-compose.yml --profile redis logs
       - name: Teardown
         if: always()
-        run: docker compose -f harness/docker-compose.yml down -v
+        run: docker compose -f harness/docker-compose.yml --profile redis down -v

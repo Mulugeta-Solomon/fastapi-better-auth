@@ -53,9 +53,26 @@ lockfile and would never exercise a floor.
 | `starlette` | `>=1.3.1` |
 | `pydantic` | `>=2.7` |
 | `pyjwt[crypto]` | `>=2.10` |
-| `anyio` | `>=4` |
+| `anyio` | `>=4.1` |
 | `httpx` (extra `[httpx]`) | `>=0.27` |
 | `httpx2` (extra `[httpx2]`) | `>=2.0` |
+| `sqlalchemy[asyncio]` (extra `[sqlalchemy]`) | `>=2.0` |
+| `redis` (extra `[redis]`) | `>=5.0.1` |
+
+The two store extras are what `SqlAlchemySessionStore` / `SyncStoreAdapter` and
+`RedisSessionStore` need; neither is imported unless one of those is constructed, so an install
+with neither still imports the package and every published name. `sqlalchemy` needs a driver of
+its own — `asyncpg` and `psycopg` are what the conformance lane and the docs use. `redis`'s floor
+is `5.0.1` rather than `5.0` because `aclose()` arrived there, and the deprecated `close()` it
+replaced emits a warning this project treats as an error.
+
+A database driver is deliberately *not* a floor of ours: which one a deployment uses is its own
+decision, and pinning one here would be this library choosing it.
+
+`anyio`'s floor moved from `>=4` to `>=4.1` with the stores. `SyncStoreAdapter` is the first thing
+here to call `anyio.to_thread.run_sync`, and anyio 4.0's Trio backend passes a `cancellable=`
+argument Trio removed in 0.23 — so on Trio it raises `TypeError` rather than running the query.
+The floor-resolution lane is what found it.
 
 ## What a release of this library may change
 
@@ -66,6 +83,10 @@ lockfile and would never exercise a floor.
   formats: the signed cookie's HMAC construction and the session store's own layout. It will be
   pinned to the better-auth versions the conformance lane exercises, and an upstream change to
   either may force a change here inside a minor release. Stated now rather than discovered later.
+  The stores are the first piece of it to land, and they read three internal shapes: the
+  `session` and `user` tables' column names, the secondary-storage key (the raw session token,
+  with no namespace), and the JSON that key holds (`{session, user}`). All three are asserted
+  against a running better-auth in the conformance lane, in both of its topologies.
 - **Mode C (remote get-session)** — after Mode A.
 
 Security fixes are released for the latest version only while this project is pre-1.0; see

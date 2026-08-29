@@ -58,14 +58,14 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.0.1
       - name: Start harness (better-auth@${{ matrix.version }})
-        run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml up --build -d --wait
+        run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml --profile redis up --build -d --wait
       - name: Sync (dev group)
         run: uv sync
       - name: Conformance lane
         run: uv run pytest -m e2e -q
       - name: Harness logs
         if: failure()
-        run: docker compose -f harness/docker-compose.yml logs
+        run: docker compose -f harness/docker-compose.yml --profile redis logs
       - name: Open issue on failure
         if: failure() || cancelled()
         env:
@@ -99,13 +99,18 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.0.1
       - name: Start harness (better-auth@${{ matrix.version }})
-        run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml up --build -d --wait
+        run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml --profile redis up --build -d --wait
+      # The store drivers are installed by name rather than through the wheel's own
+      # [sqlalchemy] / [redis] extras: those extras do not exist on releases before 0.2.0, and
+      # this leg installs whatever is currently on PyPI. The store conformance module skips
+      # itself on a build that publishes no stores, so the leg stays green until 0.2.0 ships.
       - name: Install the published wheel and the conformance lane's test dependencies
         run: |
           uv venv --python 3.13 "$WHEEL_VENV"
           uv pip install --python "$WHEEL_VENV/bin/python" --refresh \
             --index-url https://pypi.org/simple/ \
-            "fastapi-better-auth-bridge[httpx,httpx2]" "pytest>=8" "trio>=0.27"
+            "fastapi-better-auth-bridge[httpx,httpx2]" "pytest>=8" "trio>=0.27" \
+            "sqlalchemy[asyncio]>=2.0" "asyncpg>=0.30" "redis>=5.0.1"
       - name: Instrument liveness — the library under test must be the installed wheel
         id: guard
         run: |
@@ -116,7 +121,7 @@ jobs:
           "$WHEEL_VENV/bin/python" -m pytest tests/e2e -m e2e -q
       - name: Harness logs
         if: failure()
-        run: docker compose -f harness/docker-compose.yml logs
+        run: docker compose -f harness/docker-compose.yml --profile redis logs
       - name: Open issue on failure
         if: failure() || cancelled()
         env:

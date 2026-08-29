@@ -43,20 +43,28 @@ from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import pytest
+from sqlalchemy import Engine
+from sqlalchemy import text as sqla_text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from fastapi_better_auth import (
     AuthServiceUnavailable,
     BetterAuth,
     ConfigurationError,
+    RedisSessionStore,
     Session,
     SessionError,
+    SessionStore,
     SharedSecret,
+    SqlAlchemySessionStore,
+    SyncStoreAdapter,
     User,
 )
 from fastapi_better_auth._internal.jwks import JwksClient
 from fastapi_better_auth._internal.jwt_verifier import JwtVerifier
 from fastapi_better_auth._internal.reasons import REDACTED, fingerprint
 from tests.fakes import connection, resolver_of
+from tests.stores import RecordingRedis, async_engine, build_schema, sync_engine
 from tests.tokens import (
     Clock,
     claims,
@@ -89,6 +97,14 @@ WRONG_KEY = ed25519_signer("wp6-1")
 ORIGIN = "https://auth.example.com"
 HOSTILE_KID = 'evil-kid-9f3ab21c"\n2026-01-01 CRITICAL forged log line'
 LEAKY_SECRET = "Zt7Qv1oXbK4mPr9wCyHnLdEuAsJf2Ng6"
+STORE_TOKEN = "wBNhqX3M2CKkT7bmDTmeEMA1S1qCcWnn"
+STORED_USER_ID = "cIrUeXmXVG5Kg0Pzt4rCozIxLv3oeOMG"
+UNREADABLE = (
+    f'{{"session": {{"token": "{STORE_TOKEN}", "userId": "{STORED_USER_ID}",'
+    f' "expiresAt": "soon"}}, "user": {{"id": "{STORED_USER_ID}"}}}}'
+)
+"""A stored value whose expiry will not parse, so the whole record is refused - and both the key
+it sat under and the ids inside it are candidates to leak into the line that refuses it."""
 FORMATTER = logging.Formatter("%(name)s %(levelname)s %(message)s")
 
 
@@ -195,6 +211,19 @@ COVERED_BY: Mapping[LogSite, str] = {
         level="warning",
         template="jwks refresh failed for %s; serving the key set on hand",
     ): "test_a_jwks_refresh_failure_logs_no_attacker_chosen_kid",
+    LogSite(
+        module="diagnostics",
+        level="warning",
+        template="stored %s is unusable (%s); answering a miss [%s]",
+    ): "test_a_malformed_stored_session_logs_no_token",
+    LogSite(
+        module="diagnostics",
+        level="warning",
+        template=(
+            "table %s is missing better-auth columns this store reads: %s;"
+            " the fields they feed will be absent from every record"
+        ),
+    ): "test_a_schema_drift_warning_carries_only_operator_owned_names",
 }
 
 
@@ -466,6 +495,104 @@ async def test_a_jwks_refresh_failure_logs_no_attacker_chosen_kid(
     assert HOSTILE_KID not in rendered(records)
     assert "forged log line" not in rendered(records)
     assert REDACTED in caught.value.reason
+
+
+@pytest.mark.anyio
+async def test_a_malformed_stored_session_logs_no_token(
+    records: list[logging.LogRecord],
+) -> None:
+    """A stored value a store refuses is still session data, and the key it sat under is a live
+    session token. The operator gets a fingerprint and a phrase this package wrote - never the
+    key, and never a byte of the value."""
+    store = RedisSessionStore(client=RecordingRedis({STORE_TOKEN: UNREADABLE}))
+
+    assert await store.fetch_session_by_token(STORE_TOKEN) is None
+
+    assert_template_fired(records, next(s for s in COVERED_BY if s.module == "diagnostics"))
+    assert_no_leak(records, STORE_TOKEN, STORED_USER_ID)
+    assert fingerprint(STORE_TOKEN) in rendered(records), "the operator cannot tell which session"
+
+
+@pytest.mark.anyio
+async def test_a_schema_drift_warning_carries_only_operator_owned_names(
+    records: list[logging.LogRecord], tmp_path: pathlib.Path
+) -> None:
+    """The other store-side line. Everything in it - the table name and the column names - comes
+    from this package's own constants and the operator's own configuration, so there is nothing
+    here a client could have chosen; the assertion is that no row data joins them."""
+    path = tmp_path / "drift.sqlite"
+    build_schema(path, drop_session_columns=("ipAddress",))
+    engine = sync_engine(path)
+
+    try:
+        await SyncStoreAdapter(engine=engine).connect()
+    finally:
+        engine.dispose()
+
+    drift = next(site for site in COVERED_BY if site.template.startswith("table %s"))
+    assert_template_fired(records, drift)
+    written = rendered(records)
+    assert "ipAddress" in written
+    assert STORED_USER_ID not in written
+
+
+class TestQueryErrorHygiene:
+    """A1, the headline. SQLAlchemy's `DBAPIError.str()` embeds the bound parameters, so an
+    untranslated query error carries the raw session token - and a consumer's `logger.exception`
+    writes it, the one thing `StoredSession.token = repr=False` exists to prevent. Both execute
+    paths (the async store and `SyncStoreAdapter`) are pinned.
+
+    Pinned to asyncio: `aiosqlite` drives the event loop directly and cannot run under trio, and
+    the sync adapter's backend-agnosticism is proven in `test_sync_store_adapter.py` - here the
+    property under test is hygiene, not the backend."""
+
+    @pytest.fixture
+    def anyio_backend(self) -> str:
+        return "asyncio"
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("flavour", ["async", "sync"])
+    async def test_a_query_time_db_error_leaks_no_token_or_user_id(
+        self, records: list[logging.LogRecord], tmp_path: pathlib.Path, flavour: str
+    ) -> None:
+        path = tmp_path / f"{flavour}.sqlite"
+        build_schema(path)
+        engine: AsyncEngine | Engine
+        store: SessionStore
+        if flavour == "async":
+            async_e = async_engine(path)
+            engine, store = async_e, SqlAlchemySessionStore(engine=async_e)
+        else:
+            sync_e = sync_engine(path)
+            engine, store = sync_e, SyncStoreAdapter(engine=sync_e)
+        assert isinstance(store, (SqlAlchemySessionStore, SyncStoreAdapter))
+        await store.connect()
+        # Break the query itself after discovery, the shape a timeout/deadlock/failover takes.
+        breaker = sync_engine(path)
+        with breaker.begin() as connection:
+            connection.execute(sqla_text('DROP TABLE "session"'))
+        breaker.dispose()
+
+        try:
+            with pytest.raises(AuthServiceUnavailable) as caught:
+                await store.fetch_session_by_token(STORE_TOKEN)
+            consumer().exception("auth lookup failed", exc_info=caught.value)
+            consumer().warning("auth lookup failed: %s", caught.value.reason)
+        finally:
+            if isinstance(engine, AsyncEngine):
+                await engine.dispose()
+            else:
+                engine.dispose()
+
+        # Scoped to the two loggers this library's contract covers - the consumer logging the
+        # refusal, and the library itself. A DBAPI driver logs its own SQL (with parameters) at
+        # DEBUG whether the query succeeds or fails; that telemetry is the driver's channel and is
+        # out of scope. A1 is that the raised EXCEPTION - which rides into every WARNING/ERROR a
+        # consumer keeps - carries no token, and it is proven pre-fix by the standalone
+        # reproduction and by the RED run of this suite's sibling assertions.
+        ours = [r for r in records if r.name in {CONSUMER_LOGGER, LIBRARY_LOGGER}]
+        assert_no_leak(ours, STORE_TOKEN, STORED_USER_ID)
+        assert fingerprint(STORE_TOKEN) in rendered(ours), "cannot tell which session failed"
 
 
 def _long_lifetime() -> str:
