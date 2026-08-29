@@ -51,6 +51,8 @@ from fastapi_better_auth import (
     AuthServiceUnavailable,
     BetterAuth,
     ConfigurationError,
+    CookieVerifier,
+    CsrfDisabled,
     RedisSessionStore,
     Session,
     SessionError,
@@ -224,6 +226,14 @@ COVERED_BY: Mapping[LogSite, str] = {
             " the fields they feed will be absent from every record"
         ),
     ): "test_a_schema_drift_warning_carries_only_operator_owned_names",
+    LogSite(
+        module="cookie_verifier",
+        level="warning",
+        template=(
+            "a %s cookie was observed; the session-data cookie cache is out of scope in this"
+            " version (CVE-2026-67337, a 2FA bypass through exactly that cache) and is never parsed"
+        ),
+    ): "test_a_session_data_observation_logs_no_cookie_value",
 }
 
 
@@ -534,6 +544,28 @@ async def test_a_schema_drift_warning_carries_only_operator_owned_names(
     written = rendered(records)
     assert "ipAddress" in written
     assert STORED_USER_ID not in written
+
+
+def test_a_session_data_observation_logs_no_cookie_value(
+    records: list[logging.LogRecord], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one line the cookie verifier emits. Seeing the out-of-scope `session_data` cookie warns
+    once, naming the CVE; the cookie is never parsed, so its value never reaches the line."""
+    from fastapi_better_auth._internal import cookie_verifier as cv
+
+    monkeypatch.setattr(cv._SESSION_DATA_ONCE, "_fired", False, raising=False)  # pyright: ignore[reportPrivateUsage]
+    value = "sd_9f3ab21c9f3ab21c9f3ab21c"
+    verifier = CookieVerifier(
+        secret=SharedSecret(LEAKY_SECRET),
+        store=RedisSessionStore(client=RecordingRedis()),
+        csrf=CsrfDisabled(reason="log-hygiene scenario, no request is verified"),
+    )
+
+    verifier.extract(connection(cookie=f"better-auth.session_data={value}"))
+
+    observed = next(site for site in COVERED_BY if site.module == "cookie_verifier")
+    assert_template_fired(records, observed)
+    assert value not in rendered(records)
 
 
 class TestQueryErrorHygiene:

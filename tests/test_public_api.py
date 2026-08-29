@@ -17,6 +17,7 @@ EXPECTED = (
     "BetterAuthError",
     "ConfigurationError",
     "ContentEncodingRejected",
+    "CookieVerifier",
     "CsrfDisabled",
     "CsrfFacts",
     "CsrfFailure",
