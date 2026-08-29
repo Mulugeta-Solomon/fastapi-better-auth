@@ -25,12 +25,14 @@ from starlette.requests import HTTPConnection
 
 from fastapi_better_auth import (
     AuthServiceUnavailable,
+    BetterAuth,
     ConfigurationError,
     CsrfDisabled,
     CsrfFailure,
     InvalidCredential,
     OriginCheck,
     Session,
+    SessionError,
     SessionExpired,
     SessionRevoked,
     SharedSecret,
@@ -41,6 +43,8 @@ from fastapi_better_auth import (
 )
 from fastapi_better_auth._internal import cookie_verifier as cv
 from fastapi_better_auth._internal.cookie_verifier import CookieVerifier
+from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, resolver_of
+from tests.fakes import connection as fake_connection
 
 VECTOR_DIR = pathlib.Path(__file__).parent / "vectors"
 COOKIE_DOC: dict[str, Any] = json.loads((VECTOR_DIR / "cookie_v1.json").read_text())
@@ -136,6 +140,16 @@ def sign(token: str, secret: bytes = b"") -> str:
     key = secret or VECTOR_SECRET_VALUE.encode()
     digest = hmac.new(key, token.encode(), hashlib.sha256).digest()
     return f"{token}.{base64.b64encode(digest).decode()}"
+
+
+class _FixedClock:
+    """Stands in for `cookie_verifier.datetime`, whose `now(tz)` the expiry check reads."""
+
+    def __init__(self, instant: datetime) -> None:
+        self._instant = instant
+
+    def now(self, tz: Any = None) -> datetime:
+        return self._instant
 
 
 def http(method: str = "GET", *, cookie: str | None = None, **headers: str) -> HTTPConnection:
@@ -293,9 +307,18 @@ class TestExtract:
 
         assert credential is not None
 
-    def test_a_blank_cookie_value_is_present_not_absent(self) -> None:
-        """A planted empty cookie from a sibling subdomain is dispatched to verify, not waved off."""
-        assert verifier().extract(http(cookie=f"{COOKIE}=")) is not None
+    def test_a_blank_cookie_value_reads_as_absent(self) -> None:
+        """The Verifier Protocol contract: a blank or whitespace-only acceptable value must read as
+        ABSENT, or a planted empty cookie from a sibling subdomain makes every composed request
+        AmbiguousCredentials before any verify runs (a cookie-tossing DoS)."""
+        assert verifier().extract(http(cookie=f"{COOKIE}=")) is None
+        assert verifier().extract(http(cookie=f"{COOKIE}=   ")) is None
+
+    def test_a_blank_valued_cookie_beside_a_real_one_leaves_the_real_one(self) -> None:
+        """Dropping blanks is safe for the duplicate defence: a real cookie plus a planted blank of
+        the same name resolves to the real one, not a duplicate rejection."""
+        real = sign(CAPTURED_TOKEN)
+        assert verifier().extract(http(cookie=f"{COOKIE}=; {COOKIE}={real}")) is not None
 
     def test_a_chunked_cookie_is_present(self) -> None:
         assert verifier().extract(http(cookie=f"{COOKIE}.0=part")) is not None
@@ -375,6 +398,20 @@ class TestVerifyPipeline:
         empty = FakeStore()
         with pytest.raises(SessionRevoked):
             await run(verifier(store=empty), http(cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}"))
+
+    @pytest.mark.anyio
+    async def test_expiry_is_inclusive_at_the_check_instant(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Strict expiry is `expires_at <= now`: a session expiring at EXACTLY the check instant is
+        expired. Only a frozen clock distinguishes `<=` from `<`; year-2000/2999 cannot."""
+        instant = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        monkeypatch.setattr(cv, "datetime", _FixedClock(instant))
+        store = FakeStore(
+            sessions={CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN, expires_at=instant)}
+        )
+        with pytest.raises(SessionExpired):
+            await run(verifier(store=store), http(cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}"))
 
     @pytest.mark.anyio
     async def test_an_expired_session_is_rejected_though_the_signature_is_good(self) -> None:
@@ -550,10 +587,15 @@ class TestStoreFailureParity:
     @pytest.mark.anyio
     async def test_a_raw_store_failure_becomes_a_uniform_refusal(self) -> None:
         """The SQL store already raises AuthServiceUnavailable; the Redis store lets a connection
-        error escape untranslated. The verifier translates the latter so the two answer alike."""
+        error escape untranslated. The verifier translates the latter so the two answer alike - and
+        the translation carries NO chain: the Redis error can embed the token, so a reintroduced
+        `raise ... from exc` (or a raise inside the handler) would re-leak it through __context__."""
         store = FakeStore(session_error=ConnectionError("redis down"))
-        with pytest.raises(AuthServiceUnavailable):
+        with pytest.raises(AuthServiceUnavailable) as caught:
             await run(verifier(store=store), http(cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}"))
+
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
 
     @pytest.mark.anyio
     async def test_an_already_translated_store_failure_propagates_unchanged(self) -> None:
@@ -576,8 +618,11 @@ class TestStoreFailureParity:
             sessions={CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN, user=None)},
             user_error=ConnectionError("redis down"),
         )
-        with pytest.raises(AuthServiceUnavailable):
+        with pytest.raises(AuthServiceUnavailable) as caught:
             await run(verifier(store=store), http(cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}"))
+
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
 
     @pytest.mark.anyio
     async def test_an_already_translated_user_lookup_failure_propagates(self) -> None:
@@ -603,9 +648,9 @@ class TestStoreFailureParity:
 
 class TestStructuralRejections:
     @pytest.mark.anyio
-    async def test_a_blank_cookie_is_a_terminal_rejection_not_none(self) -> None:
-        with pytest.raises(InvalidCredential):
-            await run(verifier(), http(cookie=f"{COOKIE}="))
+    async def test_a_lone_blank_cookie_reads_as_absent(self) -> None:
+        """A blank value carries no credential; extract returns None, so run sees no credential."""
+        assert await run(verifier(), http(cookie=f"{COOKIE}=")) is None
 
     @pytest.mark.anyio
     async def test_a_duplicate_session_cookie_is_refused(self) -> None:
@@ -646,6 +691,91 @@ class TestNoBypass:
 
         with pytest.raises(InvalidCredential):
             await run(built, connection)
+
+
+class TestBlankCookieComposition:
+    @pytest.mark.anyio
+    async def test_a_planted_blank_cookie_does_not_break_a_bearer_request(self) -> None:
+        """F-A regression: with a bearer verifier composed alongside the cookie one, a valid bearer
+        plus a planted blank `better-auth.session_token=` must STILL authenticate via the bearer -
+        not become AmbiguousCredentials because the cookie verifier reported a blank as present."""
+        auth = BetterAuth(verifiers=[FakeVerifier("x-bearer"), verifier()])
+        resolve = resolver_of(auth.current_session())
+
+        session = await resolve(fake_connection(x_bearer=GOOD_CREDENTIAL, cookie=f"{COOKIE}="))
+
+        assert session is not None
+        assert session.user.id == "u1", "the bearer credential must have authenticated"
+
+    @pytest.mark.anyio
+    async def test_two_real_cookies_of_one_name_still_reject_as_duplicate(self) -> None:
+        """The duplicate defence survives the blank predicate: two NON-blank same-name cookies are
+        still a malformed set."""
+        signed = sign(CAPTURED_TOKEN)
+        with pytest.raises(InvalidCredential):
+            await run(verifier(), http(cookie=f"{COOKIE}={signed}; {COOKIE}={signed}"))
+
+
+# ---------------------------------------------------------------- frame-locals hygiene (D-094)
+
+
+def _library_frames(error: BaseException) -> list[Any]:
+    """Every traceback frame that belongs to this library - the ones a reporter blames us for."""
+    frames: list[Any] = []
+    traceback = error.__traceback__
+    while traceback is not None:
+        if "fastapi_better_auth" in traceback.tb_frame.f_code.co_filename:
+            frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    return frames
+
+
+class TestFrameLocalsHygiene:
+    """The D-094 guarantee the module CLAIMS, made executable: on every refusal path the raw token
+    and signature flow BY VALUE into the helper frames that raise, so each must scrub before it
+    propagates or a Sentry-style frame-locals capture lifts a live credential out of the traceback.
+    """
+
+    def _store_for(self, scenario: str) -> FakeStore:
+        if scenario == "revoked":
+            return FakeStore()
+        if scenario == "expired":
+            return FakeStore(
+                sessions={CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN, expires_at=FAR_PAST)}
+            )
+        if scenario == "store-down":
+            return FakeStore(session_error=ConnectionError("redis down"))
+        if scenario == "user-absent":
+            return FakeStore(sessions={CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN, user=None)})
+        if scenario == "parse-fail":
+            # A valid, live session whose user payload parse_user rejects (empty id): the ONLY path
+            # that reaches _session's raise with the raw token still on that frame.
+            bad_user = stored_user(payload={"id": ""})
+            return FakeStore(
+                sessions={CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN, user=bad_user)}
+            )
+        return seeded_store()  # bad-sig
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "scenario", ["bad-sig", "revoked", "expired", "store-down", "user-absent", "parse-fail"]
+    )
+    async def test_no_refusal_path_leaves_the_token_in_a_library_frame(self, scenario: str) -> None:
+        if scenario == "bad-sig":
+            cookie_value = sign(CAPTURED_TOKEN, secret=b"a-wrong-secret-thirty-two-chars!!")
+        else:
+            cookie_value = sign(CAPTURED_TOKEN)
+        signature = cookie_value.rpartition(".")[2]
+        built = verifier(store=self._store_for(scenario))
+
+        with pytest.raises(SessionError) as caught:
+            await run(built, http(cookie=f"{COOKIE}={cookie_value}"))
+
+        frames = _library_frames(caught.value)
+        rendered = " ".join(repr(frame.f_locals) for frame in frames)
+        assert frames, "no library frame was captured; retune this probe"
+        assert CAPTURED_TOKEN not in rendered, f"the raw token survived a {scenario} frame"
+        assert signature not in rendered, f"the signature survived a {scenario} frame"
 
 
 # ---------------------------------------------------------------- the session_data warning

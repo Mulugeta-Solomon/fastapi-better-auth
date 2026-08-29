@@ -313,6 +313,63 @@ class TestParseSignedValue:
         assert signed not in caught.value.reason
 
 
+# ---------------------------------------------------------------- frame-locals hygiene (D-094)
+
+
+def _library_frames(error: BaseException) -> list[object]:
+    frames: list[object] = []
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if "fastapi_better_auth" in frame.f_code.co_filename:
+            frames.append(frame)
+        traceback = traceback.tb_next
+    return frames
+
+
+def _rendered_frames(error: BaseException) -> str:
+    frames = _library_frames(error)
+    assert frames, "no library frame was captured; retune this probe"
+    return " ".join(repr(frame.f_locals) for frame in frames)  # type: ignore[attr-defined]
+
+
+MARK = "ZZmaterialZZ"
+
+
+class TestFrameLocalsHygiene:
+    """Every frame that holds cookie material must scrub it before a raise puts it on a traceback -
+    the guarantee both parse modules claim (D-094). Covers the parse pipeline AND the resolution
+    helpers (the non-contiguous-chunk raise, the duplicate raise, the whole+chunked raise), which
+    hold the raw `pairs`/`ordered` on their frames."""
+
+    def test_a_parse_failure_leaves_no_material_in_a_library_frame(self) -> None:
+        with pytest.raises(InvalidCredential) as caught:
+            parse_signed_value(f"{MARK}.{'_' * SIGNATURE_LENGTH}")
+
+        assert MARK not in _rendered_frames(caught.value)
+
+    def test_a_non_contiguous_chunk_run_leaves_no_material_in_a_library_frame(self) -> None:
+        crafted = pairs((f"{COOKIE}.0", MARK + "A"), (f"{COOKIE}.2", MARK + "C"))
+        with pytest.raises(InvalidCredential) as caught:
+            resolve_cookie_value(crafted, COOKIE, SECURE)
+
+        assert MARK not in _rendered_frames(caught.value)
+
+    def test_a_duplicate_cookie_leaves_no_material_in_a_library_frame(self) -> None:
+        crafted = pairs((COOKIE, MARK + "one"), (COOKIE, MARK + "two"))
+        with pytest.raises(InvalidCredential) as caught:
+            resolve_cookie_value(crafted, COOKIE, SECURE)
+
+        assert MARK not in _rendered_frames(caught.value)
+
+    def test_a_whole_and_chunked_cookie_leaves_no_material_in_a_library_frame(self) -> None:
+        crafted = pairs((COOKIE, MARK + "whole"), (f"{COOKIE}.0", MARK + "chunk"))
+        with pytest.raises(InvalidCredential) as caught:
+            resolve_cookie_value(crafted, COOKIE, SECURE)
+
+        assert MARK not in _rendered_frames(caught.value)
+
+
 # ---------------------------------------------------------------- property tests (hypothesis)
 
 ARBITRARY = st.text(max_size=200)

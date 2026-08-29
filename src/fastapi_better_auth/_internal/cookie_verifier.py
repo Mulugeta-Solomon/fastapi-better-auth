@@ -214,16 +214,22 @@ class CookieVerifier:
         """Return this verifier's cookie material and CSRF snapshot, or `None` if it is absent.
 
         Reads the raw Cookie header (never `request.cookies`, which collapses duplicates) - and all
-        of them, joined, because HTTP/2 may split cookies across header lines. Presence is any
-        acceptable name being on the request; a blank value still counts, so a planted empty cookie
-        is dispatched to `verify` and refused there rather than making every request ambiguous.
+        of them, joined, because HTTP/2 may split cookies across header lines. Presence is an
+        acceptable name carrying a NON-BLANK value; a blank or whitespace-only value reads as absent
+        (the Verifier Protocol contract), or a planted empty cookie from a sibling subdomain would
+        make every composed request `AmbiguousCredentials` before any verify runs - dispatch counts
+        presence, and a blank carries no credential. Dropping blanks is safe for the duplicate
+        defence: a real cookie beside a planted blank of the same name resolves to the real one,
+        while two non-blank same-name cookies still reach the duplicate rejection in `verify`.
 
         Synchronous and non-raising. The one side effect is a single, once-only warning if the
         out-of-scope `session_data` cookie is seen (CVE-2026-67337); its value is never read.
         """
         pairs = cookie_pairs(_joined_cookie_header(connection))
         self._observe_session_data(pairs)
-        matched = tuple((name, value) for name, value in pairs if name in self._acceptable)
+        matched = tuple(
+            (name, value) for name, value in pairs if name in self._acceptable and value.strip()
+        )
         if not matched:
             return None
         facts = CsrfFacts.from_connection(connection, policy=self._csrf)
@@ -268,31 +274,42 @@ class CookieVerifier:
     async def _resolved(
         self, token: str, marker: str, user_model: type[UserModelT]
     ) -> Session[UserModelT]:
-        record = await self._looked_up(token, marker)
-        if record is None:
-            raise SessionRevoked(reason=f"no stored session for this token [{marker}]")
-        _check_expiry(record, marker)
-        stored = record.user
-        if stored is None:
-            stored = await self._looked_up_user(record.user_id, marker)
+        # This frame holds the raw token across the store/expiry/ban refusals; scrub it before any
+        # of them propagates, so a reporter capturing this frame's locals finds nothing (D-094).
+        try:
+            record = await self._looked_up(token, marker)
+            if record is None:
+                raise SessionRevoked(reason=f"no stored session for this token [{marker}]")
+            _check_expiry(record, marker)
+            stored = record.user
             if stored is None:
-                raise SessionRevoked(reason=f"the session's user is absent [{marker}]")
-        _check_ban(stored, marker)
-        return _session(record, stored, token, user_model)
+                stored = await self._looked_up_user(record.user_id, marker)
+                if stored is None:
+                    raise SessionRevoked(reason=f"the session's user is absent [{marker}]")
+            _check_ban(stored, marker)
+            return _session(record, stored, token, user_model)
+        finally:
+            token = ""
 
     async def _looked_up(self, token: str, marker: str) -> StoredSession | None:
         try:
-            return await self._store.fetch_session_by_token(token)
-        except (BetterAuthError, SessionError):
-            raise
-        except Exception:  # noqa: BLE001 - a raw store failure becomes the uniform refusal
-            failure = _store_unavailable(marker)
-        # Raised outside the handler so no __context__ links to the store's exception, and
-        # `from None` clears __cause__ (WP10 A1). The two shipped stores answer alike after this -
-        # SQL already translates to this, Redis propagated its connection error untranslated.
-        raise failure from None
+            try:
+                return await self._store.fetch_session_by_token(token)
+            except (BetterAuthError, SessionError):
+                raise
+            except Exception:  # noqa: BLE001 - a raw store failure becomes the uniform refusal
+                failure = _store_unavailable(marker)
+            # Raised outside the handler so no __context__ links to the store's exception, and
+            # `from None` clears __cause__ (WP10 A1). The two shipped stores answer alike after this
+            # - SQL already translates to this, Redis propagated its connection error untranslated.
+            raise failure from None
+        finally:
+            token = ""
 
     async def _looked_up_user(self, user_id: str, marker: str) -> StoredUser | None:
+        # No token here, and `user_id` is not a credential (it is in StoredSession's own repr), so
+        # this frame needs no scrub - only the store-parity translation the two stores' divergence
+        # requires, raised outside the handler with `from None` as in `_looked_up`.
         try:
             return await self._store.fetch_user_by_id(user_id)
         except (BetterAuthError, SessionError):
@@ -327,19 +344,28 @@ def _verify_signature(
 
     The keyring is the `BETTER_AUTH_SECRETS` rotation: a cookie signed with any current secret must
     verify. Iterating without an early return keeps the work independent of which key matched, and
-    `matched |=` accumulates so a match is never short-circuited away.
+    `matched |=` accumulates so a match is never short-circuited away. The token, the signature and
+    every derived byte string are scrubbed in `finally` - this is the frame that raises the bad-sig
+    refusal, so a reporter capturing its locals must find no credential (D-094).
     """
-    message = token.encode("utf-8")
-    presented = signature.encode("ascii")
-    matched = False
-    for secret in secrets:
-        digest = hmac.new(secret.get_secret_value().encode("utf-8"), message, hashlib.sha256)
-        expected = base64.b64encode(digest.digest())
-        matched |= hmac.compare_digest(presented, expected)
-    if not matched:
-        raise InvalidCredential(
-            reason=f"signature verifies against no configured secret [{marker}]"
-        )
+    message = presented = expected = b""
+    digest = None
+    try:
+        message = token.encode("utf-8")
+        presented = signature.encode("ascii")
+        matched = False
+        for secret in secrets:
+            digest = hmac.new(secret.get_secret_value().encode("utf-8"), message, hashlib.sha256)
+            expected = base64.b64encode(digest.digest())
+            matched |= hmac.compare_digest(presented, expected)
+        if not matched:
+            raise InvalidCredential(
+                reason=f"signature verifies against no configured secret [{marker}]"
+            )
+    finally:
+        token = signature = ""
+        message = presented = expected = b""
+        digest = None
 
 
 def _check_expiry(record: StoredSession, marker: str) -> None:
@@ -365,12 +391,17 @@ def _check_ban(user: StoredUser, marker: str) -> None:
 def _session(
     record: StoredSession, user: StoredUser, token: str, user_model: type[UserModelT]
 ) -> Session[UserModelT]:
-    return Session(
-        user=parse_user(user_model, user.payload),
-        expires_at=record.expires_at,
-        token=SecretStr(token),
-        raw=record.payload,
-    )
+    # parse_user may raise InvalidCredential from this frame, which holds the raw token; scrub it in
+    # finally. On success the token lives on only as the returned Session's masked SecretStr.
+    try:
+        return Session(
+            user=parse_user(user_model, user.payload),
+            expires_at=record.expires_at,
+            token=SecretStr(token),
+            raw=record.payload,
+        )
+    finally:
+        token = ""
 
 
 def _validated_keyring(

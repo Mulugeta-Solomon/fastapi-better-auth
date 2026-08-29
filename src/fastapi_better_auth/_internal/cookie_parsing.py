@@ -109,15 +109,18 @@ def resolve_cookie_value(
     Raises:
         InvalidCredential: For any malformed set, and (defensively) if no base has material at all.
     """
-    for base in (secure_base, plain_base):
-        if base is None:
-            continue
-        value = _value_for_base(pairs, base)
-        if value is not None:
-            return value
-    # extract only dispatches to verify when an acceptable name was present, so this is unreachable
-    # through the real entry point; refused rather than returned so a direct caller cannot get ""
-    raise InvalidCredential(reason="no session cookie material after resolution")
+    try:
+        for base in (secure_base, plain_base):
+            if base is None:
+                continue
+            value = _value_for_base(pairs, base)
+            if value is not None:
+                return value
+        # extract only dispatches when an acceptable name was present, so this is unreachable
+        # through the real entry point; refused rather than returned so no direct caller gets ""
+        raise InvalidCredential(reason="no session cookie material after resolution")
+    finally:
+        pairs = ()
 
 
 def parse_signed_value(material: str) -> ParsedCookie:
@@ -182,8 +185,8 @@ def _bases(cookie_name: str, secure_prefix: str) -> tuple[str, ...]:
 def _value_for_base(pairs: tuple[tuple[str, str], ...], base: str) -> str | None:
     """The value one base carries: a single whole cookie, its reassembled chunks, or None.
 
-    Holds cookie material in `whole`/`chunks`, so it scrubs them in `finally` before any raise can
-    put them on a traceback.
+    Holds cookie material in the `pairs` argument and in `whole`/`chunks`, so it scrubs all three
+    in `finally` before any raise can put them on a traceback (D-094).
     """
     whole = [value for name, value in pairs if name == base]
     chunks = [(int(name[len(base) + 1 :]), value) for name, value in pairs if _is_chunk(name, base)]
@@ -203,6 +206,7 @@ def _value_for_base(pairs: tuple[tuple[str, str], ...], base: str) -> str | None
             return whole[0]
         return _reassembled(chunks, base)
     finally:
+        pairs = ()
         whole.clear()
         chunks.clear()
 
@@ -212,23 +216,28 @@ def _is_chunk(name: str, base: str) -> bool:
     if not name.startswith(prefix):
         return False
     suffix = name[len(prefix) :]
-    return suffix.isdigit() and int(suffix) < MAX_CHUNKS
+    # `.isascii()` guards `int()`: `'²'.isdigit()` is True but `int('²')` raises.
+    # Unreachable via extract (acceptable_names is ASCII), but this stays safe on a direct caller.
+    return suffix.isascii() and suffix.isdigit() and int(suffix) < MAX_CHUNKS
 
 
 def _reassembled(chunks: list[tuple[int, str]], base: str) -> str:
     """Concatenate a contiguous chunk run from 0, or refuse a gap, a repeat or a missing first.
 
-    Holds the joined value in `value`, so it scrubs it in `finally` before a size-cap raise.
+    Holds the raw chunk values in `ordered`/`value`, so the contiguity check runs INSIDE the
+    scrubbed region and both are cleared in `finally` (D-094). The `chunks` argument is the same
+    list `_value_for_base` clears in its own finally, so it is not re-cleared here.
     """
     ordered = sorted(chunks, key=lambda item: item[0])
-    indices = [index for index, _ in ordered]
-    if indices != list(range(len(indices))):
-        raise InvalidCredential(
-            reason=f"the {base!r} cookie chunks are not a contiguous run from 0; a gap, a repeat or"
-            " a missing first chunk is refused"
-        )
-    value = "".join(value for _, value in ordered)
+    value = ""
     try:
+        indices = [index for index, _ in ordered]
+        if indices != list(range(len(indices))):
+            raise InvalidCredential(
+                reason=f"the {base!r} cookie chunks are not a contiguous run from 0; a gap, a"
+                " repeat or a missing first chunk is refused"
+            )
+        value = "".join(chunk_value for _, chunk_value in ordered)
         length = len(value)
         if length > MAX_COOKIE_BYTES:
             raise InvalidCredential(
