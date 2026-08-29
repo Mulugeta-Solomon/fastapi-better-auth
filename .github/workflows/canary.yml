@@ -56,7 +56,7 @@ jobs:
         version: ["1.6.30", "1.7.1", "latest"]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1
       - name: Start harness (better-auth@${{ matrix.version }})
         run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml up --build -d --wait
       - name: Sync (dev group)
@@ -97,7 +97,7 @@ jobs:
       WHEEL_VENV: .venv-published-wheel
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1
       - name: Start harness (better-auth@${{ matrix.version }})
         run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml up --build -d --wait
       - name: Install the published wheel and the conformance lane's test dependencies
