@@ -7,6 +7,7 @@ import re
 
 FINGERPRINT_LENGTH = 8
 LABEL_PATTERN = re.compile(r"[A-Za-z0-9_.:+-]{1,64}")
+ORIGIN_PATTERN = re.compile(r"[A-Za-z0-9_.:/\[\]+-]{1,128}")
 REDACTED = "<redacted>"
 
 
@@ -32,5 +33,23 @@ def safe_label(value: object) -> str:
     `parse_user` applies to a payload-chosen field path (D-069), for the same reason.
     """
     if not isinstance(value, str) or not LABEL_PATTERN.fullmatch(value):
+        return REDACTED
+    return value
+
+
+def safe_origin(value: object) -> str:
+    """Render an attacker-supplied `Origin` for a log line, or refuse to.
+
+    `safe_label` cannot serve here: an origin contains `//`, which its pattern excludes, so
+    every rejected origin would render `<redacted>` and an operator would never learn which
+    origin to add to their allowlist. This is the same control one notch wider - the slash and
+    the brackets an IPv6 literal needs, and a longer cap - and it is deliberately still an
+    allowlist of characters rather than a denylist of dangerous ones.
+
+    It is **not** a credential sanitizer. An `Origin` is a public value a browser serializes
+    from the page's own URL; a token passed through here would render verbatim, exactly as it
+    would through `safe_label`.
+    """
+    if not isinstance(value, str) or not ORIGIN_PATTERN.fullmatch(value):
         return REDACTED
     return value
