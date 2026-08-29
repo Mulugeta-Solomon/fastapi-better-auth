@@ -190,9 +190,24 @@ def test_the_snapshot_renders_no_submitted_token() -> None:
 
 
 def test_a_hostile_origin_is_redacted_from_the_snapshot_rendering() -> None:
-    captured = facts(origin='https://evil\n2026-01-01 CRITICAL forged"')
+    """The origin field specifically - every OTHER field is a clean value, so the `<redacted>`
+    that has to appear can only have come from `safe_origin(origin)`. A weaker version of this
+    passed with `method`/`sec_fetch_site`/`header_name` left None, each of which renders
+    `<redacted>` on its own - so the assertion held even when the origin rendered raw."""
+    hostile = 'https://evil\n2026-01-01 CRITICAL forged"'
+    captured = facts(
+        method="POST",
+        origin=hostile,
+        sec_fetch_site="same-origin",
+        header_name="x-csrf-token",
+        header_value=TOKEN,
+    )
 
-    assert REDACTED in repr(captured)
+    rendered = repr(captured)
+
+    assert "forged" not in rendered, "the hostile origin was rendered raw into the repr"
+    assert "CRITICAL" not in rendered
+    assert REDACTED in rendered
 
 
 @pytest.mark.parametrize("method", SAFE)
@@ -234,13 +249,19 @@ def test_a_cross_origin_post_is_refused_even_with_a_good_session_token() -> None
 
 
 def test_a_cross_site_websocket_handshake_is_refused() -> None:
-    """The second load-bearing RED: a GET, and still checked (CSWSH)."""
+    """The second load-bearing RED: a GET handshake, checked ONLY because it is a WebSocket.
+
+    `method="GET"` is a safe method, so the websocket branch of `requires_check` is the sole
+    thing that makes this request checkable - delete that branch and this refusal turns into a
+    silent pass. `method=None` would have hidden that behind the fail-closed no-method path."""
     with pytest.raises(CsrfFailure):
-        origin_check().check(facts(method=None, origin=EVIL, websocket=True), TOKEN)
+        origin_check().check(facts(method="GET", origin=EVIL, websocket=True), TOKEN)
 
 
 def test_a_same_origin_websocket_handshake_passes() -> None:
-    origin_check().check(facts(method=None, origin=APP, websocket=True), TOKEN)
+    """A real handshake is a GET; it is checked because it is a WebSocket, and it passes here
+    because its Origin is on the allowlist."""
+    origin_check().check(facts(method="GET", origin=APP, websocket=True), TOKEN)
 
 
 @pytest.mark.parametrize(
@@ -305,6 +326,36 @@ def test_a_non_ascii_origin_is_refused_rather_than_crashing_the_comparison() -> 
     """`compare_digest` raises `TypeError` on a non-ASCII `str`; a refusal must stay a 403."""
     with pytest.raises(CsrfFailure):
         origin_check().check(facts(origin="https://éxample.com"), TOKEN)
+
+
+# The `errors="replace"` codec contract (D-126), pinned directly. `é` above encodes cleanly,
+# so it never exercises the *substitution* path - a lone surrogate does. Starlette latin-1-decodes
+# header bytes, so no real request can carry one; the snapshot is built by hand on purpose, which
+# is the honest scope for a defense-in-depth codec guarantee. With plain `.encode("utf-8")` both
+# of these raise `UnicodeEncodeError` instead of the 403 the wire shape promises.
+UNENCODABLE = "https://\ud800.example"
+"""A lone high surrogate: a valid `str`, with no UTF-8 encoding, so `.encode("utf-8")` raises."""
+
+
+def test_an_unencodable_origin_stays_a_403_and_never_a_unicode_error() -> None:
+    with pytest.raises(CsrfFailure) as caught:
+        origin_check().check(facts(origin=UNENCODABLE), TOKEN)
+
+    assert not isinstance(
+        caught.value, UnicodeEncodeError
+    )  # a UnicodeError would not be caught here
+    assert caught.value.status_code == 403
+
+
+def test_an_unencodable_submitted_token_stays_a_403_and_never_a_unicode_error() -> None:
+    """The second codec site: the submitted header value, not the Origin."""
+    policy = double_submit()
+
+    with pytest.raises(CsrfFailure) as caught:
+        policy.check(facts(header_name=DEFAULT_TOKEN_HEADER, header_value="\ud800forged"), TOKEN)
+
+    assert not isinstance(caught.value, UnicodeEncodeError)
+    assert caught.value.status_code == 403
 
 
 def test_one_of_several_allowed_origins_passes() -> None:
@@ -401,8 +452,10 @@ def test_the_signed_policy_skips_a_safe_method(method: str) -> None:
 
 
 def test_a_cross_site_websocket_handshake_is_refused_by_the_signed_policy() -> None:
+    """A GET handshake, checked ONLY because it is a WebSocket - the signed policy's twin of
+    the OriginCheck case. `method="GET"` isolates the websocket branch."""
     with pytest.raises(CsrfFailure):
-        double_submit().check(facts(method=None, origin=EVIL, websocket=True), TOKEN)
+        double_submit().check(facts(method="GET", origin=EVIL, websocket=True), TOKEN)
 
 
 def test_the_token_helper_is_stable_hex_and_bound_to_both_inputs() -> None:
@@ -677,7 +730,7 @@ def refusals() -> tuple[tuple[str, CsrfPolicy, CsrfFacts], ...]:
             signed,
             facts(header_name=DEFAULT_TOKEN_HEADER, header_value=signed.token_for(OTHER_TOKEN)),
         ),
-        ("cswsh", origin_check(), facts(method=None, origin=EVIL, websocket=True)),
+        ("cswsh", origin_check(), facts(method="GET", origin=EVIL, websocket=True)),
     )
 
 
