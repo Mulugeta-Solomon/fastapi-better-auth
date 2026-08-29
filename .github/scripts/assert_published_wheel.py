@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Assert the library under test is the wheel installed from the package index.
 
 Exits non-zero unless the imported module lives in site-packages, outside the checkout,

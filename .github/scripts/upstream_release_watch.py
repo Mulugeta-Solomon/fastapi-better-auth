@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Report whether better-auth published its current `latest` inside a lookback window.
 
 Reads the npm registry only: the answer is derived from the publish timestamp the registry
