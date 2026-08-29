@@ -7,6 +7,7 @@ verified here. Everything importable from this module is public API; everything 
 See https://github.com/Mulugeta-Solomon/fastapi-better-auth for status.
 """
 
+from ._internal.cookie_verifier import CookieVerifier
 from ._internal.core import BetterAuth
 from ._internal.csrf import (
     CsrfDisabled,
@@ -59,6 +60,7 @@ __all__ = [
     "BetterAuthError",
     "ConfigurationError",
     "ContentEncodingRejected",
+    "CookieVerifier",
     "CsrfDisabled",
     "CsrfFacts",
     "CsrfFailure",
