@@ -107,7 +107,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--window-hours",
         type=float,
         default=26.0,
-        help="fire when latest was published this recently (default: 26)",
+        help=(
+            "fire when latest was published this recently (default: 26). Deliberately wider "
+            "than the 24h tick: GitHub cron delivery is best-effort, and a release landing "
+            "near a tick firing two idempotent sweeps beats a delayed tick missing one."
+        ),
     )
     parser.add_argument("--timeout", type=float, default=30.0, help="per-attempt seconds")
     parser.add_argument("--attempts", type=int, default=3, help="registry read attempts")

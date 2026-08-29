@@ -43,7 +43,7 @@ jobs:
           fi
 
   conformance:
-    name: better-auth@${{ matrix.version }}
+    name: HEAD vs better-auth@${{ matrix.version }}
     needs: upstream-check
     if: >-
       ${{ !cancelled()
@@ -73,7 +73,7 @@ jobs:
         run: |
           TITLE="canary: conformance failure against better-auth@${{ matrix.version }}"
           gh label create canary --color D93F0B --description "automated conformance canary" 2>/dev/null || true
-          EXISTING=$(gh issue list --state open --label canary --json title --jq ".[].title" | grep -Fx "$TITLE" || true)
+          EXISTING=$(gh issue list --state open --label canary --limit 100 --json title --jq ".[].title" | grep -Fx "$TITLE" || true)
           if [ -z "$EXISTING" ]; then
             gh issue create --title "$TITLE" --label canary --body "The e2e conformance lane failed against better-auth@${{ matrix.version }}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           fi
