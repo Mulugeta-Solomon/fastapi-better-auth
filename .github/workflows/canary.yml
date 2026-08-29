@@ -2,7 +2,11 @@ name: canary
 
 on:
   schedule:
+    # Weekly backstop: the full matrix runs whether or not upstream moved.
     - cron: "0 6 * * 1"
+    # Daily upstream watch. This literal is repeated in the upstream-check `if` below
+    # (job-level `if` cannot read the `env` context); the two must stay identical.
+    - cron: "37 18 * * *"
   workflow_dispatch:
 
 permissions:
@@ -10,8 +14,41 @@ permissions:
   issues: write
 
 jobs:
+  upstream-check:
+    # Only the daily watch narrows the sweep. The weekly cron and manual dispatch skip this
+    # job, and a failure here widens the sweep rather than cancelling it - see the gates below.
+    name: upstream release watch
+    if: github.event_name == 'schedule' && github.event.schedule == '37 18 * * *'
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.watch.outputs.should-run }}
+      latest: ${{ steps.watch.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Did better-auth publish a release in the last 26 hours?
+        id: watch
+        run: python3 .github/scripts/upstream_release_watch.py --window-hours 26
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="canary: upstream release watch cannot read the npm registry"
+          BODY="The daily watch could not decide whether better-auth published a release. Today's sweep ran anyway - the gates fail open - so this is not a missed canary, but the watch is no longer narrowing anything and every daily tick will now run the full matrix until it is fixed. Run: ${RUN_URL}"
+          gh label create canary --color D93F0B --description "automated conformance canary" 2>/dev/null || true
+          EXISTING=$(gh issue list --state open --label canary --limit 100 --json title --jq ".[].title" | grep -Fx "$TITLE" || true)
+          if [ -z "$EXISTING" ]; then
+            gh issue create --title "$TITLE" --label canary --body "$BODY"
+          fi
+
   conformance:
-    name: better-auth@${{ matrix.version }}
+    name: HEAD vs better-auth@${{ matrix.version }}
+    needs: upstream-check
+    if: >-
+      ${{ !cancelled()
+      && (needs.upstream-check.result != 'success'
+      || needs.upstream-check.outputs.should-run == 'true') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -30,13 +67,73 @@ jobs:
         if: failure()
         run: docker compose -f harness/docker-compose.yml logs
       - name: Open issue on failure
-        if: failure()
+        if: failure() || cancelled()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TITLE="canary: conformance failure against better-auth@${{ matrix.version }}"
           gh label create canary --color D93F0B --description "automated conformance canary" 2>/dev/null || true
-          EXISTING=$(gh issue list --state open --label canary --json title --jq ".[].title" | grep -Fx "$TITLE" || true)
+          EXISTING=$(gh issue list --state open --label canary --limit 100 --json title --jq ".[].title" | grep -Fx "$TITLE" || true)
           if [ -z "$EXISTING" ]; then
             gh issue create --title "$TITLE" --label canary --body "The e2e conformance lane failed against better-auth@${{ matrix.version }}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
+
+  published-wheel:
+    # The wheel users actually install, from the index, against the same harness matrix.
+    # Nothing here may install the checkout: no `uv sync`, no `uv run`, no editable install.
+    name: published wheel vs better-auth@${{ matrix.version }}
+    needs: upstream-check
+    if: >-
+      ${{ !cancelled()
+      && (needs.upstream-check.result != 'success'
+      || needs.upstream-check.outputs.should-run == 'true') }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["1.6.30", "1.7.1", "latest"]
+    env:
+      # Never `.venv`: uv adopts that name as the project environment.
+      WHEEL_VENV: .venv-published-wheel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Start harness (better-auth@${{ matrix.version }})
+        run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml up --build -d --wait
+      - name: Install the published wheel and the conformance lane's test dependencies
+        run: |
+          uv venv --python 3.13 "$WHEEL_VENV"
+          uv pip install --python "$WHEEL_VENV/bin/python" --refresh \
+            --index-url https://pypi.org/simple/ \
+            "fastapi-better-auth-bridge[httpx,httpx2]" "pytest>=8" "trio>=0.27"
+      - name: Instrument liveness — the library under test must be the installed wheel
+        id: guard
+        run: |
+          "$WHEEL_VENV/bin/python" .github/scripts/assert_published_wheel.py
+      - name: Conformance lane (published wheel)
+        id: conformance
+        run: |
+          "$WHEEL_VENV/bin/python" -m pytest tests/e2e -m e2e -q
+      - name: Harness logs
+        if: failure()
+        run: docker compose -f harness/docker-compose.yml logs
+      - name: Open issue on failure
+        if: failure() || cancelled()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WHEEL_VERSION: ${{ steps.guard.outputs.version || 'unknown' }}
+          CONFORMANCE_OUTCOME: ${{ steps.conformance.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$CONFORMANCE_OUTCOME" = "failure" ]; then
+            TITLE="canary: published wheel ${WHEEL_VERSION} fails conformance against better-auth@${{ matrix.version }}"
+            BODY="fastapi-better-auth-bridge ${WHEEL_VERSION}, installed from PyPI, failed the e2e conformance lane against better-auth@${{ matrix.version }}. This is the artifact users have, not HEAD. Run: ${RUN_URL}"
+          else
+            TITLE="canary: published-wheel lane cannot run against better-auth@${{ matrix.version }}"
+            BODY="The published-wheel lane failed before it tested anything - harness startup, the PyPI install, or the instrument-liveness guard. Until this is fixed the lane proves nothing about the shipped wheel. Run: ${RUN_URL}"
+          fi
+          gh label create canary --color D93F0B --description "automated conformance canary" 2>/dev/null || true
+          EXISTING=$(gh issue list --state open --label canary --limit 100 --json title --jq ".[].title" | grep -Fx "$TITLE" || true)
+          if [ -z "$EXISTING" ]; then
+            gh issue create --title "$TITLE" --label canary --body "$BODY"
           fi
