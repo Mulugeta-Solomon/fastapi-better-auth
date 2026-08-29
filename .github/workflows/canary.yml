@@ -2,7 +2,11 @@ name: canary
 
 on:
   schedule:
+    # Weekly backstop: the full matrix runs whether or not upstream moved.
     - cron: "0 6 * * 1"
+    # Daily upstream watch. This literal is repeated in the upstream-check `if` below
+    # (job-level `if` cannot read the `env` context); the two must stay identical.
+    - cron: "37 18 * * *"
   workflow_dispatch:
 
 permissions:
@@ -10,8 +14,28 @@ permissions:
   issues: write
 
 jobs:
+  upstream-check:
+    # Only the daily watch is gated on upstream activity. The weekly cron and manual
+    # dispatch skip this job, so a red or slow npm registry never suppresses them.
+    name: upstream release watch
+    if: github.event_name == 'schedule' && github.event.schedule == '37 18 * * *'
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.watch.outputs.should-run }}
+      latest: ${{ steps.watch.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Did better-auth publish a release in the last 26 hours?
+        id: watch
+        run: python3 .github/scripts/upstream_release_watch.py --window-hours 26
+
   conformance:
     name: better-auth@${{ matrix.version }}
+    needs: upstream-check
+    if: >-
+      ${{ !cancelled()
+      && (needs.upstream-check.result == 'skipped'
+      || needs.upstream-check.outputs.should-run == 'true') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -45,6 +69,11 @@ jobs:
     # The wheel users actually install, from the index, against the same harness matrix.
     # Nothing here may install the checkout: no `uv sync`, no `uv run`, no editable install.
     name: published wheel vs better-auth@${{ matrix.version }}
+    needs: upstream-check
+    if: >-
+      ${{ !cancelled()
+      && (needs.upstream-check.result == 'skipped'
+      || needs.upstream-check.outputs.should-run == 'true') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
