@@ -24,7 +24,7 @@ jobs:
       should-run: ${{ steps.watch.outputs.should-run }}
       latest: ${{ steps.watch.outputs.latest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Did better-auth publish a release in the last 26 hours?
         id: watch
         run: python3 .github/scripts/upstream_release_watch.py --window-hours 26
@@ -55,8 +55,8 @@ jobs:
       matrix:
         version: ["1.6.30", "1.7.1", "latest"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
       - name: Start harness (better-auth@${{ matrix.version }})
         run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml up --build -d --wait
       - name: Sync (dev group)
@@ -96,8 +96,8 @@ jobs:
       # Never `.venv`: uv adopts that name as the project environment.
       WHEEL_VENV: .venv-published-wheel
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
       - name: Start harness (better-auth@${{ matrix.version }})
         run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml up --build -d --wait
       - name: Install the published wheel and the conformance lane's test dependencies
