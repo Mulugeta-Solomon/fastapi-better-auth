@@ -326,6 +326,26 @@ class TestConstruction:
         with pytest.raises(ConfigurationError, match="url"):
             RedisSessionStore()
 
+    @pytest.mark.parametrize(
+        "cap", [0, -1, 1.5, True, "8192"], ids=["zero", "negative", "float", "bool", "string"]
+    )
+    def test_a_cap_that_could_not_admit_a_value_is_refused(self, cap: Any) -> None:
+        """A cap below one refuses every stored value - a total authentication outage that
+        startup would otherwise call healthy."""
+        with pytest.raises(ConfigurationError, match="max_bytes"):
+            RedisSessionStore(client=RecordingRedis(), max_bytes=cap)
+
+    def test_a_refused_argument_never_gets_as_far_as_building_a_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ordering, pinned: a refusal after the client was built would leave a connection pool
+        nobody holds and nobody closes. Blocking the import proves the build never happened."""
+        monkeypatch.setitem(sys.modules, "redis", None)
+        monkeypatch.setitem(sys.modules, "redis.asyncio", None)
+
+        with pytest.raises(ConfigurationError, match="key_prefix"):
+            RedisSessionStore(url="redis://localhost:56379/0", key_prefix=7)  # type: ignore[arg-type]
+
     def test_a_prefix_that_is_not_a_string_is_refused(self) -> None:
         """It is concatenated onto the token to form the key; a non-string would either raise
         on the first request or, worse, stringify into a key nobody meant."""

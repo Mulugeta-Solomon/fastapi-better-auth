@@ -53,7 +53,7 @@ lockfile and would never exercise a floor.
 | `starlette` | `>=1.3.1` |
 | `pydantic` | `>=2.7` |
 | `pyjwt[crypto]` | `>=2.10` |
-| `anyio` | `>=4` |
+| `anyio` | `>=4.1` |
 | `httpx` (extra `[httpx]`) | `>=0.27` |
 | `httpx2` (extra `[httpx2]`) | `>=2.0` |
 | `sqlalchemy[asyncio]` (extra `[sqlalchemy]`) | `>=2.0` |
@@ -68,6 +68,11 @@ replaced emits a warning this project treats as an error.
 
 A database driver is deliberately *not* a floor of ours: which one a deployment uses is its own
 decision, and pinning one here would be this library choosing it.
+
+`anyio`'s floor moved from `>=4` to `>=4.1` with the stores. `SyncStoreAdapter` is the first thing
+here to call `anyio.to_thread.run_sync`, and anyio 4.0's Trio backend passes a `cancellable=`
+argument Trio removed in 0.23 — so on Trio it raises `TypeError` rather than running the query.
+The floor-resolution lane is what found it.
 
 ## What a release of this library may change
 

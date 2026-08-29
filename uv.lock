@@ -516,7 +516,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anyio", specifier = ">=4" },
+    { name = "anyio", specifier = ">=4.1" },
     { name = "exceptiongroup", marker = "python_full_version < '3.11'", specifier = ">=1.2" },
     { name = "fastapi", specifier = ">=0.133" },
     { name = "httpx", marker = "extra == 'httpx'", specifier = ">=0.27" },

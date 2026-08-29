@@ -57,6 +57,15 @@ def _validated_prefix(key_prefix: object) -> str:
     return key_prefix
 
 
+def _validated_cap(max_bytes: object) -> int:
+    """A cap below one refuses every stored value, silently and forever."""
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+        raise ConfigurationError(
+            f"max_bytes must be a positive integer number of bytes; got {max_bytes!r}."
+        )
+    return max_bytes
+
+
 def _import_redis() -> Any:
     try:
         from redis.asyncio import Redis
@@ -115,7 +124,9 @@ class RedisSessionStore:
 
     Raises:
         ConfigurationError: If neither `url` nor `client` is given, if both are, if `key_prefix`
-            is not a string, or if `url` was given and the `redis` package is not installed.
+            is not a string, if `max_bytes` is not a positive integer, or if `url` was given and
+            the `redis` package is not installed. Every one of these is checked before a client
+            is built, so a refused construction leaves no pool behind.
     """
 
     def __init__(
@@ -130,12 +141,14 @@ class RedisSessionStore:
             raise ConfigurationError(NEITHER)
         if url is not None and client is not None:
             raise ConfigurationError(BOTH)
+        # Every argument is checked before a client is built: a refusal after that point would
+        # leave a connection pool nobody holds a reference to and nobody closes.
+        self._prefix = _validated_prefix(key_prefix)
+        self._max_bytes = _validated_cap(max_bytes)
         built = None if client is not None else _import_redis().from_url(url)
         # Only a client this store BUILT is ever closed; a borrowed pool is not ours to shut.
         self._built: Any | None = built
         self._client: _Client = cast("_Client", client if client is not None else built)
-        self._prefix = _validated_prefix(key_prefix)
-        self._max_bytes = max_bytes
 
     async def fetch_session_by_token(self, token: str) -> StoredSession | None:
         """The session stored under this raw token, with its user.
