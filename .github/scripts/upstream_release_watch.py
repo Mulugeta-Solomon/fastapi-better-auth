@@ -11,6 +11,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -20,6 +21,7 @@ from typing import Any, NoReturn
 
 REGISTRY_URL = "https://registry.npmjs.org/better-auth"
 USER_AGENT = "fastapi-better-auth-bridge-canary"
+VERSION = re.compile(r"^[0-9A-Za-z._+-]{1,64}$")
 
 
 def fail(message: str) -> NoReturn:
@@ -28,6 +30,10 @@ def fail(message: str) -> NoReturn:
 
 
 def emit_output(name: str, value: str) -> None:
+    """One `name=value` line, or none. A newline here forges arbitrary step outputs."""
+    for part, what in ((name, "name"), (value, "value")):
+        if "\n" in part or "\r" in part:
+            fail(f"refusing to write a step output whose {what} spans lines: {part!r}")
     destination = os.environ.get("GITHUB_OUTPUT")
     if not destination:
         return
@@ -82,6 +88,9 @@ def latest_release(document: dict[str, Any]) -> tuple[str, dt.datetime]:
     latest = tags.get("latest")
     if not isinstance(latest, str) or not latest:
         fail("registry dist-tags carries no latest version")
+    # Everything downstream - annotations, the summary, step outputs - embeds this string.
+    if not VERSION.fullmatch(latest):
+        fail(f"registry dist-tags.latest is not a plausible version: {latest!r}")
     times = document.get("time")
     if not isinstance(times, dict):
         fail("registry document carries no time map")

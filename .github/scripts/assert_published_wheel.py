@@ -22,7 +22,14 @@ CHECKOUT_SRC = REPO_ROOT / "src"
 
 
 def emit_output(name: str, value: str) -> None:
-    """Publish a step output so a later step can name the artifact that was tested."""
+    """Publish a step output so a later step can name the artifact that was tested.
+
+    One `name=value` line, or none: a newline in a version string read out of installed
+    metadata would forge arbitrary step outputs.
+    """
+    for part, what in ((name, "name"), (value, "value")):
+        if "\n" in part or "\r" in part:
+            raise SystemExit(f"::error::refusing a step output whose {what} spans lines: {part!r}")
     destination = os.environ.get("GITHUB_OUTPUT")
     if not destination:
         return
