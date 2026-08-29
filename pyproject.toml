@@ -8,7 +8,7 @@ module-name = "fastapi_better_auth"
 
 [project]
 name = "fastapi-better-auth-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Verify Better Auth (TypeScript) sessions from FastAPI. A bridge, not a Python port."
 readme = "README.md"
 requires-python = ">=3.10"
