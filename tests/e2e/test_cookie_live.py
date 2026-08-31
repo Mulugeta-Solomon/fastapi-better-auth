@@ -26,14 +26,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from fastapi_better_auth import (
     BetterAuth,
-    CsrfDisabled,
     HttpxTransport,
-    OriginCheck,
     Session,
     SharedSecret,
     User,
 )
-from fastapi_better_auth._internal.cookie_verifier import CookieVerifier
 from fastapi_better_auth._internal.jwt_verifier import JwtVerifier
 from tests.fakes import session_app
 
@@ -49,10 +46,19 @@ from .conftest import (
 )
 
 try:
-    from fastapi_better_auth import RedisSessionStore, SqlAlchemySessionStore
+    # Every name Mode A added after 0.1.0 belongs in here, not above: the canary's
+    # published-wheel leg installs the last release, and one unguarded post-release import
+    # raises before this guard is reached, killing the lane it exists to keep green.
+    from fastapi_better_auth import (
+        CsrfDisabled,
+        OriginCheck,
+        RedisSessionStore,
+        SqlAlchemySessionStore,
+    )
+    from fastapi_better_auth._internal.cookie_verifier import CookieVerifier
 except ImportError:
     pytest.skip(
-        "this build of fastapi-better-auth-bridge publishes no session stores",
+        "this build of fastapi-better-auth-bridge publishes no cookie mode",
         allow_module_level=True,
     )
 
