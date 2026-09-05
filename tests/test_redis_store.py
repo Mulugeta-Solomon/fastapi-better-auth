@@ -50,10 +50,27 @@ EXTRA = "fastapi-better-auth-bridge[redis]"
 FAR_FUTURE_ISO = "2999-01-01T00:00:00.000Z"
 VERIFIER_SECRET = SharedSecret("Qb8Xm2vTz6Lp1RkYd9Wn4Hs7Cj3Fg5Ae")
 
+NESTING = sys.getrecursionlimit() * 4
+NESTED_BOMB = "[" * NESTING + "]" * NESTING
+"""A few kilobytes - far under the byte cap - and deeper than json's recursive scanner goes."""
+
+LONE_SURROGATE_TOKEN = chr(0xD800) + "abc"
+"""An unpaired surrogate: a `str` Python holds happily and cannot encode as UTF-8.
+
+Spelled with `chr` rather than an escape so the file itself stays encodable. `json.dumps`
+writes it as an escape, so the stored value is ASCII and only the *parsed* token carries it -
+which is exactly how it arrives from a real Redis holding what some other writer put there.
+"""
+
 
 def store_over(**values: str) -> tuple[RedisSessionStore, RecordingRedis]:
     client = RecordingRedis(values)
     return RedisSessionStore(client=client), client
+
+
+def _labelled(value: object) -> str:
+    """Name a case by its label and never by its stored value: some of them are kilobytes."""
+    return value if isinstance(value, str) and len(value) <= 24 else "value"
 
 
 def _minus(key: str) -> dict[str, Any]:
@@ -216,7 +233,10 @@ class TestMalformedValues:
             ("banned-not-a-boolean", stored(user=wire_user(banned="yes"))),
             ("banned-a-number", stored(user=wire_user(banned=1))),
             ("ban-expiry-not-a-date", stored(user=wire_user(banExpires="whenever"))),
+            ("deeply-nested", NESTED_BOMB),
+            ("surrogate-token", stored(session=wire_session(token=LONE_SURROGATE_TOKEN))),
         ],
+        ids=_labelled,
     )
     async def test_it_is_a_miss(
         self, label: str, value: str, caplog: pytest.LogCaptureFixture
