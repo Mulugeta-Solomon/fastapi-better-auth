@@ -34,11 +34,12 @@ class TestCookieHeaderCaps:
         assert credential is not None
 
     def test_a_header_over_the_byte_cap_reads_as_absent(self) -> None:
-        """A valid cookie buried under a header padded past the cap is not parsed - the whole
-        header is refused before `cookie_pairs`, so the real credential is never reached."""
-        real = f"{COOKIE}={sign(CAPTURED_TOKEN)}"
-        padding = "; ".join(f"pad{i}=x" for i in range(MAX_COOKIE_HEADER_BYTES // 8))
-        oversized = f"{real}; {padding}"
+        """A single cookie under the accepted name whose value pushes the header past the cap is
+        refused before `cookie_pairs`. One pair, well under the pair count, and the name IS
+        accepted - so the byte cap is the only rung that can fire (removing it makes this present,
+        which the pair-count test cannot detect)."""
+        oversized = f"{COOKIE}={'a' * (MAX_COOKIE_HEADER_BYTES + 100)}"
+        assert oversized.count(";") == 0
         assert len(oversized) > MAX_COOKIE_HEADER_BYTES
 
         assert verifier().extract(http(cookie=oversized)) is None
