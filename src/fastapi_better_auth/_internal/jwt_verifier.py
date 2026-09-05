@@ -31,6 +31,26 @@ MAX_LEEWAY = 60.0
 MAX_LIFETIME = 86400.0
 MAX_TOKEN_BYTES = 8192
 DOT_SEPARATORS = 2
+AUTHORIZATION = "authorization"
+
+
+class _AmbiguousBearer:
+    """What `extract` returns when more than one `Authorization` header arrived.
+
+    `Authorization` is a single-credential header, not a comma-list one (RFC 7230 3.2.2), so two
+    of them is a request no client should send. Returning `None` would silently drop the
+    credential and let the request through as anonymous; returning this marker instead makes
+    dispatch count it as one present credential that `verify` refuses (a terminal 401), the same
+    shape the cookie side uses for a present-but-malformed cookie (D-192).
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<ambiguous bearer: more than one Authorization header>"
+
+
+_AMBIGUOUS_BEARER = _AmbiguousBearer()
 
 
 class JwtVerifier:
@@ -161,7 +181,7 @@ class JwtVerifier:
         """The HTTP boundary the key set is fetched through."""
         return self._transport
 
-    def extract(self, connection: HTTPConnection) -> str | None:
+    def extract(self, connection: HTTPConnection) -> str | _AmbiguousBearer | None:
         """Return the bearer token on this request, or `None` if there is not one.
 
         Structural only: the `Authorization` header, the `Bearer` scheme matched
@@ -171,8 +191,16 @@ class JwtVerifier:
         A blank token is *absent*, not present: an empty `Authorization: Bearer` header would
         otherwise be a credential, and an anonymous request carrying one would be refused by
         `current_session` and made ambiguous for anyone composing two verifiers.
+
+        More than one `Authorization` header is a request no client should send (the header
+        carries a single credential, not a comma-list), so it is a present-but-malformed
+        credential: a marker `verify` turns into a refusal, rather than the first of the two
+        being taken silently.
         """
-        header = connection.headers.get("authorization")
+        headers = connection.headers.getlist(AUTHORIZATION)
+        if len(headers) > 1:
+            return _AMBIGUOUS_BEARER
+        header = headers[0] if headers else None
         if not header:
             return None
         scheme, separator, rest = header.partition(" ")
@@ -180,11 +208,14 @@ class JwtVerifier:
             return None
         return rest.strip() or None
 
-    async def verify(self, credential: str, user_model: type[UserModelT]) -> Session[UserModelT]:
+    async def verify(
+        self, credential: str | _AmbiguousBearer, user_model: type[UserModelT]
+    ) -> Session[UserModelT]:
         """Verify a bearer token and build the session it proves.
 
         Args:
-            credential: The token this verifier's own `extract` returned.
+            credential: The token this verifier's own `extract` returned, or the marker it
+                returns for a request carrying more than one `Authorization` header.
             user_model: The `User` subclass to parse the claims into.
 
         Returns:
@@ -193,13 +224,20 @@ class JwtVerifier:
             `raw` is the decoded claims exactly as they arrived.
 
         Raises:
-            InvalidCredential: For anything structurally or cryptographically wrong.
+            InvalidCredential: For anything structurally or cryptographically wrong, and for a
+                request that carried more than one `Authorization` header.
             SessionExpired: When `exp` has elapsed beyond `leeway`.
             AuthServiceUnavailable: When the key set could not be fetched or trusted. Still a
                 refusal: a session this library cannot verify is one it must not honour.
         """
-        token = credential
+        token = ""
         try:
+            if isinstance(credential, _AmbiguousBearer):
+                raise InvalidCredential(
+                    reason="more than one Authorization header on one request; a bearer"
+                    " credential is carried by exactly one"
+                )
+            token = credential
             marker = _checked_shape(token)
             header = _unverified_header(token, marker)
             _no_critical_extensions(header, marker)
