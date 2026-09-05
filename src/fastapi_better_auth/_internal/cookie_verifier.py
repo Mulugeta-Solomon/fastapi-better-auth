@@ -409,10 +409,9 @@ def _check_ban(user: StoredUser, marker: str) -> None:
 def _session(
     record: StoredSession, user: StoredUser, token: str, user_model: type[UserModelT]
 ) -> Session[UserModelT]:
-    # parse_user may raise InvalidCredential from this frame, which holds the raw token three
-    # times: in `token`, inside `record`, and inside the session payload, whose `token` column is
-    # upstream's own (D-181). The record is dropped and the other two scrubbed in finally; the
-    # constructed Session keeps its own references, so only the locals are cleared.
+    # The raw token is in this frame three times - `token`, inside `record`, and inside the
+    # payload under upstream's own `token` column - and all three must be gone before it
+    # exits, on the refusal path as well as the return (D-181).
     expires_at = record.expires_at
     raw: Mapping[str, Any] = record.payload
     del record
