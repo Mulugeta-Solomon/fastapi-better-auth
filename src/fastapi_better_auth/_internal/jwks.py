@@ -24,6 +24,7 @@ MAX_JWKS_BYTES = 64 * 1024
 MAX_KEYS = 32
 CACHE_TTL = 300.0
 MIN_CACHE_TTL = 60.0
+MIN_RSA_KEY_BITS = 2048
 NEGATIVE_TTL = 60.0
 REFETCH_INTERVAL = 10.0
 MAX_REMEMBERED_MISSES = 256
@@ -279,8 +280,26 @@ class JwksClient:
             return
         if kid in keys:
             return
-        keys[kid] = Jwk(
-            kid=kid, algorithm=algorithm, key=self._loaded(loader, published, kid), jwk=published
+        declared = _not_for_verifying(published)
+        if declared is not None:
+            self._skipped(kid, declared)
+            return
+        key = self._loaded(loader, published, kid)
+        if loader is RSAAlgorithm and _rsa_bits(key) < MIN_RSA_KEY_BITS:
+            self._skipped(kid, "size")
+            return
+        keys[kid] = Jwk(kid=kid, algorithm=algorithm, key=key, jwk=published)
+
+    def _skipped(self, kid: str, why: str) -> None:
+        """One key dropped from an otherwise usable set - the correct blast radius.
+
+        Refusing the whole document would be an outage for every token; dropping this key is
+        an outage only for the tokens it signed, which then answer as an unknown `kid`.
+        """
+        logger.warning(
+            "jwks key %s is not usable for signature verification (%s); it is skipped",
+            safe_label(kid),
+            why,
         )
 
     def _loaded(self, loader: type[Algorithm], published: Mapping[str, Any], kid: str) -> Any:
@@ -291,6 +310,34 @@ class JwksClient:
 
     def _unusable(self, why: str) -> AuthServiceUnavailable:
         return AuthServiceUnavailable(reason=f"jwks at {self._uri} is unusable: {why}")
+
+
+def _not_for_verifying(published: Mapping[str, Any]) -> str | None:
+    """Which of the JWK's own declarations says this key does not check signatures, if either.
+
+    RFC 7517 4.2/4.3: `use` and `key_ops` are both optional, and absent means unrestricted -
+    upstream publishes neither, so absence has to stay usable. Present and pointing elsewhere
+    is the publisher saying so, and verifying with an encryption key anyway is using a key for
+    what its owner said it is not for. A `key_ops` that is not a list is refused rather than
+    searched: `"verify" in "verify"` is `True` for a string.
+    """
+    if "use" in published and published["use"] != "sig":
+        return "use"
+    if "key_ops" in published:
+        operations = published["key_ops"]
+        if not isinstance(operations, list) or "verify" not in cast("Sequence[object]", operations):
+            return "key_ops"
+    return None
+
+
+def _rsa_bits(key: Any) -> int:
+    """The modulus size of a loaded RSA key; 0 when the object cannot say, which skips it.
+
+    Only asked of keys an RSA loader produced - an EC key carries a `key_size` too, and it is
+    a curve size, so comparing it against an RSA floor would refuse every EC key published.
+    """
+    size: object = getattr(key, "key_size", 0)
+    return size if isinstance(size, int) else 0
 
 
 def _validated_transport(transport: object) -> Transport:

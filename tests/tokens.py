@@ -110,6 +110,23 @@ def rsa_signer(kid: str = "rs256-1", *, algorithm: str = "RS256") -> Signer:
     return Signer(kid=kid, algorithm=algorithm, private=private, jwk=published)
 
 
+WEAK_RSA_BITS = 1024
+
+
+@functools.lru_cache(maxsize=1)
+def _weak_rsa_key() -> rsa.RSAPrivateKey:
+    """An RSA key below every current floor. Generated once, for the same reason as above."""
+    return rsa.generate_private_key(public_exponent=65537, key_size=WEAK_RSA_BITS)
+
+
+def weak_rsa_signer(kid: str = "rs256-weak", *, algorithm: str = "RS256") -> Signer:
+    """A key that loads, verifies its own signatures, and is far too small to be trusted."""
+    private = _weak_rsa_key()
+    published: dict[str, Any] = dict(RSAAlgorithm.to_jwk(private.public_key(), as_dict=True))
+    published.update({"alg": algorithm, "kid": kid})
+    return Signer(kid=kid, algorithm=algorithm, private=private, jwk=published)
+
+
 def key_set(*signers: Signer, extra: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
     """The document `/api/auth/jwks` answers with, in upstream's own shape."""
     return {"keys": [dict(signer.jwk) for signer in signers] + [dict(each) for each in extra]}

@@ -14,6 +14,7 @@ obligations already have a real socket pointed at them in `tests/test_transports
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import anyio
@@ -34,16 +35,20 @@ from fastapi_better_auth._internal.jwks import (
     MAX_KEYS,
     MAX_REMEMBERED_MISSES,
     MIN_CACHE_TTL,
+    MIN_RSA_KEY_BITS,
     JwksClient,
 )
+from fastapi_better_auth._internal.reasons import REDACTED
 from tests.tokens import (
     NESTING_START,
     ORIGIN,
     Clock,
+    Signer,
     ed25519_signer,
     key_set,
     nested_arrays,
     rsa_signer,
+    weak_rsa_signer,
 )
 from tests.transports import NotATransport, Reply, ScriptedTransport, json_reply
 
@@ -52,6 +57,20 @@ ROTATED = ed25519_signer("cached-2")
 KEY_SET = key_set(SIGNER)
 DEEP_DOCUMENT = nested_arrays(min(NESTING_START, MAX_JWKS_BYTES // 2))
 """A key-set body nested deep enough to exhaust the JSON scanner, and still under the cap."""
+LIBRARY_LOGGER = "fastapi_better_auth"
+SKIP_PREFIX = "jwks key %s is not usable"
+"""The head of the skip template. Matched on the *template*, so a test asserting "one skip"
+cannot be satisfied by some other line that happens to mention the same words."""
+
+
+def _skips(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The skip lines emitted so far. Read at assert time: pytest hands each phase its own
+    record list, so a reference taken during setup would stay empty for the whole call."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == LIBRARY_LOGGER and str(record.msg).startswith(SKIP_PREFIX)
+    ]
 
 
 def client(
@@ -302,6 +321,137 @@ async def test_a_duplicated_kid_keeps_the_first_key_published() -> None:
 
     assert found is not None
     assert found.jwk["x"] == SIGNER.jwk["x"]
+
+
+# --- what a published key says about itself ---------------------------------------------
+
+
+def _published(signer: Signer, **fields: Any) -> dict[str, Any]:
+    """One JWK with extra members set on it, exactly as upstream would publish them."""
+    return {**dict(signer.jwk), **fields}
+
+
+SKIPPED: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("use", {"use": "enc"}),
+    ("use-unknown", {"use": "sig-ish"}),
+    ("use-null", {"use": None}),
+    ("key_ops", {"key_ops": ["encrypt", "decrypt"]}),
+    ("key_ops-empty", {"key_ops": []}),
+    ("key_ops-not-a-list", {"key_ops": "verify"}),
+)
+"""Every declaration that says this key is not for checking signatures. `key_ops: "verify"`
+is in here because `"verify" in "verify"` is `True` for a string - a membership test on an
+unvalidated JSON value is how a malformed key set talks its way past a list check."""
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("label", "fields"), SKIPPED, ids=[name for name, _ in SKIPPED])
+async def test_a_key_that_does_not_declare_itself_for_verification_is_skipped(
+    label: str, fields: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """SA-8. RFC 7517 4.2/4.3: `use` and `key_ops` are optional, and absent means unrestricted
+    - but *present and pointing elsewhere* is upstream saying this key does not check
+    signatures, and loading it anyway is checking signatures with an encryption key.
+
+    Skipped rather than refused, deliberately: failing the whole set for one bad key is an
+    outage for every token, while skipping is an outage only for the tokens that key signed.
+    So the answer is an unknown kid, and a line in the log saying which key and why.
+    """
+    keys, _transport = client(json_reply({"keys": [_published(SIGNER, **fields)]}))
+
+    assert await keys.key_for(SIGNER.kid) is None
+    assert len(_skips(caplog)) == 1
+
+
+@pytest.mark.anyio
+async def test_an_undersized_rsa_key_is_skipped(caplog: pytest.LogCaptureFixture) -> None:
+    """A 1024-bit RSA key loads and verifies its own signatures perfectly well, which is the
+    problem: nothing downstream would ever notice. The size is only knowable after the key
+    material is loaded, so this skip sits after the load rather than beside the declarations."""
+    weak = weak_rsa_signer("weak-1")
+    keys, _transport = client(json_reply(key_set(weak)), algorithms=("RS256",))
+
+    assert await keys.key_for(weak.kid) is None
+    assert len(_skips(caplog)) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "fields",
+    [{}, {"use": "sig"}, {"key_ops": ["verify"]}, {"use": "sig", "key_ops": ["verify", "sign"]}],
+    ids=["silent", "use-sig", "key-ops-verify", "both"],
+)
+async def test_a_key_that_declares_itself_for_verification_still_loads(
+    fields: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The over-refusal half. Upstream publishes neither member today, so a rule that read
+    absence as refusal would be an outage on the very deployment this library exists for."""
+    keys, _transport = client(json_reply({"keys": [_published(SIGNER, **fields)]}))
+
+    assert await keys.key_for(SIGNER.kid) is not None
+    assert _skips(caplog) == []
+
+
+@pytest.mark.anyio
+async def test_a_key_at_the_rsa_floor_still_loads(caplog: pytest.LogCaptureFixture) -> None:
+    """The floor is a floor, not a ceiling: 2048 is what upstream would publish."""
+    strong = rsa_signer("strong-1")
+    keys, _transport = client(json_reply(key_set(strong)), algorithms=("RS256",))
+
+    found = await keys.key_for(strong.kid)
+
+    assert found is not None
+    assert found.key.key_size == MIN_RSA_KEY_BITS
+    assert _skips(caplog) == []
+
+
+@pytest.mark.anyio
+async def test_one_bad_key_never_costs_the_rest_of_the_set(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The blast radius, stated as a test: the sibling keys in the same document keep working.
+
+    A skip that raised would turn one mispublished key into a total authentication outage,
+    which is strictly worse than the thing it is protecting against.
+    """
+    keys, _transport = client(
+        json_reply({"keys": [_published(SIGNER, use="enc"), dict(ROTATED.jwk)]})
+    )
+
+    assert await keys.key_for(ROTATED.kid) is not None
+    assert await keys.key_for(SIGNER.kid) is None
+    assert len(_skips(caplog)) == 1
+
+
+@pytest.mark.anyio
+async def test_a_skipped_key_is_reported_once_per_fetch_and_never_per_lookup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A line per lookup would be the log-amplification lever the key set is capped against;
+    the parse happens once per fetch, so the line does too."""
+    keys, transport = client(json_reply({"keys": [_published(SIGNER, use="enc")]}))
+
+    for _ in range(5):
+        assert await keys.key_for(SIGNER.kid) is None
+
+    assert transport.calls == 1
+    assert len(_skips(caplog)) == 1
+
+
+@pytest.mark.anyio
+async def test_a_skip_names_the_key_only_through_a_safe_label(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A `kid` is text upstream chose and an operator reads; the whole set is capped at 32
+    keys, so a hostile one is only reachable through a compromised key set - which is exactly
+    when a forged log line would be most useful to whoever compromised it."""
+    hostile = 'aaa"\n2026-01-01 CRITICAL root logged in'
+    keys, _transport = client(json_reply({"keys": [_published(SIGNER, kid=hostile, use="enc")]}))
+
+    assert await keys.key_for(hostile) is None
+    written = "\n".join(f"{record.getMessage()}" for record in _skips(caplog))
+    assert REDACTED in written
+    assert "CRITICAL" not in written
 
 
 # --- the cache ------------------------------------------------------------------------

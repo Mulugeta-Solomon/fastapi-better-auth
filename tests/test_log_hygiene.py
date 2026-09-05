@@ -214,6 +214,11 @@ COVERED_BY: Mapping[LogSite, str] = {
         template="jwks refresh failed for %s; serving the key set on hand",
     ): "test_a_jwks_refresh_failure_logs_no_attacker_chosen_kid",
     LogSite(
+        module="jwks",
+        level="warning",
+        template="jwks key %s is not usable for signature verification (%s); it is skipped",
+    ): "test_a_skipped_jwks_key_logs_neither_its_kid_nor_its_material",
+    LogSite(
         module="diagnostics",
         level="warning",
         template="stored %s is unusable (%s); answering a miss [%s]",
@@ -291,6 +296,18 @@ def assert_template_fired(records: list[logging.LogRecord], site: LogSite) -> No
 
 def consumer() -> logging.Logger:
     return logging.getLogger(CONSUMER_LOGGER)
+
+
+def _site(head: str) -> LogSite:
+    """The manifest entry whose template starts with `head`, and exactly one of them.
+
+    Selected on the template rather than on the module: `jwks` emits two lines now, and
+    `next(s for s in COVERED_BY if s.module == ...)` would have picked whichever one the set
+    happened to yield first - a scenario silently asserting about the other line's template.
+    """
+    found = [site for site in COVERED_BY if site.template.startswith(head)]
+    assert len(found) == 1, f"{head!r} names {len(found)} log sites, not one"
+    return found[0]
 
 
 # ---------------------------------------------------------------- the manifest is honest
@@ -501,10 +518,39 @@ async def test_a_jwks_refresh_failure_logs_no_attacker_chosen_kid(
 
     consumer().warning("key set unusable: %s", caught.value.reason)
 
-    assert_template_fired(records, next(s for s in COVERED_BY if s.module == "jwks"))
+    assert_template_fired(records, _site("jwks refresh failed"))
     assert HOSTILE_KID not in rendered(records)
     assert "forged log line" not in rendered(records)
     assert REDACTED in caught.value.reason
+
+
+@pytest.mark.anyio
+async def test_a_skipped_jwks_key_logs_neither_its_kid_nor_its_material(
+    records: list[logging.LogRecord],
+) -> None:
+    """The key-set client's other warning. A key the publisher marked `use: "enc"` is dropped
+    from the set rather than trusted to check signatures, and the line saying so names the key
+    by a sanitized `kid` and one reason word.
+
+    The material is what makes this line worth an assertion. A JWKS is supposed to carry only
+    public halves, and a server that mispublished a *private* one would be handing this
+    library the whole secret in the very entry it is about to complain about.
+    """
+    mispublished = {
+        **dict(SIGNER.jwk),
+        "kid": HOSTILE_KID,
+        "use": "enc",
+        "d": LEAKY_SECRET,
+    }
+    transport = ScriptedTransport(json_reply({"keys": [mispublished]}))
+    client = JwksClient(base_url=ORIGIN, transport=transport, algorithms=("EdDSA",))
+
+    assert await client.key_for(HOSTILE_KID) is None
+
+    assert_template_fired(records, _site("jwks key %s is not usable"))
+    assert_no_leak(records, LEAKY_SECRET, str(SIGNER.jwk["x"]))
+    assert HOSTILE_KID not in rendered(records)
+    assert "forged log line" not in rendered(records)
 
 
 @pytest.mark.anyio
@@ -518,7 +564,7 @@ async def test_a_malformed_stored_session_logs_no_token(
 
     assert await store.fetch_session_by_token(STORE_TOKEN) is None
 
-    assert_template_fired(records, next(s for s in COVERED_BY if s.module == "diagnostics"))
+    assert_template_fired(records, _site("stored %s is unusable"))
     assert_no_leak(records, STORE_TOKEN, STORED_USER_ID)
     assert fingerprint(STORE_TOKEN) in rendered(records), "the operator cannot tell which session"
 
