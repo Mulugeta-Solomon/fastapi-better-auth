@@ -24,6 +24,7 @@ from fastapi_better_auth._internal.remote_response import (
     DEFAULT_BACKOFF,
     MAX_BACKOFF,
     MIN_BACKOFF,
+    is_cacheable_null,
     retry_after_seconds,
     session_document_from,
 )
@@ -205,3 +206,27 @@ def test_retry_after_defaults_when_unparseable() -> None:
 def test_retry_after_is_clamped_high_and_low() -> None:
     assert retry_after_seconds(headers(**{"x-retry-after": "9999"})) == MAX_BACKOFF
     assert retry_after_seconds(headers(**{"x-retry-after": "0"})) == MIN_BACKOFF
+
+
+# ---------------------------------------------------------------- is_cacheable_null
+
+
+def test_a_200_null_is_the_one_cacheable_outcome() -> None:
+    assert is_cacheable_null(response(b"null")) is True
+
+
+@pytest.mark.parametrize(
+    "resp",
+    [
+        response(body()),  # a real document, not null
+        response(b"null", status=401),  # not a 200
+        response(b"null", content_type="text/html"),  # not JSON
+        response(b"not json at all"),  # unparseable
+        response(b"[]"),  # JSON, but not null
+    ],
+    ids=["document", "non-200", "non-json", "unparseable", "empty-list"],
+)
+def test_nothing_else_is_cacheable(resp: TransportResponse) -> None:
+    """Only a `200 + null` is remembered; a token mismatch, an expiry or an unreadable body -
+    each also a refusal - must never be cached, so the cache cannot delay a real state change."""
+    assert is_cacheable_null(resp) is False

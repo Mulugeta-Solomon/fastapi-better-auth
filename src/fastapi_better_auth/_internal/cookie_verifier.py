@@ -16,7 +16,6 @@ the store is reached on a CSRF failure. These are named invariants, spy-tested, 
 from __future__ import annotations
 
 import logging
-import threading
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any, TypeVar, cast
@@ -45,6 +44,7 @@ from .errors import (
     SessionRevoked,
 )
 from .models import Session, User
+from .once import Once
 from .parsing import parse_user
 from .reasons import fingerprint, safe_label
 from .shared_secret import SharedSecret
@@ -61,23 +61,6 @@ DEFAULT_SECURE_PREFIX = "__Secure-"
 COOKIE_HEADER = "cookie"
 COOKIE_SOURCE_PREFIX = "cookie:"
 ILLEGAL_IN_A_COOKIE_NAME = frozenset(" \t\r\n;=,")
-
-
-class _Once:
-    """A latch that fires true exactly once across threads, for a warning that must not repeat."""
-
-    __slots__ = ("_fired", "_lock")
-
-    def __init__(self) -> None:
-        self._fired = False
-        self._lock = threading.Lock()
-
-    def fire(self) -> bool:
-        with self._lock:
-            if self._fired:
-                return False
-            self._fired = True
-            return True
 
 
 class CookieCredential:
@@ -207,7 +190,7 @@ class CookieVerifier:
         # Per-instance, not process-wide: two verifiers in one process each warn once on their
         # own first session_data cookie, so a second deployment's CVE-2026-67337 warning is not
         # eaten by the first (D-197).
-        self._session_data_once = _Once()
+        self._session_data_once = Once()
         self.credential_source = f"{COOKIE_SOURCE_PREFIX}{self._cookie_name}"
 
     @property
