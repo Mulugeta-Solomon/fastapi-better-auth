@@ -106,10 +106,12 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.13"
-      - name: Start harness (both topologies)
+      - name: Start harness (every posture)
         # --profile redis brings up auth-redis on :3101 alongside the default :3100 server.
         # Both gate: the stores answer two different truths and only one of them is Postgres.
-        run: docker compose -f harness/docker-compose.yml --profile redis up --build -d --wait
+        # strict (:3102) and throttled (:3103) are the two postures Mode C's conformance legs
+        # need: a bearer plugin with requireSignature on, and a real rate limit on get-session.
+        run: docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled up --build -d --wait
       - name: Sync (dev group)
         run: uv sync
       - name: Unit lane (coverage, no gate)
@@ -118,7 +120,7 @@ jobs:
         run: uv run pytest -m e2e -q --cov=fastapi_better_auth --cov-append --cov-fail-under=80
       - name: Harness logs
         if: failure()
-        run: docker compose -f harness/docker-compose.yml --profile redis logs
+        run: docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled logs
       - name: Teardown
         if: always()
-        run: docker compose -f harness/docker-compose.yml --profile redis down -v
+        run: docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled down -v

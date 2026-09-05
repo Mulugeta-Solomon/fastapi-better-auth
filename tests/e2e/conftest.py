@@ -1,7 +1,9 @@
 """Fixtures for the conformance lane. Requires the harness: docker compose -f harness/docker-compose.yml up -d"""
 
 import os
+import pathlib
 import secrets
+import subprocess
 import urllib.parse
 
 import httpx
@@ -9,6 +11,8 @@ import pytest
 
 HARNESS_URL = os.environ.get("HARNESS_URL", "http://localhost:3100")
 REDIS_HARNESS_URL = os.environ.get("REDIS_HARNESS_URL", "http://localhost:3101")
+STRICT_HARNESS_URL = os.environ.get("STRICT_HARNESS_URL", "http://localhost:3102")
+THROTTLED_HARNESS_URL = os.environ.get("THROTTLED_HARNESS_URL", "http://localhost:3103")
 HARNESS_SECRET = os.environ.get("HARNESS_SECRET", "harness-secret-do-not-use-in-production")
 SEED_EMAIL = os.environ.get("SEED_EMAIL", "seed@example.com")
 SEED_PASSWORD = os.environ.get("SEED_PASSWORD", "seed-password-123")
@@ -23,30 +27,94 @@ REDIS_URL = os.environ.get("HARNESS_REDIS_URL", "redis://localhost:56379/0")
 SESSION_COOKIE = "better-auth.session_token"
 PASSWORD = "conformance-password-123"
 
+COMPOSE_FILE = pathlib.Path(__file__).resolve().parents[2] / "harness" / "docker-compose.yml"
+
+# The throttled service's /get-session rule, mirrored from RATE_LIMIT_GET_SESSION_MAX in
+# harness/docker-compose.yml. Upstream keys the bucket on the last request it ALLOWED (a refused
+# one leaves it untouched), so a window only clears after that many seconds without one.
+THROTTLE_WINDOW_SECONDS = 10
+THROTTLE_MAX = 3
+
+
+def harness_sql(sql: str) -> None:
+    """Run one statement against the harness database, or skip if docker cannot be reached.
+
+    Session expiry and a database-direct ban cannot be manufactured through the API - upstream
+    offers no endpoint that backdates `expiresAt`, and the admin ban route also deletes the
+    user's sessions, which would make a ban leg pass for the wrong reason.
+    """
+    try:
+        subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(COMPOSE_FILE),
+                "exec",
+                "-T",
+                "postgres",
+                "psql",
+                "-U",
+                "harness",
+                "-d",
+                "harness",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                sql,
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        pytest.skip(f"cannot reach harness postgres via docker compose: {exc}")
+
+
+def _reachable(url: str, *, label: str, profile: str | None = None) -> str:
+    """Skip locally when a harness posture is down; fail in CI, where a silent skip is worse."""
+    try:
+        resp = httpx.get(f"{url}/healthz", timeout=5)
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 - any failure means that posture is down
+        start = "" if profile is None else f" (start it with --profile {profile})"
+        message = f"{label} harness not reachable at {url}{start}: {exc}"
+        if os.environ.get("CI"):
+            pytest.fail(message)
+        pytest.skip(message)
+    return url
+
 
 @pytest.fixture(scope="session")
 def harness() -> str:
-    try:
-        resp = httpx.get(f"{HARNESS_URL}/healthz", timeout=5)
-        resp.raise_for_status()
-    except Exception as exc:  # noqa: BLE001 - any failure means the harness is down
-        if os.environ.get("CI"):
-            pytest.fail(f"harness not reachable at {HARNESS_URL} in CI: {exc}")
-        pytest.skip(f"harness not reachable at {HARNESS_URL}: {exc}")
-    return HARNESS_URL
+    """The default topology: sessions in Postgres, no profile needed."""
+    return _reachable(HARNESS_URL, label="default")
 
 
 @pytest.fixture(scope="session")
 def redis_harness() -> str:
     """The secondary-storage topology: `docker compose --profile redis up -d --wait`."""
-    try:
-        resp = httpx.get(f"{REDIS_HARNESS_URL}/healthz", timeout=5)
-        resp.raise_for_status()
-    except Exception as exc:  # noqa: BLE001 - any failure means that topology is down
-        if os.environ.get("CI"):
-            pytest.fail(f"redis-profile harness not reachable at {REDIS_HARNESS_URL}: {exc}")
-        pytest.skip(f"redis-profile harness not reachable at {REDIS_HARNESS_URL}: {exc}")
-    return REDIS_HARNESS_URL
+    return _reachable(REDIS_HARNESS_URL, label="redis-profile", profile="redis")
+
+
+@pytest.fixture(scope="session")
+def strict_harness() -> str:
+    """The strict bearer posture: `docker compose --profile strict up -d --wait`.
+
+    `bearer({ requireSignature: true })`, which is the one-line upstream fix this library's
+    advisory probe names. Everything else about it is byte-identical to `:3100`.
+    """
+    return _reachable(STRICT_HARNESS_URL, label="strict-profile", profile="strict")
+
+
+@pytest.fixture(scope="session")
+def throttled_harness() -> str:
+    """The rate-limited posture: `docker compose --profile throttled up -d --wait`.
+
+    An explicit `rateLimit: { enabled: true, customRules: { "/get-session": { window: 10,
+    max: 3 } } }`, so the 429 path is provable against a real server without `NODE_ENV=production`
+    (which would also flip the cookie name to `__Secure-` over http).
+    """
+    return _reachable(THROTTLED_HARNESS_URL, label="throttled-profile", profile="throttled")
 
 
 @pytest.fixture(scope="session")

@@ -77,3 +77,59 @@ services:
       # the first to be serving is what keeps the two migrations from racing each other.
       auth:
         condition: service_healthy
+
+  # Strict bearer posture: bearer({ requireSignature: true }), so a dot-less bearer token is
+  # ignored instead of self-signed. Started only with --profile strict.
+  auth-strict:
+    profiles: ["strict"]
+    build:
+      context: ./auth-server
+      args:
+        BETTER_AUTH_VERSION: ${BETTER_AUTH_VERSION:-}
+    environment:
+      DATABASE_URL: postgres://harness:harness@postgres:5432/harness
+      BETTER_AUTH_SECRET: harness-secret-do-not-use-in-production
+      BETTER_AUTH_URL: http://localhost:3102
+      PORT: "3102"
+      BEARER_REQUIRE_SIGNATURE: "1"
+    ports:
+      - "3102:3102"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3102/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+
+  # Rate-limited posture: an explicit `enabled: true` rule of 3 requests / 10 s on
+  # /get-session, so the 429 path can be proven against a real server. NODE_ENV is never set
+  # to production here - that would also flip the cookie name to __Secure- over http.
+  # Started only with --profile throttled.
+  auth-throttled:
+    profiles: ["throttled"]
+    build:
+      context: ./auth-server
+      args:
+        BETTER_AUTH_VERSION: ${BETTER_AUTH_VERSION:-}
+    environment:
+      DATABASE_URL: postgres://harness:harness@postgres:5432/harness
+      BETTER_AUTH_SECRET: harness-secret-do-not-use-in-production
+      BETTER_AUTH_URL: http://localhost:3103
+      PORT: "3103"
+      RATE_LIMIT_GET_SESSION_MAX: "3"
+    ports:
+      - "3103:3103"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3103/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth:
+        condition: service_healthy

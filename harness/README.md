@@ -8,13 +8,14 @@ compatibility is tested, never assumed. `auth-server/` is also the reference imp
 ## Run
 
 ```bash
-docker compose -f harness/docker-compose.yml --profile redis up --build -d --wait
+docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled up --build -d --wait
 uv run pytest -m e2e
 ```
 
 The auth container migrates the schema (Better Auth CLI), seeds its users, and serves on
-`http://localhost:3100` (`/healthz` for readiness). Dropping `--profile redis` starts only the
-default topology; the store conformance tests then skip their Redis half.
+`http://localhost:3100` (`/healthz` for readiness). Every profile is optional: drop one and the
+legs that need it skip with a reason naming the profile (in CI they fail instead, because a lane
+that silently tested nothing is worse than a red one).
 
 ## Services
 
@@ -22,11 +23,30 @@ default topology; the store conformance tests then skip their Redis half.
 |---|---|---|
 | `auth` | 3100 | Sessions in Postgres (default topology) |
 | `auth-redis` | 3101 | `--profile redis`: sessions in Redis secondary storage — the Postgres session table may stay empty |
+| `auth-strict` | 3102 | `--profile strict`: `bearer({ requireSignature: true })` |
+| `auth-throttled` | 3103 | `--profile throttled`: a real rate limit on `/get-session` (3 per 10 s) |
 | `postgres` | 55432 | Exposed for vector capture and session manipulation in tests |
 | `redis` | 56379 | Used only by the `redis` profile |
 
-Both auth containers run `auth migrate` against the same database on start, so `auth-redis`
-waits for `auth` to be healthy rather than racing it.
+Every auth container runs `auth migrate` against the same database on start, so the three optional
+ones wait for `auth` to be healthy rather than racing it.
+
+### The two postures
+
+Both are driven by an environment variable `src/auth.mjs` reads, and both default **off**, so
+`auth` and `auth-redis` keep exactly the posture every existing test pins.
+
+- `BEARER_REQUIRE_SIGNATURE=1` → `bearer({ requireSignature: true })`. The default is `false`,
+  which means upstream self-signs a *raw session token* presented as `Authorization: Bearer`, so
+  a token in a log or a dump is a credential. `:3102` is what turns the one-line fix this library
+  advises into a tested fact, in both directions — including the `Set-Cookie` discriminator the
+  advisory boot probe reads.
+- `RATE_LIMIT_GET_SESSION_MAX=3` → `rateLimit: { enabled: true, customRules: { "/get-session":
+  { window: 10, max: 3 } } }`. `enabled` is set **explicitly**: upstream defaults it to
+  `NODE_ENV === "production"`, and setting `NODE_ENV` would also flip the session cookie to its
+  `__Secure-` name over http, which would make `:3103` a different server rather than the same
+  one under a rate limit. Upstream answers a refused request `429` with **`X-Retry-After`** in
+  whole seconds — not the standard `Retry-After` — which is exactly what the live 429 leg pins.
 
 ## Seeded users
 
@@ -40,7 +60,7 @@ endpoint that grants the *first* admin — every one of them is gated on an exis
 
 ## Plugins
 
-`jwt()`, `bearer()` and `admin()`. The last is what creates `banned` / `banReason` /
+`jwt()`, `bearer({ requireSignature })` and `admin()`. The last is what creates `banned` / `banReason` /
 `banExpires` on `user` and `impersonatedBy` on `session`; without it those columns do not exist,
 which is a supported deployment and one the stores are tested against too. Enabling it does not
 touch the session cookie's wire format, so the golden vectors in `tests/vectors/` are unaffected.
