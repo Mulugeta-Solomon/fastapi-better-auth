@@ -170,6 +170,14 @@ def test_the_snapshot_never_raises_on_a_hostile_request(hostile: dict[str, str])
     assert captured.requires_check is True
 
 
+def test_a_hand_built_snapshot_means_one_origin() -> None:
+    """Every direct construction described a request carrying exactly one, so that is the
+    default - a snapshot built by hand is not evidence that a second header arrived. Asserted
+    on `facts()` itself, which is what every hand-built snapshot in this file goes through."""
+    assert facts().origin_count == 1
+    assert CsrfFacts().origin_count == 1
+
+
 def test_the_snapshot_is_frozen() -> None:
     captured = facts()
 

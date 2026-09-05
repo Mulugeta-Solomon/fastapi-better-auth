@@ -11,12 +11,8 @@ cookie.
 from __future__ import annotations
 
 import base64
-import hashlib
 import hmac
-import json
 import logging
-import pathlib
-from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -37,109 +33,38 @@ from fastapi_better_auth import (
     SessionRevoked,
     SharedSecret,
     SignedDoubleSubmit,
-    StoredSession,
-    StoredUser,
     User,
 )
 from fastapi_better_auth._internal import cookie_verifier as cv
 from fastapi_better_auth._internal.cookie_verifier import CookieVerifier
+from tests.cookies import (
+    CAPTURED_TOKEN,
+    COOKIE,
+    COOKIE_DOC,
+    DOTTED_TOKEN,
+    FAR_FUTURE,
+    FAR_PAST,
+    SECRET,
+    USER_ID,
+    VECTOR_SECRET_VALUE,
+    FakeStore,
+    http,
+    run,
+    seeded_store,
+    sign,
+    stored_session,
+    stored_user,
+    verifier,
+)
 from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, resolver_of
 from tests.fakes import connection as fake_connection
 
-VECTOR_DIR = pathlib.Path(__file__).parent / "vectors"
-COOKIE_DOC: dict[str, Any] = json.loads((VECTOR_DIR / "cookie_v1.json").read_text())
-VECTOR_SECRET_VALUE: str = COOKIE_DOC["secret"]
-
-COOKIE = "better-auth.session_token"
-SECURE = "__Secure-better-auth.session_token"
 APP = "https://app.example.com"
 EVIL = "https://evil.example.com"
+SECURE = "__Secure-better-auth.session_token"
 
-SECRET = SharedSecret(VECTOR_SECRET_VALUE)
 OTHER_SECRET = SharedSecret("Nf4Wq7zC2mVt9Bs5Kx1Ld8Hj6Yr3Pg0Zx")
 CSRF_SECRET = SharedSecret("Qb8Xm2vTz6Lp1RkYd9Wn4Hs7Cj3Fg5Ae")
-
-FAR_FUTURE = datetime(2999, 1, 1, tzinfo=timezone.utc)
-FAR_PAST = datetime(2000, 1, 1, tzinfo=timezone.utc)
-
-CAPTURED_TOKEN = "SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B"
-DOTTED_TOKEN = "prefix.SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B"
-USER_ID = "u1"
-USER_PAYLOAD: Mapping[str, Any] = {"id": USER_ID, "email": "seed@example.com"}
-
-
-# ---------------------------------------------------------------- fakes and helpers
-
-
-class FakeStore:
-    """A `SessionStore` that answers from two dicts and counts every call it is given."""
-
-    def __init__(
-        self,
-        *,
-        sessions: Mapping[str, StoredSession] | None = None,
-        users: Mapping[str, StoredUser] | None = None,
-        session_error: BaseException | None = None,
-        user_error: BaseException | None = None,
-    ) -> None:
-        self.sessions = dict(sessions or {})
-        self.users = dict(users or {})
-        self.session_error = session_error
-        self.user_error = user_error
-        self.session_calls: list[str] = []
-        self.user_calls: list[str] = []
-
-    async def fetch_session_by_token(self, token: str) -> StoredSession | None:
-        self.session_calls.append(token)
-        if self.session_error is not None:
-            raise self.session_error
-        return self.sessions.get(token)
-
-    async def fetch_user_by_id(self, user_id: str) -> StoredUser | None:
-        self.user_calls.append(user_id)
-        if self.user_error is not None:
-            raise self.user_error
-        return self.users.get(user_id)
-
-
-def stored_user(**overrides: Any) -> StoredUser:
-    fields: dict[str, Any] = {"id": USER_ID, "payload": dict(USER_PAYLOAD)}
-    fields.update(overrides)
-    return StoredUser(**fields)
-
-
-_UNSET: Any = object()
-
-
-def stored_session(
-    token: str, *, expires_at: datetime = FAR_FUTURE, user: Any = _UNSET, **overrides: Any
-) -> StoredSession:
-    payload: dict[str, Any] = {"id": "sess", "userId": USER_ID, "token": token}
-    payload.update(overrides.pop("payload", {}))
-    fields: dict[str, Any] = {
-        "token": token,
-        "user_id": USER_ID,
-        "expires_at": expires_at,
-        "payload": payload,
-        "user": stored_user() if user is _UNSET else user,
-    }
-    fields.update(overrides)
-    return StoredSession(**fields)
-
-
-def seeded_store() -> FakeStore:
-    return FakeStore(
-        sessions={
-            CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN),
-            DOTTED_TOKEN: stored_session(DOTTED_TOKEN),
-        }
-    )
-
-
-def sign(token: str, secret: bytes = b"") -> str:
-    key = secret or VECTOR_SECRET_VALUE.encode()
-    digest = hmac.new(key, token.encode(), hashlib.sha256).digest()
-    return f"{token}.{base64.b64encode(digest).decode()}"
 
 
 class _FixedClock:
@@ -150,31 +75,6 @@ class _FixedClock:
 
     def now(self, tz: Any = None) -> datetime:
         return self._instant
-
-
-def http(method: str = "GET", *, cookie: str | None = None, **headers: str) -> HTTPConnection:
-    raw = [(key.replace("_", "-").encode(), value.encode()) for key, value in headers.items()]
-    if cookie is not None:
-        raw.append((b"cookie", cookie.encode()))
-    return HTTPConnection({"type": "http", "method": method, "path": "/", "headers": raw})
-
-
-def verifier(*, store: FakeStore | None = None, csrf: Any = None, **kwargs: Any) -> CookieVerifier:
-    return CookieVerifier(
-        secret=kwargs.pop("secret", SECRET),
-        store=seeded_store() if store is None else store,
-        csrf=CsrfDisabled(reason="signature tests do not exercise CSRF") if csrf is None else csrf,
-        **kwargs,
-    )
-
-
-async def run(
-    verifier: CookieVerifier, connection: HTTPConnection, model: type[User] = User
-) -> Session[User] | None:
-    credential = verifier.extract(connection)
-    if credential is None:
-        return None
-    return await verifier.verify(credential, model)
 
 
 # ---------------------------------------------------------------- construction
@@ -453,38 +353,6 @@ class TestVerifyPipeline:
 
         assert session is not None
         assert session.raw["impersonatedBy"] == "admin-9"
-
-
-class TestBans:
-    @pytest.mark.anyio
-    @pytest.mark.parametrize(
-        ("banned", "ban_expires"),
-        [(True, None), (True, FAR_FUTURE)],
-        ids=["permanent", "still-active"],
-    )
-    async def test_a_banned_user_is_refused(
-        self, banned: bool, ban_expires: datetime | None
-    ) -> None:
-        user = stored_user(banned=banned, ban_expires=ban_expires)
-        store = FakeStore(sessions={CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN, user=user)})
-        with pytest.raises(SessionRevoked):
-            await run(verifier(store=store), http(cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}"))
-
-    @pytest.mark.anyio
-    @pytest.mark.parametrize(
-        ("banned", "ban_expires"),
-        [(None, None), (False, None), (True, FAR_PAST)],
-        ids=["unknown", "not-banned", "ban-lapsed"],
-    )
-    async def test_an_unbanned_or_lapsed_user_is_allowed(
-        self, banned: bool | None, ban_expires: datetime | None
-    ) -> None:
-        user = stored_user(banned=banned, ban_expires=ban_expires)
-        store = FakeStore(sessions={CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN, user=user)})
-
-        session = await run(verifier(store=store), http(cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}"))
-
-        assert session is not None
 
 
 # ---------------------------------------------------------------- CSRF ordering + zero-call

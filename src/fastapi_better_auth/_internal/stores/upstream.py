@@ -36,8 +36,20 @@ def as_moment(value: Any) -> datetime | None:
 
 
 def as_text(value: Any) -> str | None:
-    """A non-blank string, or `None`. An id that is blank is an id nothing should be found by."""
+    """A non-blank, UTF-8-encodable string, or `None`.
+
+    An id that is blank is an id nothing should be found by, and a `str` carrying an unpaired
+    surrogate is not text this library will vouch for: Python holds one happily, and every use
+    a store has for the value - the constant-time compare against the presented token, a log
+    line, anything sent anywhere - encodes it and raises `UnicodeEncodeError`. Refusing it here
+    closes both stores' compare sites at the boundary they already trust, and puts it on the
+    path a blank value already takes: "does not carry one", which is a miss (D-183).
+    """
     if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
         return None
     return value
 

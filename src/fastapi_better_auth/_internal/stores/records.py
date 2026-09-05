@@ -13,6 +13,11 @@ NAIVE = (
     " value with no offset is read against whichever clock happens to be nearest - which is how"
     " an expired session becomes a live one."
 )
+NOT_A_FLAG = (
+    "banned must be True, False or None; got {kind}. It decides whether a user is let in, so"
+    " there is no reading of a 1, a 'true' or anything else that is not a guess - and a guess on"
+    " a ban check is a guess in the direction of letting a banned user through."
+)
 
 
 def freeze(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -24,6 +29,13 @@ def require_aware(name: str, value: datetime) -> datetime:
     if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
         raise ValueError(NAIVE.format(name=name))
     return value
+
+
+def require_flag(value: object) -> bool | None:
+    """`True`, `False` or `None`. Anything else is a record no ban check can read (D-182)."""
+    if value is None or isinstance(value, bool):
+        return value
+    raise TypeError(NOT_A_FLAG.format(kind=type(value).__name__))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -45,7 +57,10 @@ class StoredUser:
         banned: `True` or `False` when the admin plugin's `banned` column exists, and `None`
             when it does not. `None` means *unknown*, never *safe* - a deployment without the
             admin plugin has no ban state at all, and reading its absence as "not banned" is
-            the difference between an unbanned user and one nobody asked about.
+            the difference between an unbanned user and one nobody asked about. Those three are
+            the only values: a `1`, a `"true"` or anything else is a `TypeError`, because the
+            verifier's ban check must not have to guess, and the two shipped stores already
+            answer a miss for a `banned` they cannot read.
         ban_expires: When a ban lifts, timezone-aware, or `None` for "no expiry recorded" -
             which for a banned user means the ban is permanent, not that it has lapsed.
 
@@ -53,6 +68,7 @@ class StoredUser:
 
     Raises:
         ValueError: If `ban_expires` is naive.
+        TypeError: If `banned` is not `True`, `False` or `None`.
     """
 
     id: str
@@ -62,6 +78,7 @@ class StoredUser:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", freeze(self.payload))
+        require_flag(self.banned)
         if self.ban_expires is not None:
             require_aware("ban_expires", self.ban_expires)
 

@@ -9,6 +9,8 @@ store that fell back to the database on a miss would therefore resurrect revoked
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -16,11 +18,17 @@ import sys
 from typing import Any
 
 import pytest
+from starlette.requests import HTTPConnection
 
 from fastapi_better_auth import (
     ConfigurationError,
+    CookieVerifier,
+    CsrfDisabled,
     RedisSessionStore,
+    SessionError,
     SessionStore,
+    SharedSecret,
+    User,
 )
 from fastapi_better_auth._internal.reasons import REDACTED
 from fastapi_better_auth._internal.stores import redis_store as redis_store_module
@@ -39,11 +47,30 @@ from tests.stores import (
 
 UNKNOWN_TOKEN = "5RmMvJt3xQ8bWfKcApZnUhLd2YeGsT7q"
 EXTRA = "fastapi-better-auth-bridge[redis]"
+FAR_FUTURE_ISO = "2999-01-01T00:00:00.000Z"
+VERIFIER_SECRET = SharedSecret("Qb8Xm2vTz6Lp1RkYd9Wn4Hs7Cj3Fg5Ae")
+
+NESTING = sys.getrecursionlimit() * 4
+NESTED_BOMB = "[" * NESTING + "]" * NESTING
+"""A few kilobytes - far under the byte cap - and deeper than json's recursive scanner goes."""
+
+LONE_SURROGATE_TOKEN = chr(0xD800) + "abc"
+"""An unpaired surrogate: a `str` Python holds happily and cannot encode as UTF-8.
+
+Spelled with `chr` rather than an escape so the file itself stays encodable. `json.dumps`
+writes it as an escape, so the stored value is ASCII and only the *parsed* token carries it -
+which is exactly how it arrives from a real Redis holding what some other writer put there.
+"""
 
 
 def store_over(**values: str) -> tuple[RedisSessionStore, RecordingRedis]:
     client = RecordingRedis(values)
     return RedisSessionStore(client=client), client
+
+
+def _labelled(value: object) -> str:
+    """Name a case by its label and never by its stored value: some of them are kilobytes."""
+    return value if isinstance(value, str) and len(value) <= 24 else "value"
 
 
 def _minus(key: str) -> dict[str, Any]:
@@ -206,7 +233,10 @@ class TestMalformedValues:
             ("banned-not-a-boolean", stored(user=wire_user(banned="yes"))),
             ("banned-a-number", stored(user=wire_user(banned=1))),
             ("ban-expiry-not-a-date", stored(user=wire_user(banExpires="whenever"))),
+            ("deeply-nested", NESTED_BOMB),
+            ("surrogate-token", stored(session=wire_session(token=LONE_SURROGATE_TOKEN))),
         ],
+        ids=_labelled,
     )
     async def test_it_is_a_miss(
         self, label: str, value: str, caplog: pytest.LogCaptureFixture
@@ -318,6 +348,44 @@ class TestMalformedValues:
         written = " ".join(entry.getMessage() for entry in caplog.records)
         assert "forged log line" not in written
         assert REDACTED in written
+
+
+class TestBannedThroughTheVerifier:
+    """B2. `StoredUser` now refuses a `banned` that is not `bool | None`, and that refusal is a
+    `TypeError` - so the question this answers is whether a real stored value can reach it. It
+    cannot: `_user` refuses a non-boolean `banned` before any record is built, so a JSON `1`
+    stays a miss, and the verifier turns the miss into a refusal rather than a 500."""
+
+    @pytest.mark.anyio
+    async def test_a_banned_of_one_is_a_refusal_and_never_an_escape(self) -> None:
+        value = stored(session=wire_session(expiresAt=FAR_FUTURE_ISO), user=wire_user(banned=1))
+        store = RedisSessionStore(client=RecordingRedis({TOKEN: value}))
+        verifier = CookieVerifier(
+            secret=VERIFIER_SECRET,
+            store=store,
+            csrf=CsrfDisabled(reason="this row is about the ban check, not CSRF"),
+        )
+        connection = _cookie_connection(TOKEN)
+        credential = verifier.extract(connection)
+        assert credential is not None
+
+        with pytest.raises(SessionError):
+            await verifier.verify(credential, User)
+
+
+def _cookie_connection(token: str) -> HTTPConnection:
+    digest = hmac.new(
+        VERIFIER_SECRET.get_secret_value().encode(), token.encode(), hashlib.sha256
+    ).digest()
+    value = f"{token}.{base64.b64encode(digest).decode()}"
+    return HTTPConnection(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [(b"cookie", f"better-auth.session_token={value}".encode())],
+        }
+    )
 
 
 class TestFetchUserById:

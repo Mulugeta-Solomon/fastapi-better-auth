@@ -238,7 +238,9 @@ class RedisSessionStore:
             return None
         try:
             parsed: object = json.loads(value)
-        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
+            # A few kilobytes of nesting exhausts json's recursive scanner well under the byte
+            # cap; a stack limit reached is a value this reader cannot read (D-183).
             unusable(SESSION_KEY, "it is not JSON", key)
             return None
         if not isinstance(parsed, dict):
