@@ -325,10 +325,12 @@ carries. All of this applies unchanged to Mode C, which reads the same cookie.
 The mode to reach for when FastAPI can *reach* your Better Auth server over the network but does
 not share its database, its Redis, or — unless you choose to — its secret. It takes the session
 cookie off the request, forwards exactly that one cookie to
-`GET /api/auth/get-session?disableCookieCache=true&disableRefresh=true`, and believes the answer:
-`disableCookieCache` forces the authoritative read, so revocation is instant, and `disableRefresh`
-keeps the call read-only. Everything that could refuse the request without asking — the structural
-check, your optional secret, the negative cache, the backoff latch — runs first.
+`GET /api/auth/get-session?disableCookieCache=true&disableRefresh=true`, and believes the answer.
+`disableCookieCache` switches off the cookie-cache short-circuit so the route always falls through
+to the authoritative lookup (`dist/api/routes/session.mjs:48`) — that is where the instant
+revocation comes from — and `disableRefresh` keeps the call read-only. Everything that could refuse
+the request without asking upstream — the structural check, your optional secret, the negative
+cache, the backoff latch — runs first.
 
 Like Mode A this is a cookie mode, so **`csrf=` is required and has no default**, and the protected
 routes below are `POST`s for the same reason: cross-site request forgery is a threat to unsafe
@@ -684,7 +686,8 @@ Mode C looks like the easy one and has the sharpest edges, which is why the shap
 fixed at construction and never derived from the one being verified. An unauthenticated
 `get-session` answers **`200` with a body of literally `null`**, not a `401`, so a snippet that
 checks the status code authenticates everybody. The `bearer` plugin's hook *overwrites* the session
-cookie of an outgoing request with whatever `Authorization` header it sees, so a proxy that forwards
+cookie of an outgoing request with whatever `Authorization` header it sees
+(`dist/plugins/bearer/index.mjs:44-46`), so a proxy that forwards
 the inbound `Authorization` along with the cookie hands a client a targeted denial-of-service on one
 victim, and a client who sends a raw session token an authentication this side never checked — which
 is why exactly two headers, `cookie` and `accept`, ever go out. `httpx`'s default client keeps
