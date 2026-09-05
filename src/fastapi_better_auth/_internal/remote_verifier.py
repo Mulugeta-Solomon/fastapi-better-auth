@@ -412,11 +412,9 @@ class RemoteVerifier:
             record = self._document(response, material, marker, verified)
             return self._session(record, token, marker, user_model)
         finally:
-            # `credential` is a parameter, and a parameter is a frame local like any other; and
-            # `record`/`response` carry the forwarded token when `_session` refuses AFTER the fetch
-            # (expired, banned) - this frame holds all of it (D-094, D-180, D-210). The WP15 gates
-            # (cache/latch/limiter/ready) each refuse through this frame too, so `material`/`token`
-            # are dropped here on every one of their paths.
+            # `credential`/`record`/`response` carry the forwarded cookie/token as frame locals;
+            # every verify() exit - success, the D-094/180/210 refusals, and the WP15 cache/latch/
+            # limiter/ready gates - routes through this finally, so all are cleared here (D-210).
             credential = None
             material = name = token = ""
             record = response = None
