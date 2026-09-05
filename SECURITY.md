@@ -51,6 +51,16 @@ header at all, because Better Auth never emits one and no extension is supported
   reason lives only on the exception's `.reason` and in your logs. Timing is not uniform by design:
   a cookie whose signature does not verify is refused before the session store is consulted, so
   the store is never a lever for unauthenticated traffic.
+- **Match `secure_cookies` to what your server actually sets.** `CookieVerifier` reads exactly one
+  cookie name: the `__Secure-`-prefixed one when `secure_cookies=True` (the default, and Better
+  Auth's own production default), or the plain name when `False` — set `False` for a dev/HTTP
+  deployment on the plain name. It never reads both at once: accepting the plain and the prefixed
+  name together let a sibling subdomain plant the *other* name and be authenticated as itself, a
+  cross-name session fixation. Prefer `secure_prefix="__Host-"` where you can harden Better Auth to
+  emit `__Host-` cookies — `__Host-` is the only prefix a sibling subdomain cannot set; `__Secure-`
+  does not stop one. The residual same-name risk is bounded: CSRF is required in cookie mode and
+  covers every state-changing request, so a planted same-name cookie is at worst a read-only
+  exposure or the duplicate-cookie lockout below, never a silent takeover of writes.
 - **Duplicate session cookies are refused, not resolved.** A sibling subdomain that plants a
   cookie of the same name locks the victim out of this API until that cookie is gone — a denial
   of service, never a login as someone else. Better Auth uses the `__Secure-` prefix, which does
@@ -58,6 +68,13 @@ header at all, because Better Auth never emits one and no extension is supported
 - **Bans are enforced locally and fail closed.** A stored `banned` value that is not `true`,
   `false` or absent is treated as banned; a store that hands the verifier a malformed record is a
   refusal, never an exception.
+- **Bans take effect immediately in cookie mode, not in JWT mode.** `CookieVerifier` consults the
+  session store on every request, so a ban — or a sign-out — is enforced the instant the store
+  reflects it. `JwtVerifier` has no store and verifies a bearer token offline against the JWKS, so
+  it cannot see a ban (exactly as upstream's own `get-session` cannot): a banned user keeps access
+  through a still-valid JWT until it expires. If you compose the two modes, a bearer token is a
+  window of continued access after a ban. Keep `max_token_lifetime` — and your upstream token
+  lifetime — short, and do not rely on Mode B alone for prompt revocation.
 - **Traceback hygiene.** Every frame of this library that holds a raw credential drops it before a
   refusal propagates, so an error reporter that captures frame locals finds nothing. If you write
   your own `Verifier`, `SessionStore` or `CsrfPolicy`, the frames you own are yours to scrub the
