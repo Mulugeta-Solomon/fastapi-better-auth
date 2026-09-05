@@ -5,15 +5,26 @@ that runs in CI; nothing appears here because it is expected to work.
 
 ## Better Auth
 
-The server this library bridges to. The conformance suite runs against a real Better Auth server
-(Hono/Node, Postgres, Redis) started from `harness/docker-compose.yml`.
+The server this library bridges to. The conformance suite runs against real Better Auth servers
+(Hono/Node, Postgres, Redis) started from `harness/docker-compose.yml` — four of them, because two
+of the behaviours this library documents are *server postures* rather than server versions, and a
+posture asserted in only one direction is not asserted at all.
 
 | better-auth | Lane | When |
 |---|---|---|
 | 1.7.1 | conformance, gating | every pull request, and every push to `main` |
+| 1.7.1 with `secondaryStorage` (Redis) | conformance, gating | every pull request, and every push to `main` |
+| 1.7.1 with `bearer({ requireSignature: true })` | conformance (strict posture), gating | every pull request, and every push to `main` |
+| 1.7.1 with `rateLimit: { enabled: true, customRules: { "/get-session": { window: 10, max: 3 } } }` | conformance (throttled posture), gating | every pull request, and every push to `main` |
 | 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes |
 | 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes |
 | `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes |
+
+The strict posture is what makes "`bearer({ requireSignature: true })` is the fix" a tested claim
+rather than a reading of the source: the default-permissive server and the strict one are driven
+with the same credentials and asserted to answer differently. The throttled posture is what pins the
+one upstream header most likely to drift — a `429` carries `X-Retry-After` and never `Retry-After` —
+against a real server rather than a scripted one. Every canary lane runs all four.
 
 The gating lane pins `better-auth@1.7.1`, so no change lands without passing against it. The canary
 runs the same suite twice against the matrix above — once from the repository HEAD, and once
@@ -83,13 +94,31 @@ The floor-resolution lane is what found it.
   cookie's HMAC construction and the session store's own layout. It is **tested against
   better-auth 1.7.1** — the version the conformance lane pins — verified on **2026-08-29**, and an
   upstream change to either the cookie signing or the store layout may force a change here inside a
-  minor release. That coupling is stated rather than hidden: the format-independent path is Mode C
-  (remote `get-session`), which asks the server instead of reading its internals and so rides out
-  such a change — it comes after Mode A and is not yet shipped. The stores read three internal
-  shapes, all asserted against a running better-auth in the conformance lane, in both of its
-  topologies: the `session` and `user` tables' column names, the secondary-storage key (the raw
-  session token, with no namespace), and the JSON that key holds (`{session, user}`).
-- **Mode C (remote get-session)** — after Mode A. Not yet shipped.
+  minor release. That coupling is stated rather than hidden: Mode C (remote `get-session`) is the
+  path with less of it, because it asks the server instead of reading its internals. The stores read
+  three internal shapes, all asserted against a running better-auth in the conformance lane, in both
+  of its topologies: the `session` and `user` tables' column names, the secondary-storage key (the
+  raw session token, with no namespace), and the JSON that key holds (`{session, user}`).
+- **Mode C (remote get-session)** couples to *less*, and the honest word for it is "less", never
+  "format-independent". It is **tested against better-auth 1.7.1**, verified live on
+  **2026-09-05** across all four harness postures. Its dependencies are exactly these four, and
+  each is asserted in the conformance lane:
+  1. **The 200-null contract** — `GET /api/auth/get-session` answers `200` with a body of literally
+     `null` for a request that carries no valid session, rather than a `401`. The boot probe asserts
+     it, and a server wired through `auth.lifespan` does not start if it does not hold.
+  2. **The `{session, user}` body shape** of an authenticated answer, and `session.token` within it
+     matching the token that was forwarded.
+  3. **The `disableCookieCache` and `disableRefresh` query parameters**, which are what make the
+     read authoritative and read-only. Both are pinned into the request and neither is configurable.
+  4. **Only if you configure a secret**, the signed-cookie envelope — the same coupling Mode A has,
+     bought deliberately to refuse forgeries locally. Without a secret Mode C reads no envelope, no
+     store, no database and no shared secret at all.
+
+  What it does *not* read: the session store, the store topology, the database schema, or Better
+  Auth's ID format (the token's alphabet and length are operator-overridable upstream, so nothing
+  here pins them). An upstream change to the cookie HMAC or the store layout does not reach Mode C
+  unless you configured a secret; a change to the `get-session` contract does, and that is what the
+  weekly canary exists to catch.
 
 Security fixes are released for the latest version only while this project is pre-1.0; see
 [SECURITY.md](SECURITY.md).

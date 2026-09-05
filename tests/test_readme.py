@@ -10,9 +10,17 @@ can show an Authorize button. Executing a snippet proves it parses; asking it fo
 it is the real API doing real enforcement. "Every" is enforced by a census wider than the
 extractor's own gate, so a fence spelled some other way fails loudly instead of vanishing.
 
+The documented routes come in two shapes and both are driven. A secured **GET** is a bearer route,
+so it is probed with a forged token. A secured **POST** is a cookie route — cookie modes are
+documented on unsafe methods on purpose, because that is where their CSRF policy earns its place —
+so it is probed with a forged session cookie, same-origin so the probe reaches the credential
+rather than stopping at a 403. Without that half, a cookie-mode quickstart could document a route
+this page never once asked to refuse anything.
+
 Nothing here touches the network, and that is asserted rather than assumed: every snippet
-refuses its credential on shape alone, before a key set is ever wanted, and `refuse_network`
-records any fetch the shipped transport attempts anyway.
+refuses its credential on shape alone, before a key set or a get-session call is ever wanted, and
+`refuse_network` records any fetch the shipped transport attempts anyway — asserted per route, so
+a snippet that reaches upstream to decide a forgery names the route it did it from.
 """
 
 from __future__ import annotations
@@ -40,6 +48,29 @@ BEARER_REQUIREMENT: list[dict[str, list[str]]] = [{BEARER_NAME: []}]
 UNAUTHENTICATED = {"detail": "Not authenticated"}
 FORGED = ("not-a-jwt", "a.b.c")
 """Two credentials refused on shape alone — before a `kid`, and so before any key set."""
+
+ALLOWED_ORIGIN = "https://app.example.com"
+"""The one origin every cookie-mode snippet on the page allows.
+
+A cookie mode checks CSRF *before* it looks at the credential, so a cross-site probe would be a
+403 and would prove nothing about the cookie behind it. The forged-cookie probe is therefore sent
+same-origin, and a snippet that allowed some other origin fails here rather than passing on a 403.
+"""
+
+COOKIE_SCHEME_PREFIX = "BetterAuthCookie-"
+"""How every cookie verifier names its OpenAPI scheme: the prefix, then the cookie name."""
+
+COOKIE_NAMES = ("better-auth.session_token", "__Secure-better-auth.session_token")
+"""Both spellings of the one cookie Better Auth sets.
+
+A verifier accepts exactly one of them — the `__Secure-` form by default, the plain one under
+`secure_cookies=False` — and ignores the other, so presenting both is how the probe stays correct
+whichever a snippet configures. They are different names, so this is never a duplicate cookie.
+"""
+
+FORGED_COOKIES = ("not-a-signed-cookie", "forged.short", "forged." + "A" * 43 + "=")
+"""Three forged session cookies, refused without asking anyone: no signature separator at all, a
+signature of the wrong length, and a well-formed envelope whose HMAC does not verify."""
 
 BASE_URL = "https://auth.example.com"
 BROKEN_SNIPPET = "```python\nfrom fastapi_better_auth import BetterAuht\n```\n"
@@ -104,15 +135,20 @@ def apps_in(namespace: Mapping[str, Any]) -> tuple[FastAPI, ...]:
     return tuple(value for value in namespace.values() if isinstance(value, FastAPI))
 
 
-def secured_paths(document: Mapping[str, Any]) -> tuple[str, ...]:
-    """The GET operations the published document says need a credential."""
+def secured_paths(document: Mapping[str, Any], method: str = "get") -> tuple[str, ...]:
+    """The operations of one method the published document says need a credential."""
     paths: Mapping[str, Any] = document.get("paths", {})
     found: list[str] = []
     for path, operations in paths.items():
-        operation: Mapping[str, Any] = operations.get("get", {})
+        operation: Mapping[str, Any] = operations.get(method, {})
         if "security" in operation:
             found.append(path)
     return tuple(found)
+
+
+def forged_cookie_header(value: str) -> str:
+    """One `Cookie` header carrying the forgery under both spellings of the session cookie."""
+    return "; ".join(f"{name}={value}" for name in COOKIE_NAMES)
 
 
 @pytest.fixture
@@ -202,9 +238,17 @@ def test_the_applications_the_snippets_build_enforce_and_document_themselves(
     terminal 401 for `optional_session` exactly as it is for `current_session`, so the whole
     documented surface can be held to one wire shape. Anonymity is the half that differs, so it
     is asserted where it is decidable — some route among the snippets must refuse it.
+
+    A secured POST is a cookie route, and it is driven with a forged cookie for the same reason:
+    the page documents cookie modes on unsafe methods, so without this the only thing ever asked
+    to refuse anything would be the bearer half. `refuse_network` is asserted per route as well as
+    once at the end, because a cookie mode that had to *ask upstream* to reject a forgery would
+    still answer 401 — the refusal would be right and the documented behaviour ("refused locally,
+    before any upstream call") would be false.
     """
     published: list[Mapping[str, Any]] = []
     anonymous: list[int] = []
+    refused_posts: list[str] = []
 
     for snippet in ALL_SNIPPETS:
         for app in apps_in(run(snippet)):
@@ -216,7 +260,7 @@ def test_the_applications_the_snippets_build_enforce_and_document_themselves(
                 if BEARER_NAME in schemes:
                     published.append(schemes[BEARER_NAME])
                 for path in secured_paths(document):
-                    where = f"{snippet.id} {path}"
+                    where = f"{snippet.id} GET {path}"
                     assert document["paths"][path]["get"]["security"] == BEARER_REQUIREMENT, where
                     for credential in FORGED:
                         forged = client.get(path, headers={"Authorization": f"Bearer {credential}"})
@@ -224,8 +268,27 @@ def test_the_applications_the_snippets_build_enforce_and_document_themselves(
                         assert forged.json() == UNAUTHENTICATED, where
                         assert forged.headers["www-authenticate"] == "Bearer", where
                     anonymous.append(client.get(path).status_code)
+                for path in secured_paths(document, "post"):
+                    where = f"{snippet.id} POST {path}"
+                    requirement = document["paths"][path]["post"]["security"]
+                    assert requirement and all(len(r) == 1 for r in requirement), where
+                    assert any(
+                        next(iter(r)).startswith(COOKIE_SCHEME_PREFIX) for r in requirement
+                    ), where
+                    for cookie in FORGED_COOKIES:
+                        headers = {
+                            "Cookie": forged_cookie_header(cookie),
+                            "Origin": ALLOWED_ORIGIN,
+                        }
+                        forged = client.post(path, headers=headers)
+                        assert forged.status_code == 401, where
+                        assert forged.json() == UNAUTHENTICATED, where
+                        assert forged.headers["www-authenticate"] == "Bearer", where
+                        assert refuse_network == [], where
+                    refused_posts.append(where)
 
     assert published, "no snippet builds an application that documents the bearer scheme"
+    assert refused_posts, "no documented POST route was proven to refuse a forged cookie"
     assert all(
         {key: definition[key] for key in BEARER_DEFINITION} == BEARER_DEFINITION
         and definition["description"]

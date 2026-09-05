@@ -162,8 +162,9 @@ class Session(BaseModel, Generic[UserT]):
             server-side session token to hand back. Held as a `SecretStr`, so it is
             masked in reprs and dumps and excluded from responses; read it deliberately
             with `.get_secret_value()`.
-        raw: The upstream payload as it arrived - the decoded JWT claims, or the whole
-            `get-session` body. Everything this model does not promote to a field
+        raw: The upstream payload as it arrived - the decoded JWT claims, or the `session`
+            half of the `get-session` body (never the `{session, user}` wrapper; the user is
+            `Session.user`). Everything this model does not promote to a field
             (`ipAddress`, `userAgent`, `activeOrganizationId`, plugin data) is reachable
             here, which is what keeps upstream field additions from being breaking
             changes. It is read-only and excluded from every serialization, so it never
