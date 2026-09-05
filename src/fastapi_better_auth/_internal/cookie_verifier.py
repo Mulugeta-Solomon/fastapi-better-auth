@@ -15,9 +15,6 @@ the store is reached on a CSRF failure. These are named invariants, spy-tested, 
 
 from __future__ import annotations
 
-# The keyring compare moved to `.signing`; `hmac` stays imported so the shared module is reachable
-# as `cookie_verifier.hmac`, the handle `test_cookie_verifier` spies `compare_digest` through.
-import hmac  # noqa: F401  # pyright: ignore[reportUnusedImport]
 import logging
 import threading
 from collections.abc import Mapping, Sequence

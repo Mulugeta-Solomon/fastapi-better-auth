@@ -368,7 +368,7 @@ class TestCsrfOrdering:
             calls.append(1)
             return real(a, b)
 
-        monkeypatch.setattr(cv.hmac, "compare_digest", spy)
+        monkeypatch.setattr(hmac, "compare_digest", spy)
         return calls
 
     @pytest.mark.anyio
