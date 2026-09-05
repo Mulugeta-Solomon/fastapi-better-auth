@@ -73,7 +73,14 @@ class CsrfFacts:
     Attributes:
         method: The HTTP method, verbatim. `None` for a WebSocket handshake, whose scope has
             no method at all.
-        origin: The `Origin` header, or `None` when the request carried none.
+        origin: The `Origin` header, or `None` when the request carried none. The first one,
+            when a malformed request carried several - which `origin_count` is how you find
+            out about, because resolving that by reading the first is not a decision this
+            layer makes.
+        origin_count: How many `Origin` header lines arrived. RFC 6454 gives a request exactly
+            one, so anything above `1` is a request no browser sends and an unsafe one is
+            refused for it. Defaults to `1` for a snapshot built by hand: a direct construction
+            describes a request carrying the one `origin` it was given.
         sec_fetch_site: The `Sec-Fetch-Site` header, or `None`.
         header_name: The custom header this snapshot was captured *for*, lowercased - the
             policy's `required_header`, or `None` when it wants none. A policy refuses a
@@ -85,6 +92,7 @@ class CsrfFacts:
 
     method: str | None = None
     origin: str | None = None
+    origin_count: int = 1
     sec_fetch_site: str | None = None
     header_name: str | None = None
     header_value: str | None = None
@@ -116,6 +124,7 @@ class CsrfFacts:
         return cls(
             method=method if isinstance(method, str) else None,
             origin=headers.get("origin"),
+            origin_count=len(headers.getlist("origin")),
             sec_fetch_site=headers.get("sec-fetch-site"),
             header_name=name,
             header_value=None if name is None else headers.get(name),
@@ -144,6 +153,7 @@ class CsrfFacts:
         return (
             f"{type(self).__name__}(method={safe_label(self.method)},"
             f" origin={safe_origin(self.origin)},"
+            f" origin_count={self.origin_count},"
             f" sec_fetch_site={safe_label(self.sec_fetch_site)},"
             f" header_name={safe_label(self.header_name)},"
             f" header_value={'<absent>' if submitted is None else fingerprint(submitted)},"
@@ -464,6 +474,12 @@ def _reject_bad_origin(facts: CsrfFacts, allowed: tuple[bytes, ...]) -> None:
             reason="no Origin header on an unsafe request. Browsers send one on every unsafe"
             " method and on every WebSocket handshake; a client that does not is refused"
             " rather than exempted"
+        )
+    if facts.origin_count > 1:
+        # Refused before the allowlist: resolving two Origins by reading the first is a choice
+        # made on behalf of whoever arranged for the second (D-184).
+        raise CsrfFailure(
+            reason="more than one Origin header on an unsafe request; a browser sends exactly one"
         )
     presented = origin.encode("utf-8", "replace")
     matched = False

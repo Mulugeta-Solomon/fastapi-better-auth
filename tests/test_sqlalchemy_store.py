@@ -51,7 +51,7 @@ from fastapi_better_auth._internal.stores.sqlalchemy_core import (
     session_from,
     user_from,
 )
-from fastapi_better_auth._internal.stores.upstream import as_text
+from fastapi_better_auth._internal.stores.upstream import as_db_flag, as_text
 from tests.stores import (
     ADMIN_ID,
     EXPIRES_AT,
@@ -758,6 +758,14 @@ class TestUnencodableRowValues:
             assert session_from([row], plan, LONE_SURROGATE_TOKEN) is None
 
         assert caplog.records, "an unreadable token was refused silently"
+
+    def test_as_db_flag_passes_a_real_boolean_through(self) -> None:
+        """Boy-scout: the unit lane could not reach this branch. SQLite and MySQL encode a
+        boolean column as the integer 0/1, so no test over this schema ever hands `as_db_flag`
+        a real `bool` - only Postgres does, in the conformance lane. Called directly, so the
+        Postgres reading is pinned where the rest of the mapper is."""
+        assert as_db_flag(True) is True
+        assert as_db_flag(False) is False
 
     def test_as_text_refuses_a_string_no_encoder_can_write(self) -> None:
         """The boundary both stores already trust. A `str` that is not UTF-8-encodable cannot be
