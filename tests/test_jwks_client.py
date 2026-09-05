@@ -575,16 +575,19 @@ async def test_concurrent_misses_coalesce_behind_one_fetch() -> None:
 
 
 @pytest.mark.anyio
-async def test_a_cancelled_fetch_does_not_burn_the_refetch_window() -> None:
-    """SA-8. The window was stamped *before* the await, so a caller whose own deadline expired
-    mid-fetch spent the whole ten seconds on behalf of everyone behind it: nobody fetched, and
-    every lookup in that window answered `AuthServiceUnavailable` off a cold cache.
+async def test_a_cancelled_fetch_still_counts_as_the_windows_attempt() -> None:
+    """R12 (fix round 2). The window is stamped *before* the await, so the moment a fetch
+    begins the attempt is spent, and a caller whose own deadline expires mid-flight cannot
+    roll it back: a second lookup inside the window sees `_may_fetch()` False and never dials.
 
-    A caller's deadline is not an attempt anybody made. The stamp moved to completion - a
-    fetch that returned, and one that failed, are both attempts; a cancelled one is not.
+    Stamping on completion instead reopens D-084. A per-request deadline shorter than a slow
+    JWKS answer would then leave `_attempted_at` untouched on every cancelled request, so each
+    one re-fetches - one outbound fetch per request, single-flight notwithstanding - and a
+    `kid` an attacker chose is back to costing a fetch. D-084 is the settled invariant; the
+    availability nit this restores (one cancelled fetch burns one window) is the accepted cost.
 
-    Cancelled on a *signal* rather than on a stopwatch: the scope is cut only once the
-    transport has recorded the call, so the probe cannot pass by having never fetched at all.
+    Cut on a *signal*, not a stopwatch: the scope is cancelled only once the transport has
+    recorded the call, so the stamp under test is provably the one the fetch set.
     """
     clock = Clock()
     gate = anyio.Event()
@@ -604,11 +607,11 @@ async def test_a_cancelled_fetch_does_not_burn_the_refetch_window() -> None:
         scopes[0].cancel()
 
     assert transport.calls == 1, "the fetch never started; this probe proves nothing"
-    assert keys._may_fetch() is True  # pyright: ignore[reportPrivateUsage]
+    assert keys._may_fetch() is False  # pyright: ignore[reportPrivateUsage]
 
-    gate.set()
-    assert await keys.key_for(SIGNER.kid) is not None
-    assert transport.calls == 2
+    with pytest.raises(AuthServiceUnavailable):
+        await keys.key_for(SIGNER.kid)
+    assert transport.calls == 1, "a cancelled fetch reopened the window - the D-084 flood"
 
 
 @pytest.mark.anyio

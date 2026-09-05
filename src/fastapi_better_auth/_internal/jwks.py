@@ -177,27 +177,15 @@ class JwksClient:
         return self._clock() - self._attempted_at >= self._refetch_interval
 
     async def _refresh(self) -> None:
-        """Attempt a fetch. A failure with keys already on hand is survivable; the first is not.
-
-        The window is stamped when the fetch *finishes* - returned or failed, both are attempts
-        somebody made. A cancellation is not: one caller's deadline expiring mid-fetch used to
-        close the window on behalf of everyone behind it, so nobody fetched and every lookup
-        for the next interval answered off a cache that was never filled. That distinction is
-        the `except` list itself - a cancellation is the `BaseException` neither clause names,
-        so it leaves through the middle of this method with the window untouched.
-        """
+        """Attempt a fetch. A failure with keys already on hand is survivable; the first is not."""
+        self._attempted_at = self._clock()
         try:
             keys = await self._fetched()
         except AuthServiceUnavailable:
-            self._attempted_at = self._clock()
             if self._keys is None:
                 raise
             logger.warning("jwks refresh failed for %s; serving the key set on hand", self._uri)
             return
-        except Exception:
-            self._attempted_at = self._clock()
-            raise
-        self._attempted_at = self._clock()
         self._keys = keys
         self._fetched_at = self._clock()
         self._missing.clear()
