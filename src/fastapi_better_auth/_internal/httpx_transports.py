@@ -12,7 +12,13 @@ from typing import TYPE_CHECKING, Protocol, TypeVar
 import anyio
 
 from .errors import ConfigurationError
-from .transport import ContentEncodingRejected, ResponseTooLarge, TransportResponse
+from .transport import (
+    ContentEncodingRejected,
+    ResponseTooLarge,
+    TransportFailure,
+    TransportResponse,
+    UntrustedResponse,
+)
 
 if TYPE_CHECKING:
     import httpx
@@ -218,6 +224,8 @@ class _HttpxFamilyTransport:
         max_bytes: int,
     ) -> TransportResponse:
         _validate_cap(max_bytes)
+        timed_out = False
+        failed = ""
         try:
             with anyio.fail_after(self._timeout + DEADLINE_GRACE):
                 async with self._client.stream(
@@ -232,14 +240,28 @@ class _HttpxFamilyTransport:
                         headers=response.headers,
                         content=await _capped(response, max_bytes),
                     )
-        except self._timeout_error() as exc:
-            raise TimeoutError(f"{method} {url} timed out after {self._timeout}s") from exc
+        except UntrustedResponse:
+            raise
+        except (TimeoutError, self._timeout_error()):
+            timed_out = True
+        except Exception as exc:  # noqa: BLE001 - translated below so no request rides it out
+            failed = type(exc).__name__
+        finally:
+            # D-094: this frame is the one a locals-capturing reporter would blame us for.
+            headers = None
+            content = b""
+        if timed_out:
+            raise TimeoutError(f"{method} {url} timed out after {self._timeout}s")
+        raise TransportFailure(reason=f"[{failed}] {url}")
 
     async def get(
         self, url: str, *, headers: Mapping[str, str] | None = None, max_bytes: int
     ) -> TransportResponse:
         """Fetch `url`, reading at most `max_bytes` of body. See `Transport.get`."""
-        return await self._fetch("GET", url, headers=headers, content=b"", max_bytes=max_bytes)
+        try:
+            return await self._fetch("GET", url, headers=headers, content=b"", max_bytes=max_bytes)
+        finally:
+            headers = None  # D-094: this frame is in the traceback too.
 
     async def post(
         self,
@@ -250,7 +272,13 @@ class _HttpxFamilyTransport:
         max_bytes: int,
     ) -> TransportResponse:
         """Send `content` to `url`, reading at most `max_bytes` of body. See `Transport.post`."""
-        return await self._fetch("POST", url, headers=headers, content=content, max_bytes=max_bytes)
+        try:
+            return await self._fetch(
+                "POST", url, headers=headers, content=content, max_bytes=max_bytes
+            )
+        finally:
+            headers = None  # D-094: this frame is in the traceback too.
+            content = b""
 
     async def aclose(self) -> None:
         """Close the client this adapter built. An injected one is left alone: its lifetime
@@ -309,9 +337,12 @@ class HttpxTransport(_HttpxFamilyTransport):
     the per-phase budget. Either way the timeout a caller sees is a builtin `TimeoutError`:
     the whole-exchange deadline raises one directly, and the library's own `TimeoutException`
     from a stalled phase is translated to one at this boundary, so the timeout contract does
-    not leak which library is underneath. Non-timeout failures - a refused connection, a TLS
-    error, a mid-response disconnect - propagate untranslated, because a transport does not
-    know what one means to the request that caused it.
+    not leak which library is underneath. Every other failure - a refused connection, a TLS
+    error, a mid-response disconnect - is translated too, to a `TransportFailure` naming only
+    the failure's type and the URL. Both replacements are raised *outside* the failing
+    `except`, so nothing of the outbound request rides out: the library's own exception holds a
+    `.request` with every header, and the day this transport carries a `cookie: <session>` that
+    would be the credential leaking into a traceback.
 
     An injected client's per-phase timeouts are then whatever it was built with rather than
     `timeout`, while the whole-exchange deadline still applies.
@@ -358,8 +389,8 @@ class Httpx2Transport(_HttpxFamilyTransport):
     client's cookie jar is shut at construction, injected or not, so an upstream `Set-Cookie`
     is neither stored nor replayed; the cap counts wire bytes and a `Content-Encoding` is
     refused as `ContentEncodingRejected`; `timeout` bounds the whole exchange and surfaces as
-    a builtin `TimeoutError` whichever clock fired; and non-timeout failures propagate
-    untranslated.
+    a builtin `TimeoutError` whichever clock fired; and every other failure is translated to a
+    `TransportFailure`, raised outside the failing `except` so no outbound header rides out.
 
     Args:
         timeout: Seconds. The deadline for one fetch, and the client's per-phase budget when

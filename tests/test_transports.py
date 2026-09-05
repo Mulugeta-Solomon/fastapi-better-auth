@@ -13,13 +13,14 @@ from __future__ import annotations
 import gc
 import gzip
 import inspect
+import pickle
 import sys
 import tracemalloc
 import warnings
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import anyio
 import httpx
@@ -38,6 +39,7 @@ from fastapi_better_auth import (
 from fastapi_better_auth._internal.httpx_transports import (
     _capped,  # pyright: ignore[reportPrivateUsage]
 )
+from fastapi_better_auth._internal.transport import TransportFailure
 from tests.scripted_server import (
     encoded,
     hangup,
@@ -410,13 +412,170 @@ async def test_a_timeout_is_never_the_libraries_own_exception_type(library: Libr
 
 
 @pytest.mark.anyio
-async def test_a_non_timeout_network_error_stays_untranslated(library: Library) -> None:
-    """The line B4 does not cross: only a timeout is translated. A server that disconnects
-    without answering is the library's own `RemoteProtocolError`, passed through for the
-    verifier above to read as it likes."""
+async def test_a_non_timeout_network_error_becomes_a_transport_failure(library: Library) -> None:
+    """R13 (fix round 2). A server that disconnects without answering used to propagate the
+    library's own `RemoteProtocolError` - whose `.request` holds every outbound header. Now
+    every non-timeout failure is translated to a `TransportFailure` raised OUTSIDE the failing
+    `except`, so the exception a caller sees names only the failure's type and the URL, is
+    never the library's own error type, and chains nothing (no `__cause__`, no `__context__`)
+    that could carry the request out."""
     async with scripted_server(hangup()) as served, library.build() as transport:
-        with pytest.raises(library.disconnect_error):
-            await transport.get(f"{served.origin()}/api/auth/jwks", max_bytes=CAP)
+        url = f"{served.origin()}/api/auth/jwks"
+        with pytest.raises(TransportFailure) as caught:
+            await transport.get(url, max_bytes=CAP)
+
+    assert not isinstance(caught.value, library.disconnect_error)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert url in caught.value.reason
+    assert library.disconnect_error.__name__ in caught.value.reason
+
+
+# The outbound header a failing fetch must never let out. Distinctive enough that any
+# appearance anywhere in a raised exception is this cookie and nothing incidental.
+OUTBOUND_COOKIE = "session=leak-canary-" + "z" * 48
+
+
+def _getattr(obj: object, name: str) -> object:
+    """`getattr` guarded: httpx's `.request` is a property that raises `RuntimeError` when
+    unset rather than returning a default, so a bare `getattr(exc, "request", None)` throws."""
+    try:
+        return getattr(obj, name, None)
+    except Exception:  # noqa: BLE001 - an attribute that cannot be read carries nothing
+        return None
+
+
+def _appears_in(secret: str, obj: object, seen: set[int]) -> bool:
+    """Whether `secret` shows up in how an error reporter would serialize `obj`: strings and
+    bytes searched directly, containers walked, everything else taken as its `repr` - which is
+    what a Sentry-style frame-locals capture records for it."""
+    if id(obj) in seen:
+        return False
+    seen.add(id(obj))
+    if isinstance(obj, str):
+        return secret in obj
+    if isinstance(obj, (bytes, bytearray)):
+        return secret.encode() in bytes(obj)
+    if isinstance(obj, Mapping):
+        mapping = cast("Mapping[object, object]", obj)
+        return any(
+            _appears_in(secret, key, seen) or _appears_in(secret, value, seen)
+            for key, value in mapping.items()
+        )
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        members = cast("Iterable[object]", obj)
+        return any(_appears_in(secret, item, seen) for item in members)
+    try:
+        return secret in repr(obj)
+    except Exception:  # noqa: BLE001 - an object whose repr raises hides nothing
+        return False
+
+
+def _carried_request_leaks(secret: str, carried: object) -> bool:
+    """A carried httpx request/response redacts sensitive headers in its `repr`, so the raw,
+    undecoded header list and the body are what have to be searched - that is where a `cookie`
+    header actually lives once it is on a `Request`."""
+    headers = _getattr(carried, "headers")
+    raw = _getattr(headers, "raw")
+    if raw is not None and _appears_in(secret, raw, set()):
+        return True
+    if raw is None and headers is not None and _appears_in(secret, headers, set()):
+        return True
+    content = _getattr(carried, "content")
+    return content is not None and _appears_in(secret, content, set())
+
+
+def _request_reachable(secret: str, error: BaseException) -> bool:
+    """Walk everything an error reporter would touch that the *transport* is responsible for:
+    the whole `__cause__`/`__context__` chain, every exception's `.request`/`.response`, and
+    every traceback frame's locals - except this test module's own frames. The caller of a
+    fetch legitimately holds the credential it is verifying (and the scripted server holds the
+    request it received), so a frame in this file carrying the secret is not a transport leak."""
+    seen: set[int] = set()
+    chain: list[BaseException] = []
+    exc: BaseException | None = error
+    while exc is not None and all(exc is not link for link in chain):
+        chain.append(exc)
+        exc = exc.__cause__ or exc.__context__
+    for link in chain:
+        if _appears_in(secret, link.args, seen):
+            return True
+        for name in ("request", "response"):
+            carried = _getattr(link, name)
+            if carried is not None and _carried_request_leaks(secret, carried):
+                return True
+        frame = link.__traceback__
+        while frame is not None:
+            if frame.tb_frame.f_code.co_filename != __file__ and _appears_in(
+                secret, frame.tb_frame.f_locals, seen
+            ):
+                return True
+            frame = frame.tb_next
+    return False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("scenario", ["stalling", "hangup", "connect-refused", "over-cap"])
+async def test_no_fetch_failure_carries_the_outbound_request(
+    library: Library, scenario: str
+) -> None:
+    """R13 (fix round 2), the phase-3 prerequisite. The JWKS fetch sends `accept` only, but
+    the day `RemoteVerifier` posts get-session it sends `cookie: <session>` through this same
+    transport. A fetch that fails must not smuggle that outbound header out in the exception it
+    raises - not as a chained httpx exception whose `.request` holds every header verbatim, and
+    not in a frame local a Sentry-style capture would serialize. Reproduced 4/4 before the fix:
+    the timeout chained the httpx error as `__cause__`; the non-timeout failures propagated the
+    raw httpx error; every path left the outbound `headers` in `_fetch`'s frame unscrubbed.
+    """
+    # The cookie is passed *inline*, never bound to a local here: the caller legitimately holds
+    # the credential it is verifying, so this test's own frame holding it would be a false
+    # positive. What is under test is that the transport does not retain or chain it out.
+    error: BaseException | None = None
+
+    if scenario == "connect-refused":
+        async with library.build() as transport:
+            try:
+                await transport.get(
+                    "http://127.0.0.1:1/api/auth/jwks",
+                    headers={"cookie": OUTBOUND_COOKIE},
+                    max_bytes=CAP,
+                )
+            except Exception as exc:  # noqa: BLE001 - inspect whatever the fetch raised
+                error = exc
+    else:
+        responder = {
+            "stalling": stalling(),
+            "hangup": hangup(),
+            "over-cap": replying(200, body=b"x" * (CAP + 1)),
+        }[scenario]
+        built = library.build(timeout=STALL_TIMEOUT) if scenario == "stalling" else library.build()
+        async with scripted_server(responder) as served, built as transport:
+            try:
+                await transport.get(
+                    f"{served.origin()}/api/auth/jwks",
+                    headers={"cookie": OUTBOUND_COOKIE},
+                    max_bytes=CAP,
+                )
+            except Exception as exc:  # noqa: BLE001 - inspect whatever the fetch raised
+                error = exc
+
+    assert error is not None, f"{scenario}: the fetch was supposed to fail and did not"
+    assert not _request_reachable(OUTBOUND_COOKIE, error), (
+        f"{scenario}: the outbound cookie is reachable from the raised {type(error).__name__}"
+    )
+
+
+def test_a_transport_failure_names_only_its_reason_and_survives_a_pickle() -> None:
+    """The internal `TransportFailure` carries only a `[type] url` reason - never the request -
+    and, like the untrusted-response errors, keeps it through the pickle an error reporter does
+    (a keyword-only `__init__` and the default `__reduce__` would not)."""
+    error = TransportFailure(reason="[ConnectError] https://auth.example.com/api/auth/jwks")
+
+    assert "ConnectError" in error.reason
+    assert "ConnectError" in repr(error)
+    restored = pickle.loads(pickle.dumps(error))
+    assert isinstance(restored, TransportFailure)
+    assert restored.reason == error.reason
 
 
 @pytest.mark.anyio
@@ -529,11 +688,15 @@ async def test_closing_the_adapter_leaves_an_injected_client_open(library: Libra
 
 @pytest.mark.anyio
 async def test_closing_the_adapter_closes_the_client_it_built(library: Library) -> None:
+    """A fetch on the closed client fails. Under the fix-round-2 contract every non-timeout
+    failure - the library's `RuntimeError` for a closed client included - is translated to a
+    `TransportFailure`, so what proves the client is shut is the failure, not its exact type."""
     transport = library.build()
     await transport.aclose()
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(TransportFailure) as caught:
         await transport.get("http://127.0.0.1:1/api/auth/jwks", max_bytes=CAP)
+    assert "RuntimeError" in caught.value.reason
 
 
 @pytest.mark.anyio
