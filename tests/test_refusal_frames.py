@@ -6,10 +6,10 @@ in one of those frames therefore ships the victim's live credential to whatever 
 and the CSRF paths do it on the exact attacker-induced cross-site request the control exists for.
 
 The other suites assert this one frame at a time, from the inside. This one asserts it from the
-outside and for every path at once: drive `BetterAuth._authenticate` - the dispatcher's own entry,
-so the dispatcher's frames are on the traceback too - through every refusal both modes can
-produce, then walk every frame of the resulting exception (and of everything it chains to) looking
-for the credential.
+outside and for every path at once: drive the dispatcher through the resolver FastAPI itself
+awaits - so the dispatcher's own frames are on the traceback too - through every refusal both
+modes can produce, then walk every frame of the resulting exception (and of everything it chains
+to) looking for the credential.
 
 Two objects are deliberately out of scope, and each row passes them to `holding(ignore=...)`:
 
@@ -19,8 +19,9 @@ Two objects are deliberately out of scope, and each row passes them to `holding(
 * **The store.** It is the operator's object; the fakes here hold the seeded record in memory by
   construction, which is a property of the test fixture and not of any code under test.
 
-`TestTheWalker` proves the instrument before the matrix uses it: a planted unscrubbed frame is caught, a `SecretStr` is not a hit, and the same
-value as a bare `str` is.
+`TestTheWalker` proves the instrument before the matrix uses it: a planted unscrubbed frame is
+caught, a chained exception is followed, a credential four containers deep is reached, and a
+`SecretStr` is not a hit where the same value as a bare `str` is.
 """
 
 from __future__ import annotations
