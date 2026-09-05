@@ -27,6 +27,14 @@ MISSING = (
     " (postgresql+asyncpg, postgresql+psycopg, mysql+asyncmy) for the engine you pass it."
 )
 
+DEFAULT_MAX_CONCURRENCY = 8
+"""Worker-thread ceiling for a pool whose capacity cannot be read (`NullPool`, `StaticPool`).
+
+A conservative bound on concurrent DB threads when the engine's pool does not state a size, so
+a flood of cancelled lookups cannot open an unbounded number of connections. A `QueuePool` (the
+production default) is introspectable and the limiter is sized to it instead - see `_pool_ceiling`.
+"""
+
 
 def _core(adapter: str):
     """The module that imports SQLAlchemy, reached only once a store is actually built.
@@ -231,16 +239,29 @@ class SyncStoreAdapter(_CoreStore):
     for the session and its user, the schema discovered once, admin columns surfaced where they
     exist, naive timestamps read as UTC.
 
+    **Concurrent lookups are bounded by this adapter, not by the process-wide thread pool.** Each
+    lookup runs its DBAPI call on a worker thread that checks out one pooled connection; without a
+    bound, a flood of concurrent (or cancelled) lookups would exhaust the connection pool and error
+    a legitimate request with a checkout timeout. The adapter holds its own `anyio.CapacityLimiter`,
+    sized to the engine's pool where it is introspectable (a `QueuePool`'s size plus overflow) so
+    the *limiter* is where excess lookups queue - cheap and cancellable - rather than the pool. A
+    cancelled lookup returns to the caller promptly, but the DBAPI call it started still runs to
+    completion on its worker thread and its connection returns to the pool only when it finishes.
+
     Args:
         engine: A synchronous `Engine`, injected. Its pool needs room for the worker threads
             this adapter uses, which is one per concurrent lookup.
         session_table: The session table's name.
         user_table: The user table's name.
         schema: The database schema both tables live in, or `None`.
+        max_concurrency: The most lookups that may run on worker threads at once. `None` (the
+            default) sizes the bound to the engine's connection pool where that is introspectable,
+            and otherwise to a conservative default; pass a positive int to set it explicitly.
 
     Raises:
         ConfigurationError: If `sqlalchemy` is not installed, if `engine` is an `AsyncEngine` or
-            not an `Engine` at all, or if either table name is blank or the two are the same.
+            not an `Engine` at all, if either table name is blank or the two are the same, or if
+            `max_concurrency` is not a positive int.
     """
 
     def __init__(
@@ -250,6 +271,7 @@ class SyncStoreAdapter(_CoreStore):
         session_table: str = "session",
         user_table: str = "user",
         schema: str | None = None,
+        max_concurrency: int | None = None,
     ) -> None:
         super().__init__(
             adapter="SyncStoreAdapter",
@@ -258,16 +280,24 @@ class SyncStoreAdapter(_CoreStore):
             schema=schema,
         )
         self._engine = self._sql.validated_sync_engine(engine)
+        self._limiter = anyio.CapacityLimiter(
+            _limiter_tokens(self._engine, _validated_concurrency(max_concurrency))
+        )
 
     async def _columns(self) -> Columns:
-        return await run_sync(self._inspected)
+        return await run_sync(self._inspected, abandon_on_cancel=True, limiter=self._limiter)
 
     def _inspected(self) -> Columns:
         with self._engine.connect() as connection:
             return self._reflected(connection)
 
     async def _select(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
-        return await run_sync(self._queried, statement, dict(params))
+        # abandon_on_cancel frees the async caller on cancellation; the DBAPI call keeps running on
+        # its worker thread and its connection returns to the pool only when it finishes. The
+        # limiter bounds concurrent threads (hence checked-out connections) to the adapter's own.
+        return await run_sync(
+            self._queried, statement, dict(params), abandon_on_cancel=True, limiter=self._limiter
+        )
 
     def _queried(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
         try:
@@ -276,3 +306,47 @@ class SyncStoreAdapter(_CoreStore):
         except self._sql.SQLAlchemyError:
             failure = self._sql.lookup_unavailable(params)
         raise failure from None
+
+
+def _validated_concurrency(max_concurrency: object) -> int | None:
+    if max_concurrency is None:
+        return None
+    if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
+        raise ConfigurationError(
+            "SyncStoreAdapter(max_concurrency=...) must be a positive int or None (size the"
+            f" bound to the engine's pool); got {type(max_concurrency).__name__}."
+        )
+    if max_concurrency < 1:
+        raise ConfigurationError(
+            "SyncStoreAdapter(max_concurrency=...) must be at least 1; a bound of"
+            f" {max_concurrency} would let no lookup run."
+        )
+    return max_concurrency
+
+
+def _limiter_tokens(engine: Engine, max_concurrency: int | None) -> int:
+    """The adapter's worker-thread bound: the caller's if given, else the engine's pool size."""
+    return max_concurrency if max_concurrency is not None else _pool_ceiling(engine)
+
+
+def _pool_ceiling(engine: Engine) -> int:
+    """How many connections the engine's pool can hand out at once, or a conservative default.
+
+    Sizing the limiter to this is what makes the *limiter*, not the pool, the point excess lookups
+    queue at: a `QueuePool` states its size and overflow, so the bound matches what the pool can
+    serve and a flood waits on the limiter instead of exhausting the pool. A pool that cannot state
+    a size (`NullPool`, `StaticPool`) falls back to `DEFAULT_MAX_CONCURRENCY`.
+    """
+    pool = getattr(engine, "pool", None)
+    size = getattr(pool, "size", None)
+    if not callable(size):
+        return DEFAULT_MAX_CONCURRENCY
+    try:
+        base = size()
+    except Exception:  # noqa: BLE001 - an exotic pool that cannot answer falls back to the default
+        return DEFAULT_MAX_CONCURRENCY
+    if not isinstance(base, int) or base < 1:
+        return DEFAULT_MAX_CONCURRENCY
+    overflow = getattr(pool, "_max_overflow", 0)
+    extra = overflow if isinstance(overflow, int) and overflow > 0 else 0
+    return base + extra
