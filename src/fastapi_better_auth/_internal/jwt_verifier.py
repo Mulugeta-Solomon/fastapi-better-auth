@@ -57,6 +57,12 @@ class JwtVerifier:
       is looked at. The allowlist is asymmetric-only and validated at construction, so `HS256`
       - the attack that signs a token with the *published* public key as an HMAC secret - is
       not configurable at all, and `none` never reaches a decode.
+    - **A `crit` header declaring critical extensions**, refused right after the header is read
+      and with no fetch. RFC 7515 4.1.11: a recipient must understand every extension a `crit`
+      names, or reject - Better Auth emits none and this library implements none, so any
+      declaration is a no, an empty list and a non-list included. Left to PyJWT the answer is
+      version-dependent (it honours the one extension it implements, `b64`, and older versions
+      honoured every name), which is exactly why it is decided here instead.
     - **A missing or unusable `kid`.** Every published key is never tried in turn: one weak
       key in a rotated set would otherwise verify anything.
     - **A missing `exp`, `iat`, `iss`, `aud` or `sub`.** PyJWT requires no claim by default,
