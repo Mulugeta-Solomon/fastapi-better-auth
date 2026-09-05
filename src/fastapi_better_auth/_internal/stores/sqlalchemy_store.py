@@ -89,7 +89,7 @@ class _CoreStore(ABC):
             return None
         plan = await self._ready()
         found = await self._select(plan.user_statement, {self._sql.USER_ID_PARAM: user_id})
-        return self._sql.user_from(found, plan, user_id)
+        return self._sql.user_from(found, plan, user_id, check_identity=True)
 
     async def _ready(self) -> Plan:
         """Discovery happens once, whoever gets there first.

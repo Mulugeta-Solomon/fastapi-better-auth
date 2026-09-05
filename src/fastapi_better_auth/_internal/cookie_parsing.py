@@ -27,6 +27,16 @@ SIGNATURE_LENGTH = 44
 HMAC_BYTES = 32
 MAX_COOKIE_BYTES = 8192
 MAX_CHUNKS = 100
+MAX_COOKIE_HEADER_BYTES = 16384
+"""The largest joined Cookie header this library will parse - 16 KiB, above any real browser's.
+
+A request over it carries no credential this library reads: `extract` returns absent rather than
+walking a header sized to burn CPU. This makes the parse bound the library's own guarantee, not
+the ASGI server's header cap (a dependency default). Starlette decodes the cookie bytes 1:1 to
+latin-1 characters, so the character count is the byte count (D-193).
+"""
+MAX_COOKIE_PAIRS = 512
+"""The most `name=value` pairs `extract` will parse from one Cookie header, above any real browser."""
 SESSION_TOKEN_SUFFIX = ".session_token"
 SESSION_DATA_SUFFIX = ".session_data"
 DATA_COOKIE_FALLBACK = "better-auth.session_data"
@@ -66,56 +76,53 @@ def cookie_pairs(header: str) -> tuple[tuple[str, str], ...]:
     return tuple(pairs)
 
 
-def acceptable_names(cookie_name: str, secure_prefix: str) -> frozenset[str]:
-    """Every cookie name this verifier will treat as its own: the bases and their chunk names.
+def acceptable_names(base: str) -> frozenset[str]:
+    """Every cookie name this verifier will treat as its own: the base and its chunk names.
 
-    Two bases - the plain `cookie_name` and its `__Secure-`-prefixed form (dropped when the prefix
-    is empty) - each joined by every chunk index Better Auth may split a long cookie across. A name
-    outside this set is another cookie's and is never read.
+    The single configured base - `secure_cookies` decides whether that is the `__Secure-`-prefixed
+    name or the plain one, never both - joined by every chunk index Better Auth may split a long
+    cookie across. A name outside this set is another cookie's and is never read. Accepting only
+    the one configured name is what closes the cross-name session fixation: a sibling subdomain
+    that plants the *other* name is not read at all (D-189).
     """
-    names: set[str] = set()
-    for base in _bases(cookie_name, secure_prefix):
-        names.add(base)
-        for index in range(MAX_CHUNKS):
-            names.add(f"{base}.{index}")
+    names: set[str] = {base}
+    for index in range(MAX_CHUNKS):
+        names.add(f"{base}.{index}")
     return frozenset(names)
 
 
-def session_data_names(cookie_name: str, secure_prefix: str) -> frozenset[str]:
-    """The names of the cookie-cache `session_data` cookie this verifier must never parse.
+def session_data_names(
+    cookie_name: str, secure_prefix: str, secure_cookies: bool
+) -> frozenset[str]:
+    """The name of the cookie-cache `session_data` cookie this verifier must never parse.
 
     Derived from the token cookie by swapping the `session_token` suffix for `session_data`, so a
     renamed token cookie keeps them aligned; falls back to Better Auth's default when the name does
-    not carry that suffix. The verifier warns once if it sees one (CVE-2026-67337) and reads it for
-    nothing else.
+    not carry that suffix. One base, matching the `secure_cookies` choice the token cookie uses, so
+    it emits the same single name the acceptable set does. The verifier warns once if it sees one
+    (CVE-2026-67337) and reads it for nothing else.
     """
     if cookie_name.endswith(SESSION_TOKEN_SUFFIX):
         data = cookie_name[: -len(SESSION_TOKEN_SUFFIX)] + SESSION_DATA_SUFFIX
     else:
         data = DATA_COOKIE_FALLBACK
-    return frozenset(_bases(data, secure_prefix))
+    return frozenset({f"{secure_prefix}{data}" if secure_cookies else data})
 
 
-def resolve_cookie_value(
-    pairs: tuple[tuple[str, str], ...], plain_base: str, secure_base: str | None
-) -> str:
-    """The one signed cookie value these pairs carry, preferring `__Secure-` when both are present.
+def resolve_cookie_value(pairs: tuple[tuple[str, str], ...], base: str) -> str:
+    """The one signed cookie value these pairs carry for the single configured base.
 
-    Walks the two bases in preference order and returns the first that has material - a single
-    whole cookie, or a contiguous run of chunks reassembled in index order. A base that carries
-    both a whole cookie and chunks, a duplicated name, or a chunk run with a gap, a repeat or a
-    missing index 0 is refused: a server emits none of those shapes.
+    Returns a single whole cookie, or a contiguous run of chunks reassembled in index order. A
+    base that carries both a whole cookie and chunks, a duplicated name, or a chunk run with a
+    gap, a repeat or a missing index 0 is refused: a server emits none of those shapes.
 
     Raises:
-        InvalidCredential: For any malformed set, and (defensively) if no base has material at all.
+        InvalidCredential: For any malformed set, and (defensively) if the base has no material.
     """
     try:
-        for base in (secure_base, plain_base):
-            if base is None:
-                continue
-            value = _value_for_base(pairs, base)
-            if value is not None:
-                return value
+        value = _value_for_base(pairs, base)
+        if value is not None:
+            return value
         # extract only dispatches when an acceptable name was present, so this is unreachable
         # through the real entry point; refused rather than returned so no direct caller gets ""
         raise InvalidCredential(reason="no session cookie material after resolution")
@@ -172,14 +179,6 @@ def parse_signed_value(material: str) -> ParsedCookie:
         material = decoded = token = signature = ""
         digest = b""
     return result
-
-
-def _bases(cookie_name: str, secure_prefix: str) -> tuple[str, ...]:
-    """The plain base and its prefixed form, deduplicated when the prefix is empty."""
-    prefixed = f"{secure_prefix}{cookie_name}"
-    if prefixed == cookie_name:
-        return (cookie_name,)
-    return (cookie_name, prefixed)
 
 
 def _value_for_base(pairs: tuple[tuple[str, str], ...], base: str) -> str | None:

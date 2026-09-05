@@ -605,6 +605,7 @@ def test_a_session_data_observation_logs_no_cookie_value(
         secret=SharedSecret(LEAKY_SECRET),
         store=RedisSessionStore(client=RecordingRedis()),
         csrf=CsrfDisabled(reason="log-hygiene scenario, no request is verified"),
+        secure_cookies=False,
     )
 
     verifier.extract(connection(cookie=f"better-auth.session_data={value}"))

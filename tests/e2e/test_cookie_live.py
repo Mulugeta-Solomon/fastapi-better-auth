@@ -111,6 +111,7 @@ class TestPostgresTopology:
                     secret=secret,
                     store=store,
                     csrf=CsrfDisabled(reason="a GET carries no CSRF risk; the rung is unit-tested"),
+                    secure_cookies=False,
                 )
             ]
         )
@@ -136,7 +137,10 @@ class TestPostgresTopology:
         auth = BetterAuth(
             verifiers=[
                 CookieVerifier(
-                    secret=secret, store=store, csrf=CsrfDisabled(reason="GET, unit-tested rung")
+                    secret=secret,
+                    store=store,
+                    csrf=CsrfDisabled(reason="GET, unit-tested rung"),
+                    secure_cookies=False,
                 )
             ]
         )
@@ -165,6 +169,7 @@ class TestRedisTopology:
                     secret=secret,
                     store=redis_store,
                     csrf=CsrfDisabled(reason="GET, unit-tested rung"),
+                    secure_cookies=False,
                 )
             ]
         )
@@ -189,6 +194,7 @@ class TestRedisTopology:
                     secret=secret,
                     store=redis_store,
                     csrf=CsrfDisabled(reason="GET, unit-tested rung"),
+                    secure_cookies=False,
                 )
             ]
         )
@@ -218,6 +224,7 @@ class TestComposition:
                     secret=secret,
                     store=SqlAlchemySessionStore(engine=engine),
                     csrf=OriginCheck(allowed_origins=[harness]),
+                    secure_cookies=False,
                 ),
             ]
         )
@@ -316,6 +323,7 @@ class TestCsrf:
                     secret=secret,
                     store=SqlAlchemySessionStore(engine=engine),
                     csrf=OriginCheck(allowed_origins=[self.ALLOWED]),
+                    secure_cookies=False,
                 )
             ]
         )

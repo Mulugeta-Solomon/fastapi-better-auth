@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
-from types import MappingProxyType
 from typing import Annotated, Any, Generic, TypeVar
 
 from pydantic import (
@@ -44,8 +43,40 @@ def _assume_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
 
+class _RawMapping(Mapping[str, Any]):
+    """A read-only view of the upstream payload whose repr masks the raw session token.
+
+    `Session.raw` carries the payload as it arrived so an application can read its own fields,
+    but in cookie mode that payload holds the raw session token under `token` in cleartext -
+    which `repr(session.raw)` would render even though `Session.token` (a `SecretStr`) is masked.
+    The value stays reachable by key; only the repr redacts it (D-194).
+    """
+
+    __slots__ = ("_data",)
+    _MASKED = frozenset({"token"})
+
+    def __init__(self, value: Mapping[str, Any]) -> None:
+        self._data: dict[str, Any] = dict(value)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        rendered = ", ".join(
+            f"{key!r}: {'<redacted>' if key in self._MASKED else value!r}"
+            for key, value in self._data.items()
+        )
+        return f"{{{rendered}}}"
+
+
 def _freeze(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    return MappingProxyType(dict(value))
+    return _RawMapping(value)
 
 
 UserId = Annotated[
@@ -136,7 +167,10 @@ class Session(BaseModel, Generic[UserT]):
             (`ipAddress`, `userAgent`, `activeOrganizationId`, plugin data) is reachable
             here, which is what keeps upstream field additions from being breaking
             changes. It is read-only and excluded from every serialization, so it never
-            reaches a response body or an OpenAPI schema.
+            reaches a response body or an OpenAPI schema. In cookie mode it also carries
+            the raw session token under `token`: its repr masks that one value (as
+            `Session.token` is masked), but the value stays reachable by key, so do not
+            log `raw` wholesale.
 
     `raw` is copied one level deep: the mapping itself is new and read-only, but nested
     containers are shared with the payload that was passed in. Never hand one payload

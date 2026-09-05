@@ -134,10 +134,14 @@ def http(method: str = "GET", *, cookie: str | None = None, **headers: str) -> H
 
 
 def verifier(*, store: FakeStore | None = None, csrf: Any = None, **kwargs: Any) -> CookieVerifier:
+    # The golden vector and the live http harness both set the PLAIN cookie name (better-auth
+    # emits `__Secure-` only over https), so the cookie lane models a plain-name deployment:
+    # secure_cookies=False. The secure default (True) is exercised in test_secure_cookies.py.
     return CookieVerifier(
         secret=kwargs.pop("secret", SECRET),
         store=seeded_store() if store is None else store,
         csrf=CsrfDisabled(reason="signature tests do not exercise CSRF") if csrf is None else csrf,
+        secure_cookies=kwargs.pop("secure_cookies", False),
         **kwargs,
     )
 

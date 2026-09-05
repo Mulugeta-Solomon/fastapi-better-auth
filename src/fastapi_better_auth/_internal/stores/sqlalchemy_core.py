@@ -265,7 +265,13 @@ def session_from(rows: Sequence[Mapping[str, Any]], plan: Plan, token: str) -> S
     )
 
 
-def user_from(rows: Sequence[Mapping[str, Any]], plan: Plan, subject: str) -> StoredUser | None:
+def user_from(
+    rows: Sequence[Mapping[str, Any]],
+    plan: Plan,
+    subject: str,
+    *,
+    check_identity: bool = False,
+) -> StoredUser | None:
     row = _only(rows, "user", subject)
     if row is None:
         return None
@@ -273,6 +279,14 @@ def user_from(rows: Sequence[Mapping[str, Any]], plan: Plan, subject: str) -> St
     identifier = as_text(payload.get("id"))
     if identifier is None:
         unusable("user", "its id is null or blank", subject)
+        return None
+    # `check_identity` re-checks the returned id against `subject` (constant-time): a collation
+    # -folding `WHERE id = :subject` can return a different row. The session-join path leaves it
+    # off - there the user is FK-bound and `subject` is the token, not an id (D-191).
+    if check_identity and not hmac.compare_digest(
+        identifier.encode("utf-8"), subject.encode("utf-8")
+    ):
+        unusable("user", "it names a different user than the id it was found under", subject)
         return None
     raw_banned = payload.get("banned")
     banned = as_db_flag(raw_banned)

@@ -341,7 +341,9 @@ Mode B is held to the same standard: `JwtVerifier` refuses an algorithm the toke
 header chose, refuses an unknown `kid` rather than trying every published key, spells out the five
 required claims because PyJWT requires none by default, and refuses a token whose lifetime upstream
 would never have minted. A present-but-invalid credential is terminal — no falling through to a
-second verifier — and no failure reason ever reaches the client.
+second verifier — and no failure reason ever reaches the client. What Mode B cannot do is see a
+ban or a sign-out: a JWT is verified offline and stays valid until it expires, so keep token
+lifetimes short and lean on Mode A for prompt revocation (see SECURITY.md).
 
 ## License
 
