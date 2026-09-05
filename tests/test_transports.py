@@ -341,6 +341,47 @@ async def test_duplicate_headers_arrive_comma_joined(library: Library) -> None:
 
 
 @pytest.mark.anyio
+async def test_an_upstream_set_cookie_is_never_replayed_owned(library: Library) -> None:
+    """Phase-3 R10. Both libraries keep a live cookie jar on the client, so a `Set-Cookie`
+    from the pinned origin was stored and sent back on every later fetch.
+
+    Nothing this adapter does has a session: a key set is public, and a get-session call
+    carries its credential in the body. So a cookie coming *back* from upstream is state this
+    library never asked for, and replaying it means a compromised or misbehaving auth origin
+    can pin per-process state onto the auth path itself.
+    """
+    answer = replying(200, headers={"Set-Cookie": "a=b; Path=/"}, body=b"{}")
+
+    async with scripted_server(answer) as served, library.build() as transport:
+        await transport.get(f"{served.origin()}/api/auth/jwks", max_bytes=CAP)
+        await transport.get(f"{served.origin()}/api/auth/jwks", max_bytes=CAP)
+
+    assert len(served.requests) == 2, "the second fetch never happened; this proves nothing"
+    assert "cookie" not in served.requests[1].headers
+
+
+@pytest.mark.anyio
+async def test_an_upstream_set_cookie_is_never_replayed_injected(library: Library) -> None:
+    """The same, on a client the adapter did not build. An injected client is the case that
+    matters most: its jar outlives any one fetch and is shared with whatever else the
+    application does with it, so a cookie stored through the auth path would leak sideways."""
+    answer = replying(200, headers={"Set-Cookie": "a=b; Path=/"}, body=b"{}")
+    client = library.connect()
+
+    try:
+        async with scripted_server(answer) as served:
+            transport = library.build(client=client)
+            await transport.get(f"{served.origin()}/api/auth/jwks", max_bytes=CAP)
+            await transport.get(f"{served.origin()}/api/auth/jwks", max_bytes=CAP)
+    finally:
+        await client.aclose()
+
+    assert len(served.requests) == 2, "the second fetch never happened; this proves nothing"
+    assert "cookie" not in served.requests[1].headers
+    assert len(client.cookies.jar) == 0
+
+
+@pytest.mark.anyio
 async def test_a_stalled_response_before_headers_raises_builtin_timeout_error(
     library: Library,
 ) -> None:

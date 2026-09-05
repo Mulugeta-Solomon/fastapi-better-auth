@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.cookiejar
 import math
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
@@ -46,8 +47,18 @@ class _StreamedResponse(Protocol):
     def aiter_raw(self) -> AsyncIterator[bytes]: ...
 
 
+class _Cookies(Protocol):
+    """The cookie store hanging off an `AsyncClient`, in both libraries alike."""
+
+    @property
+    def jar(self) -> http.cookiejar.CookieJar: ...
+
+
 class _Client(Protocol):
     """The slice of `AsyncClient` this adapter uses — identical in both libraries."""
+
+    @property
+    def cookies(self) -> _Cookies: ...
 
     def stream(
         self,
@@ -165,6 +176,21 @@ async def _capped(response: _StreamedResponse, max_bytes: int) -> bytes:
     return bytes(body)
 
 
+def _shut_the_cookie_jar(client: _Client) -> None:
+    """Leave the client unable to store a cookie, or to send one.
+
+    Nothing this adapter does has a session: a key set is public, and a get-session call
+    carries its credential in the body. So a `Set-Cookie` coming back is state the library
+    never asked for, and both libraries would keep it on the client and replay it on every
+    later fetch - which lets whoever answers the pinned origin pin state onto the auth path.
+
+    A policy that allows no domain refuses to store and refuses to send; the jar is emptied
+    too, since an injected client may arrive with cookies already in it.
+    """
+    client.cookies.jar.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=()))
+    client.cookies.jar.clear()
+
+
 class _HttpxFamilyTransport:
     """Everything the two adapters share, which is everything except one import."""
 
@@ -180,6 +206,7 @@ class _HttpxFamilyTransport:
         self._timeout = timeout
         self._timeout_error = timeout_error
         self._owned = owned
+        _shut_the_cookie_jar(client)
 
     async def _fetch(
         self,
@@ -255,9 +282,20 @@ class HttpxTransport(_HttpxFamilyTransport):
 
     Redirects are refused twice over: the client is built with `follow_redirects=False`, and
     every request passes it again explicitly, so an injected client configured to follow them
-    still does not. That is the one piece of an injected client's configuration this adapter
-    overrules, and it is deliberate - the URL being pinned is the whole security of the
+    still does not. That is deliberate - the URL being pinned is the whole security of the
     fetch, and a transport that could be bounced elsewhere makes the pin decorative.
+
+    **The cookie jar is shut, on an injected client as well.** Nothing here has a session -
+    a key set is public and a get-session call carries its credential in the body - so a
+    `Set-Cookie` from upstream is state this library never asked for, and the library
+    underneath would otherwise store it and replay it on every later fetch. The client is
+    given a policy that allows no domain and its jar is emptied at construction, so a client
+    lent to this adapter stops carrying cookies for its other callers too: hand over a client
+    that is only used for this, or let the adapter build its own.
+
+    Those two are the whole of what this adapter overrules. Everything else about an injected
+    client - proxies, TLS verification, the connection pool, and its own timeout
+    configuration - is left exactly as it was handed over.
 
     The cap counts *wire* bytes: the undecoded stream is read, so a server that answers with a
     `Content-Encoding` we did not ask for cannot decompress a gzip bomb past the cap. Such a
@@ -275,10 +313,8 @@ class HttpxTransport(_HttpxFamilyTransport):
     error, a mid-response disconnect - propagate untranslated, because a transport does not
     know what one means to the request that caused it.
 
-    Everything else about an injected client - proxies, TLS verification, the connection
-    pool, and its own timeout configuration - is left exactly as it was handed over. Its
-    per-phase timeouts are then whatever it was built with rather than `timeout`, while the
-    whole-exchange deadline still applies.
+    An injected client's per-phase timeouts are then whatever it was built with rather than
+    `timeout`, while the whole-exchange deadline still applies.
 
     Args:
         timeout: Seconds. The deadline for one fetch, and the client's per-phase budget when
@@ -318,10 +354,12 @@ class Httpx2Transport(_HttpxFamilyTransport):
     one to install is a deployment question, not a behavioural one.
 
     Every guarantee is `HttpxTransport`'s, and for the same reasons: redirects are refused
-    per request as well as per client, so an injected client cannot turn them back on; the cap
-    counts wire bytes and a `Content-Encoding` is refused as `ContentEncodingRejected`;
-    `timeout` bounds the whole exchange and surfaces as a builtin `TimeoutError` whichever
-    clock fired; and non-timeout failures propagate untranslated.
+    per request as well as per client, so an injected client cannot turn them back on; the
+    client's cookie jar is shut at construction, injected or not, so an upstream `Set-Cookie`
+    is neither stored nor replayed; the cap counts wire bytes and a `Content-Encoding` is
+    refused as `ContentEncodingRejected`; `timeout` bounds the whole exchange and surfaces as
+    a builtin `TimeoutError` whichever clock fired; and non-timeout failures propagate
+    untranslated.
 
     Args:
         timeout: Seconds. The deadline for one fetch, and the client's per-phase budget when
