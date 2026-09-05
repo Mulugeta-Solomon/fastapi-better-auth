@@ -199,10 +199,12 @@ def test_max_concurrency_must_be_a_positive_int_or_none(engine: Engine, bad: obj
 
 def test_the_default_bound_is_sized_to_the_engine_pool(engine: Engine) -> None:
     """A `QueuePool` states its size and overflow, so the limiter matches what the pool can serve
-    and a flood queues on the limiter, not on a pool checkout that times out."""
+    and a flood queues on the limiter, not on a pool checkout that times out. The count is fixed
+    at construction; the `CapacityLimiter` itself is built lazily inside the loop (it binds to the
+    backend on construction, and the adapter is built in synchronous setup)."""
     adapter = SyncStoreAdapter(engine=engine)
 
-    tokens = adapter._limiter.total_tokens  # pyright: ignore[reportPrivateUsage]
+    tokens = adapter._limiter_tokens  # pyright: ignore[reportPrivateUsage]
     assert tokens == _pool_ceiling(engine)
     assert tokens == 15  # QueuePool default: size 5 + overflow 10
 
@@ -210,8 +212,18 @@ def test_the_default_bound_is_sized_to_the_engine_pool(engine: Engine) -> None:
 def test_an_explicit_bound_wins_over_the_pool(engine: Engine) -> None:
     adapter = SyncStoreAdapter(engine=engine, max_concurrency=2)
 
-    tokens = adapter._limiter.total_tokens  # pyright: ignore[reportPrivateUsage]
+    tokens = adapter._limiter_tokens  # pyright: ignore[reportPrivateUsage]
     assert tokens == 2
+
+
+def test_the_adapter_is_constructable_outside_an_event_loop(engine: Engine) -> None:
+    """Regression: an `anyio.CapacityLimiter` binds to the backend at construction, so building it
+    in `__init__` raises outside a loop on the anyio floor - and operators build stores in
+    synchronous setup. Construction must not touch the loop; the limiter is created lazily on first
+    use. This test runs outside any event loop, so it fails if construction is made eager again."""
+    adapter = SyncStoreAdapter(engine=engine)
+
+    assert adapter._limiter is None  # pyright: ignore[reportPrivateUsage]  # not built until first use
 
 
 def test_a_pool_that_cannot_state_its_size_falls_back_to_the_default() -> None:

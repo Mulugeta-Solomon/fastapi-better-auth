@@ -280,12 +280,13 @@ class SyncStoreAdapter(_CoreStore):
             schema=schema,
         )
         self._engine = self._sql.validated_sync_engine(engine)
-        self._limiter = anyio.CapacityLimiter(
-            _limiter_tokens(self._engine, _validated_concurrency(max_concurrency))
+        self._limiter_tokens = _limiter_tokens(
+            self._engine, _validated_concurrency(max_concurrency)
         )
+        self._limiter: anyio.CapacityLimiter | None = None
 
     async def _columns(self) -> Columns:
-        return await run_sync(self._inspected, abandon_on_cancel=True, limiter=self._limiter)
+        return await run_sync(self._inspected, abandon_on_cancel=True, limiter=self._get_limiter())
 
     def _inspected(self) -> Columns:
         with self._engine.connect() as connection:
@@ -296,8 +297,22 @@ class SyncStoreAdapter(_CoreStore):
         # its worker thread and its connection returns to the pool only when it finishes. The
         # limiter bounds concurrent threads (hence checked-out connections) to the adapter's own.
         return await run_sync(
-            self._queried, statement, dict(params), abandon_on_cancel=True, limiter=self._limiter
+            self._queried,
+            statement,
+            dict(params),
+            abandon_on_cancel=True,
+            limiter=self._get_limiter(),
         )
+
+    def _get_limiter(self) -> anyio.CapacityLimiter:
+        # Created lazily on first use, INSIDE the running loop: unlike anyio.Lock, a
+        # CapacityLimiter binds to the backend at construction, and the adapter is built in
+        # synchronous setup. The None-check and set share no await, so no two callers race it.
+        limiter = self._limiter
+        if limiter is None:
+            limiter = anyio.CapacityLimiter(self._limiter_tokens)
+            self._limiter = limiter
+        return limiter
 
     def _queried(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
         try:
