@@ -24,10 +24,10 @@ import functools
 import json
 import pathlib
 import time
-from collections.abc import Generator, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Generator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NoReturn, TypeVar
 
 import jwt
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
@@ -104,6 +104,23 @@ def _rsa_key() -> rsa.RSAPrivateKey:
 
 def rsa_signer(kid: str = "rs256-1", *, algorithm: str = "RS256") -> Signer:
     private = _rsa_key()
+    published: dict[str, Any] = dict(RSAAlgorithm.to_jwk(private.public_key(), as_dict=True))
+    published.update({"alg": algorithm, "kid": kid})
+    return Signer(kid=kid, algorithm=algorithm, private=private, jwk=published)
+
+
+WEAK_RSA_BITS = 1024
+
+
+@functools.lru_cache(maxsize=1)
+def _weak_rsa_key() -> rsa.RSAPrivateKey:
+    """An RSA key below every current floor. Generated once, for the same reason as above."""
+    return rsa.generate_private_key(public_exponent=65537, key_size=WEAK_RSA_BITS)
+
+
+def weak_rsa_signer(kid: str = "rs256-weak", *, algorithm: str = "RS256") -> Signer:
+    """A key that loads, verifies its own signatures, and is far too small to be trusted."""
+    private = _weak_rsa_key()
     published: dict[str, Any] = dict(RSAAlgorithm.to_jwk(private.public_key(), as_dict=True))
     published.update({"alg": algorithm, "kid": kid})
     return Signer(kid=kid, algorithm=algorithm, private=private, jwk=published)
@@ -188,6 +205,88 @@ def forged(
     head = b64url(json.dumps(dict(header)).encode())
     body = b64url(json.dumps(dict(payload)).encode())
     return f"{head}.{body}.{signature}"
+
+
+def nested_arrays(depth: int) -> bytes:
+    """`depth` nested empty JSON arrays: valid JSON that costs the scanner a frame per level."""
+    return ("[" * depth + "]" * depth).encode()
+
+
+Probe = TypeVar("Probe", str, bytes)
+
+
+def deepest_depth(build: Callable[[int], Probe], cap: int) -> int:
+    """The deepest nesting `build` can express while the result still fits `cap` bytes.
+
+    The size cap is the only bound here, and that is the whole point: it is what decides how
+    deep a body an attacker may actually send. The interpreter's own ceiling looked like the
+    other bound and is not one - it is `sys.getrecursionlimit()` up to 3.11, a compile-time
+    constant on 3.12/3.13 and stack headroom on 3.14+, so it moves per platform while the cap
+    does not. Whether a probe the cap admits defeats *this* interpreter is measured instead,
+    by `defeats_the_json_parser`.
+
+    Bisected; every level costs at least one byte, so `cap` is a safe upper bound on the
+    search, and a dozen builds settle it rather than a thousand.
+    """
+    low, high = 1, cap
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(build(middle)) > cap:
+            high = middle - 1
+        else:
+            low = middle
+    return low
+
+
+def deepest_under(build: Callable[[int], Probe], cap: int) -> Probe:
+    """The deepest probe `build` can express while the result still fits `cap` bytes.
+
+    A probe built past the cap is refused for its *length* before any parser sees it, so it
+    would pass every test that uses it while reaching nothing.
+    """
+    return build(deepest_depth(build, cap))
+
+
+def defeats_the_json_parser(document: bytes) -> bool:
+    """Whether this interpreter's JSON scanner exhausts itself reading `document`.
+
+    Measured, never assumed: the deepest body a size cap admits overflows the scanner on some
+    interpreters and parses cleanly on others, because the ceiling is `sys.getrecursionlimit()`
+    up to 3.11, a compile-time constant on 3.12/3.13 and stack headroom on 3.14+. A test that
+    asserts the overflow therefore has to know which one it is running on.
+    """
+    try:
+        json.loads(document)
+    except RecursionError:
+        return True
+    return False
+
+
+def exhausted_parse(*_arguments: object, **_keywords: object) -> NoReturn:
+    """A JSON parse that ran out of stack, on every platform and every run.
+
+    The probes above reach the real thing only where the cap admits a body deep enough for
+    this interpreter; this reaches it everywhere, which is what a regression guard needs.
+    """
+    raise RecursionError("probe")
+
+
+def deep_header_token(depth: int) -> str:
+    """A three-segment token whose *header* segment is `depth` nested arrays."""
+    return f"{b64url(nested_arrays(depth))}.{b64url(b'{}')}.{b64url(b'sig')}"
+
+
+def deep_payload_token(signer: Signer, depth: int) -> str:
+    """A three-segment token whose *payload* is `depth` nested arrays, signed for real.
+
+    The signature has to be genuine: PyJWT parses a payload only once the signature has
+    verified, so an unsigned probe is refused long before it reaches that parser.
+    """
+    head = b64url(json.dumps({"alg": signer.algorithm, "kid": signer.kid}).encode())
+    body = b64url(nested_arrays(depth))
+    algorithm = jwt.get_algorithm_by_name(signer.algorithm)
+    signature = algorithm.sign(f"{head}.{body}".encode(), algorithm.prepare_key(signer.private))
+    return f"{head}.{body}.{b64url(signature)}"
 
 
 def unsigned(payload: Mapping[str, Any]) -> str:

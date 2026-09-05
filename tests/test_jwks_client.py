@@ -13,6 +13,8 @@ obligations already have a real socket pointed at them in `tests/test_transports
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
 
 import anyio
@@ -21,6 +23,7 @@ import pytest
 
 from fastapi_better_auth import (
     AuthServiceUnavailable,
+    BetterAuthError,
     ConfigurationError,
     ContentEncodingRejected,
     ResponseTooLarge,
@@ -33,14 +36,54 @@ from fastapi_better_auth._internal.jwks import (
     MAX_KEYS,
     MAX_REMEMBERED_MISSES,
     MIN_CACHE_TTL,
+    MIN_RSA_KEY_BITS,
     JwksClient,
 )
-from tests.tokens import ORIGIN, Clock, ed25519_signer, key_set, rsa_signer
+from fastapi_better_auth._internal.reasons import REDACTED
+from tests.tokens import (
+    ORIGIN,
+    Clock,
+    Signer,
+    deepest_depth,
+    defeats_the_json_parser,
+    ed25519_signer,
+    exhausted_parse,
+    key_set,
+    nested_arrays,
+    rsa_signer,
+    weak_rsa_signer,
+)
 from tests.transports import NotATransport, Reply, ScriptedTransport, json_reply
 
 SIGNER = ed25519_signer("cached-1")
 ROTATED = ed25519_signer("cached-2")
 KEY_SET = key_set(SIGNER)
+DEEP_DOCUMENT_DEPTH = deepest_depth(nested_arrays, MAX_JWKS_BYTES)
+DEEP_DOCUMENT = nested_arrays(DEEP_DOCUMENT_DEPTH)
+"""The deepest key-set body `MAX_JWKS_BYTES` admits: what an upstream that has been taken over
+may actually send, bounded by the cap rather than by anything this process controls."""
+DOCUMENT_OVERFLOWS = defeats_the_json_parser(DEEP_DOCUMENT)
+"""Whether that body defeats *this* interpreter's scanner, which is a platform fact - see
+`test_a_key_set_the_json_parser_gives_up_on_is_unusable` for the part that is not."""
+OUT_OF_REACH = (
+    f"this interpreter's JSON scanner survives {DEEP_DOCUMENT_DEPTH} nested arrays, which is "
+    f"the deepest body MAX_JWKS_BYTES ({MAX_JWKS_BYTES}) admits, so the overflow is not "
+    f"reachable under the cap here"
+)
+LIBRARY_LOGGER = "fastapi_better_auth"
+SKIP_PREFIX = "jwks key %s is not usable"
+"""The head of the skip template. Matched on the *template*, so a test asserting "one skip"
+cannot be satisfied by some other line that happens to mention the same words."""
+
+
+def _skips(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The skip lines emitted so far. Read at assert time: pytest hands each phase its own
+    record list, so a reference taken during setup would stay empty for the whole call."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == LIBRARY_LOGGER and str(record.msg).startswith(SKIP_PREFIX)
+    ]
 
 
 def client(
@@ -213,6 +256,77 @@ async def test_a_malformed_key_set_is_unavailable(document: bytes) -> None:
 
 
 @pytest.mark.anyio
+async def test_an_unparseable_body_carries_no_context_out_of_the_parse() -> None:
+    """F3 (fix round 2). `_document` raised its refusal INSIDE the active `except`, so the
+    `AuthServiceUnavailable`'s `__context__` still pointed at the `JSONDecodeError` - whose
+    `.doc` is the raw body verbatim. Raising it OUTSIDE the except, the house pattern
+    `_unverified_header` already uses, severs that: a reporter walking `__context__` finds
+    nothing of the body. Not a credential here, but the JWKS body is upstream-controlled and
+    the pattern exists so the containment does not have to be decided case by case."""
+    keys, _transport = client(
+        Reply(content=b"not json at all {{{", content_type="application/json")
+    )
+
+    with pytest.raises(AuthServiceUnavailable) as caught:
+        await keys.key_for(SIGNER.kid)
+
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.anyio
+async def test_a_key_set_the_json_parser_gives_up_on_is_unusable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """SA-4's sibling, by construction rather than by probe, so it holds on every lane.
+
+    `RecursionError` is a `RuntimeError`, so it sat outside the except tuple around the parse
+    and escaped `key_for` as itself - the one answer this client is built never to give, since
+    every other unparseable body is an `AuthServiceUnavailable`. The real deep-body probe
+    below reaches this parser only where the cap admits a body deeper than the interpreter's
+    own ceiling; this does not depend on which interpreter is running it.
+    """
+    keys, _transport = client(json_reply(KEY_SET))
+
+    with caplog.at_level(logging.ERROR), pytest.MonkeyPatch.context() as patch:
+        patch.setattr(json, "loads", exhausted_parse)
+        with pytest.raises(AuthServiceUnavailable) as caught:
+            await keys.key_for(SIGNER.kid)
+
+    assert caught.value.reason.endswith("is unusable: it is not JSON")
+    assert caplog.records == []
+
+
+def test_the_nesting_probe_is_the_deepest_the_cap_admits() -> None:
+    """Prove the instrument before the observation, on every interpreter. A body past
+    `MAX_JWKS_BYTES` never reaches the parser at all, so a probe built past it would pass the
+    tests below while proving nothing; one level deeper than this is over the cap."""
+    assert len(DEEP_DOCUMENT) <= MAX_JWKS_BYTES
+    assert len(nested_arrays(DEEP_DOCUMENT_DEPTH + 1)) > MAX_JWKS_BYTES
+
+
+@pytest.mark.skipif(not DOCUMENT_OVERFLOWS, reason=OUT_OF_REACH)
+def test_the_nesting_probe_really_defeats_this_interpreters_json_parser() -> None:
+    """Platform evidence: here the cap admits a body this scanner cannot finish reading.
+    Where it does not, this skips with the measured depth rather than asserting a fact that
+    is not true there - the containment itself is pinned by the guard above."""
+    with pytest.raises(RecursionError):
+        json.loads(DEEP_DOCUMENT)
+
+
+@pytest.mark.anyio
+async def test_a_key_set_nested_as_deep_as_the_cap_allows_is_unusable() -> None:
+    """The deepest body the cap admits, end to end. Where the probe overflows this
+    interpreter, this is the escape route walked for real; where it does not, the scanner
+    returns a list and the document is refused for not being a JSON object. Both are the
+    same verdict, which is why this holds everywhere."""
+    keys, _transport = client(Reply(content=DEEP_DOCUMENT))
+
+    with pytest.raises(AuthServiceUnavailable):
+        await keys.key_for(SIGNER.kid)
+
+
+@pytest.mark.anyio
 async def test_an_empty_key_set_is_not_malformed_it_simply_knows_no_kid() -> None:
     keys, _transport = client(json_reply({"keys": []}))
 
@@ -271,6 +385,137 @@ async def test_a_duplicated_kid_keeps_the_first_key_published() -> None:
 
     assert found is not None
     assert found.jwk["x"] == SIGNER.jwk["x"]
+
+
+# --- what a published key says about itself ---------------------------------------------
+
+
+def _published(signer: Signer, **fields: Any) -> dict[str, Any]:
+    """One JWK with extra members set on it, exactly as upstream would publish them."""
+    return {**dict(signer.jwk), **fields}
+
+
+SKIPPED: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("use", {"use": "enc"}),
+    ("use-unknown", {"use": "sig-ish"}),
+    ("use-null", {"use": None}),
+    ("key_ops", {"key_ops": ["encrypt", "decrypt"]}),
+    ("key_ops-empty", {"key_ops": []}),
+    ("key_ops-not-a-list", {"key_ops": "verify"}),
+)
+"""Every declaration that says this key is not for checking signatures. `key_ops: "verify"`
+is in here because `"verify" in "verify"` is `True` for a string - a membership test on an
+unvalidated JSON value is how a malformed key set talks its way past a list check."""
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("label", "fields"), SKIPPED, ids=[name for name, _ in SKIPPED])
+async def test_a_key_that_does_not_declare_itself_for_verification_is_skipped(
+    label: str, fields: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """SA-8. RFC 7517 4.2/4.3: `use` and `key_ops` are optional, and absent means unrestricted
+    - but *present and pointing elsewhere* is upstream saying this key does not check
+    signatures, and loading it anyway is checking signatures with an encryption key.
+
+    Skipped rather than refused, deliberately: failing the whole set for one bad key is an
+    outage for every token, while skipping is an outage only for the tokens that key signed.
+    So the answer is an unknown kid, and a line in the log saying which key and why.
+    """
+    keys, _transport = client(json_reply({"keys": [_published(SIGNER, **fields)]}))
+
+    assert await keys.key_for(SIGNER.kid) is None
+    assert len(_skips(caplog)) == 1
+
+
+@pytest.mark.anyio
+async def test_an_undersized_rsa_key_is_skipped(caplog: pytest.LogCaptureFixture) -> None:
+    """A 1024-bit RSA key loads and verifies its own signatures perfectly well, which is the
+    problem: nothing downstream would ever notice. The size is only knowable after the key
+    material is loaded, so this skip sits after the load rather than beside the declarations."""
+    weak = weak_rsa_signer("weak-1")
+    keys, _transport = client(json_reply(key_set(weak)), algorithms=("RS256",))
+
+    assert await keys.key_for(weak.kid) is None
+    assert len(_skips(caplog)) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "fields",
+    [{}, {"use": "sig"}, {"key_ops": ["verify"]}, {"use": "sig", "key_ops": ["verify", "sign"]}],
+    ids=["silent", "use-sig", "key-ops-verify", "both"],
+)
+async def test_a_key_that_declares_itself_for_verification_still_loads(
+    fields: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The over-refusal half. Upstream publishes neither member today, so a rule that read
+    absence as refusal would be an outage on the very deployment this library exists for."""
+    keys, _transport = client(json_reply({"keys": [_published(SIGNER, **fields)]}))
+
+    assert await keys.key_for(SIGNER.kid) is not None
+    assert _skips(caplog) == []
+
+
+@pytest.mark.anyio
+async def test_a_key_at_the_rsa_floor_still_loads(caplog: pytest.LogCaptureFixture) -> None:
+    """The floor is a floor, not a ceiling: 2048 is what upstream would publish."""
+    strong = rsa_signer("strong-1")
+    keys, _transport = client(json_reply(key_set(strong)), algorithms=("RS256",))
+
+    found = await keys.key_for(strong.kid)
+
+    assert found is not None
+    assert found.key.key_size == MIN_RSA_KEY_BITS
+    assert _skips(caplog) == []
+
+
+@pytest.mark.anyio
+async def test_one_bad_key_never_costs_the_rest_of_the_set(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The blast radius, stated as a test: the sibling keys in the same document keep working.
+
+    A skip that raised would turn one mispublished key into a total authentication outage,
+    which is strictly worse than the thing it is protecting against.
+    """
+    keys, _transport = client(
+        json_reply({"keys": [_published(SIGNER, use="enc"), dict(ROTATED.jwk)]})
+    )
+
+    assert await keys.key_for(ROTATED.kid) is not None
+    assert await keys.key_for(SIGNER.kid) is None
+    assert len(_skips(caplog)) == 1
+
+
+@pytest.mark.anyio
+async def test_a_skipped_key_is_reported_once_per_fetch_and_never_per_lookup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A line per lookup would be the log-amplification lever the key set is capped against;
+    the parse happens once per fetch, so the line does too."""
+    keys, transport = client(json_reply({"keys": [_published(SIGNER, use="enc")]}))
+
+    for _ in range(5):
+        assert await keys.key_for(SIGNER.kid) is None
+
+    assert transport.calls == 1
+    assert len(_skips(caplog)) == 1
+
+
+@pytest.mark.anyio
+async def test_a_skip_names_the_key_only_through_a_safe_label(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A `kid` is text upstream chose and an operator reads; the whole set is capped at 32
+    keys, so a hostile one is only reachable through a compromised key set - which is exactly
+    when a forged log line would be most useful to whoever compromised it."""
+    hostile = 'aaa"\n2026-01-01 CRITICAL root logged in'
+    keys, _transport = client(json_reply({"keys": [_published(SIGNER, kid=hostile, use="enc")]}))
+
+    assert await keys.key_for(hostile) is None
+    written = "\n".join(f"{record.getMessage()}" for record in _skips(caplog))
+    assert REDACTED in written
+    assert "CRITICAL" not in written
 
 
 # --- the cache ------------------------------------------------------------------------
@@ -346,6 +591,67 @@ async def test_concurrent_misses_coalesce_behind_one_fetch() -> None:
     assert transport.calls == 1
     assert len(found) == 2
     assert all(entry is not None for entry in found)
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_fetch_still_counts_as_the_windows_attempt() -> None:
+    """R12 (fix round 2). The window is stamped *before* the await, so the moment a fetch
+    begins the attempt is spent, and a caller whose own deadline expires mid-flight cannot
+    roll it back: a second lookup inside the window sees `_may_fetch()` False and never dials.
+
+    Stamping on completion instead reopens D-084. A per-request deadline shorter than a slow
+    JWKS answer would then leave `_attempted_at` untouched on every cancelled request, so each
+    one re-fetches - one outbound fetch per request, single-flight notwithstanding - and a
+    `kid` an attacker chose is back to costing a fetch. D-084 is the settled invariant; the
+    availability nit this restores (one cancelled fetch burns one window) is the accepted cost.
+
+    Cut on a *signal*, not a stopwatch: the scope is cancelled only once the transport has
+    recorded the call, so the stamp under test is provably the one the fetch set.
+    """
+    clock = Clock()
+    gate = anyio.Event()
+    keys, transport = client(json_reply(KEY_SET), clock=clock, gate=gate)
+    scopes: list[anyio.CancelScope] = []
+
+    async def look_up() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await keys.key_for(SIGNER.kid)
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(look_up)
+        with anyio.fail_after(2):
+            while transport.calls < 1 or not scopes:
+                await anyio.lowlevel.checkpoint()
+        scopes[0].cancel()
+
+    assert transport.calls == 1, "the fetch never started; this probe proves nothing"
+    assert keys._may_fetch() is False  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(AuthServiceUnavailable):
+        await keys.key_for(SIGNER.kid)
+    assert transport.calls == 1, "a cancelled fetch reopened the window - the D-084 flood"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "failure",
+    [TimeoutError("upstream down"), ConfigurationError("the injected client was never opened")],
+    ids=["unavailable", "misconfigured"],
+)
+async def test_a_fetch_that_finished_badly_is_still_an_attempt(failure: BaseException) -> None:
+    """The other side of the same rule, and the reason it is not simply "stamp on success":
+    a failing upstream must not become one fetch per request. Both of these *finished*."""
+    clock = Clock()
+    keys, transport = client(failure, clock=clock)
+
+    with pytest.raises((SessionError, BetterAuthError)):
+        await keys.key_for(SIGNER.kid)
+    assert keys._may_fetch() is False  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises((SessionError, BetterAuthError)):
+        await keys.key_for(SIGNER.kid)
+    assert transport.calls == 1
 
 
 # --- the unknown kid ------------------------------------------------------------------

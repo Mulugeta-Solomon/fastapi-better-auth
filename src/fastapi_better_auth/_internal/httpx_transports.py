@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.cookiejar
 import math
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
@@ -11,7 +12,13 @@ from typing import TYPE_CHECKING, Protocol, TypeVar
 import anyio
 
 from .errors import ConfigurationError
-from .transport import ContentEncodingRejected, ResponseTooLarge, TransportResponse
+from .transport import (
+    ContentEncodingRejected,
+    ResponseTooLarge,
+    TransportFailure,
+    TransportResponse,
+    UntrustedResponse,
+)
 
 if TYPE_CHECKING:
     import httpx
@@ -46,8 +53,18 @@ class _StreamedResponse(Protocol):
     def aiter_raw(self) -> AsyncIterator[bytes]: ...
 
 
+class _Cookies(Protocol):
+    """The cookie store hanging off an `AsyncClient`, in both libraries alike."""
+
+    @property
+    def jar(self) -> http.cookiejar.CookieJar: ...
+
+
 class _Client(Protocol):
     """The slice of `AsyncClient` this adapter uses — identical in both libraries."""
+
+    @property
+    def cookies(self) -> _Cookies: ...
 
     def stream(
         self,
@@ -165,6 +182,21 @@ async def _capped(response: _StreamedResponse, max_bytes: int) -> bytes:
     return bytes(body)
 
 
+def _shut_the_cookie_jar(client: _Client) -> None:
+    """Leave the client unable to store a cookie, or to send one.
+
+    Nothing this adapter does has a session: a key set is public, and a get-session call
+    carries its credential in the body. So a `Set-Cookie` coming back is state the library
+    never asked for, and both libraries would keep it on the client and replay it on every
+    later fetch - which lets whoever answers the pinned origin pin state onto the auth path.
+
+    A policy that allows no domain refuses to store and refuses to send; the jar is emptied
+    too, since an injected client may arrive with cookies already in it.
+    """
+    client.cookies.jar.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=()))
+    client.cookies.jar.clear()
+
+
 class _HttpxFamilyTransport:
     """Everything the two adapters share, which is everything except one import."""
 
@@ -180,6 +212,7 @@ class _HttpxFamilyTransport:
         self._timeout = timeout
         self._timeout_error = timeout_error
         self._owned = owned
+        _shut_the_cookie_jar(client)
 
     async def _fetch(
         self,
@@ -191,6 +224,8 @@ class _HttpxFamilyTransport:
         max_bytes: int,
     ) -> TransportResponse:
         _validate_cap(max_bytes)
+        timed_out = False
+        failed = ""
         try:
             with anyio.fail_after(self._timeout + DEADLINE_GRACE):
                 async with self._client.stream(
@@ -205,14 +240,28 @@ class _HttpxFamilyTransport:
                         headers=response.headers,
                         content=await _capped(response, max_bytes),
                     )
-        except self._timeout_error() as exc:
-            raise TimeoutError(f"{method} {url} timed out after {self._timeout}s") from exc
+        except UntrustedResponse:
+            raise
+        except (TimeoutError, self._timeout_error()):
+            timed_out = True
+        except Exception as exc:  # noqa: BLE001 - translated below so no request rides it out
+            failed = type(exc).__name__
+        finally:
+            # D-094: this frame is the one a locals-capturing reporter would blame us for.
+            headers = None
+            content = b""
+        if timed_out:
+            raise TimeoutError(f"{method} {url} timed out after {self._timeout}s")
+        raise TransportFailure(reason=f"[{failed}] {url}")
 
     async def get(
         self, url: str, *, headers: Mapping[str, str] | None = None, max_bytes: int
     ) -> TransportResponse:
         """Fetch `url`, reading at most `max_bytes` of body. See `Transport.get`."""
-        return await self._fetch("GET", url, headers=headers, content=b"", max_bytes=max_bytes)
+        try:
+            return await self._fetch("GET", url, headers=headers, content=b"", max_bytes=max_bytes)
+        finally:
+            headers = None  # D-094: this frame is in the traceback too.
 
     async def post(
         self,
@@ -223,7 +272,13 @@ class _HttpxFamilyTransport:
         max_bytes: int,
     ) -> TransportResponse:
         """Send `content` to `url`, reading at most `max_bytes` of body. See `Transport.post`."""
-        return await self._fetch("POST", url, headers=headers, content=content, max_bytes=max_bytes)
+        try:
+            return await self._fetch(
+                "POST", url, headers=headers, content=content, max_bytes=max_bytes
+            )
+        finally:
+            headers = None  # D-094: this frame is in the traceback too.
+            content = b""
 
     async def aclose(self) -> None:
         """Close the client this adapter built. An injected one is left alone: its lifetime
@@ -255,9 +310,20 @@ class HttpxTransport(_HttpxFamilyTransport):
 
     Redirects are refused twice over: the client is built with `follow_redirects=False`, and
     every request passes it again explicitly, so an injected client configured to follow them
-    still does not. That is the one piece of an injected client's configuration this adapter
-    overrules, and it is deliberate - the URL being pinned is the whole security of the
+    still does not. That is deliberate - the URL being pinned is the whole security of the
     fetch, and a transport that could be bounced elsewhere makes the pin decorative.
+
+    **The cookie jar is shut, on an injected client as well.** Nothing here has a session -
+    a key set is public and a get-session call carries its credential in the body - so a
+    `Set-Cookie` from upstream is state this library never asked for, and the library
+    underneath would otherwise store it and replay it on every later fetch. The client is
+    given a policy that allows no domain and its jar is emptied at construction, so a client
+    lent to this adapter stops carrying cookies for its other callers too: hand over a client
+    that is only used for this, or let the adapter build its own.
+
+    Those two are the whole of what this adapter overrules. Everything else about an injected
+    client - proxies, TLS verification, the connection pool, and its own timeout
+    configuration - is left exactly as it was handed over.
 
     The cap counts *wire* bytes: the undecoded stream is read, so a server that answers with a
     `Content-Encoding` we did not ask for cannot decompress a gzip bomb past the cap. Such a
@@ -271,14 +337,15 @@ class HttpxTransport(_HttpxFamilyTransport):
     the per-phase budget. Either way the timeout a caller sees is a builtin `TimeoutError`:
     the whole-exchange deadline raises one directly, and the library's own `TimeoutException`
     from a stalled phase is translated to one at this boundary, so the timeout contract does
-    not leak which library is underneath. Non-timeout failures - a refused connection, a TLS
-    error, a mid-response disconnect - propagate untranslated, because a transport does not
-    know what one means to the request that caused it.
+    not leak which library is underneath. Every other failure - a refused connection, a TLS
+    error, a mid-response disconnect - is translated too, to a `TransportFailure` naming only
+    the failure's type and the URL. Both replacements are raised *outside* the failing
+    `except`, so nothing of the outbound request rides out: the library's own exception holds a
+    `.request` with every header, and the day this transport carries a `cookie: <session>` that
+    would be the credential leaking into a traceback.
 
-    Everything else about an injected client - proxies, TLS verification, the connection
-    pool, and its own timeout configuration - is left exactly as it was handed over. Its
-    per-phase timeouts are then whatever it was built with rather than `timeout`, while the
-    whole-exchange deadline still applies.
+    An injected client's per-phase timeouts are then whatever it was built with rather than
+    `timeout`, while the whole-exchange deadline still applies.
 
     Args:
         timeout: Seconds. The deadline for one fetch, and the client's per-phase budget when
@@ -318,10 +385,12 @@ class Httpx2Transport(_HttpxFamilyTransport):
     one to install is a deployment question, not a behavioural one.
 
     Every guarantee is `HttpxTransport`'s, and for the same reasons: redirects are refused
-    per request as well as per client, so an injected client cannot turn them back on; the cap
-    counts wire bytes and a `Content-Encoding` is refused as `ContentEncodingRejected`;
-    `timeout` bounds the whole exchange and surfaces as a builtin `TimeoutError` whichever
-    clock fired; and non-timeout failures propagate untranslated.
+    per request as well as per client, so an injected client cannot turn them back on; the
+    client's cookie jar is shut at construction, injected or not, so an upstream `Set-Cookie`
+    is neither stored nor replayed; the cap counts wire bytes and a `Content-Encoding` is
+    refused as `ContentEncodingRejected`; `timeout` bounds the whole exchange and surfaces as
+    a builtin `TimeoutError` whichever clock fired; and every other failure is translated to a
+    `TransportFailure`, raised outside the failing `except` so no outbound header rides out.
 
     Args:
         timeout: Seconds. The deadline for one fetch, and the client's per-phase budget when

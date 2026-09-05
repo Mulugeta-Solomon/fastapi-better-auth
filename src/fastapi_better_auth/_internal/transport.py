@@ -102,6 +102,45 @@ class ContentEncodingRejected(UntrustedResponse):
         return (_rebuild_bad_encoding, (self.encoding,))
 
 
+def _rebuild_transport_failure(reason: str) -> TransportFailure:
+    return TransportFailure(reason=reason)
+
+
+class TransportFailure(Exception):
+    """A fetch failed below the response - a refused connection, a TLS error, a mid-response
+    disconnect - and the adapter translated it so nothing of the outbound request rides out.
+
+    Internal, and a *sibling* of `UntrustedResponse` rather than a subclass: an
+    `UntrustedResponse` is a body the transport received and refused, while this is a fetch
+    that never produced one. Both share the `Exception` base and neither is in this library's
+    taxonomy, so the verifier above contains either as `AuthServiceUnavailable`.
+
+    What the type is *for* is what it does not carry. The httpx/httpx2 exception underneath
+    holds a `.request` with every outbound header - a `cookie: <session>` the day
+    `RemoteVerifier` uses this transport - so the adapter raises this OUTSIDE the `except`
+    block, with no `__cause__` and no `__context__`, naming only the failure's type and the
+    URL. Not exported: a third-party transport raises whatever it likes, and the verifier's
+    `except Exception` catches that too.
+
+    Args:
+        reason: Keyword-only, required. The failing exception's type name and the URL; never a
+            header, a body, or anything else off the request.
+    """
+
+    reason: str
+
+    def __init__(self, *, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(reason={self.reason!r})"
+
+    def __reduce__(self) -> tuple[Callable[[str], TransportFailure], tuple[str]]:
+        """Keyword-only `__init__` and the default `__reduce__` do not survive a pickle."""
+        return (_rebuild_transport_failure, (self.reason,))
+
+
 @dataclass(frozen=True, slots=True)
 class TransportResponse:
     """One HTTP response, already read to the end and already capped.
@@ -189,17 +228,22 @@ class Transport(Protocol):
     not enforcement: a server may omit it, and one that means harm may lie about it. Both
     refusals share the `UntrustedResponse` base, so one `except` clause covers them.
 
-    **A timeout is a builtin `TimeoutError`; other failures are left alone.** The Protocol
-    defines its timeout type: whatever the underlying client uses internally, a fetch that
-    times out raises a builtin `TimeoutError`, so a caller's recipe does not depend on which
-    library is underneath. Every other network failure - a refused connection, a TLS error, a
-    mid-response disconnect - propagates as whatever the client raised, untranslated: a
-    transport does not know what one means to the request that caused it, and the verifier
-    above turns both timeout and refusal into `AuthServiceUnavailable`:
+    **A fetch that fails carries nothing of the request.** There are exactly two ways a fetch
+    fails, and both are shaped so that no outbound header or body rides out in the exception: a
+    fetch that times out raises a builtin `TimeoutError`, and every other transport-level
+    failure - a refused connection, a TLS error, a mid-response disconnect - raises a
+    `TransportFailure` naming only the failure's type and the URL. This is load-bearing the
+    moment a request carries a credential - a `cookie: <session>` on a get-session call - because
+    the underlying client's own exception holds a `.request` with every header; the shipped
+    adapters translate it and raise the replacement OUTSIDE the failing `except`, so neither
+    `__cause__` nor `__context__` chains the original out. Neither type depends on which library
+    is underneath. A refused *response* is a separate thing - `UntrustedResponse`, above - and
+    the verifier turns a fetch failure and a refused response alike into `AuthServiceUnavailable`.
+    A transport of your own may raise its own exception instead, so the verifier catches broadly:
 
         try:
             response = await transport.get(jwks_url, max_bytes=MAX_JWKS_BYTES)
-        except (UntrustedResponse, TimeoutError):
+        except (UntrustedResponse, TimeoutError, TransportFailure):
             raise AuthServiceUnavailable(reason="jwks fetch failed") from None
 
     `max_bytes` is required and has no default, because the cap is the *caller's* policy: a
@@ -232,8 +276,8 @@ class Transport(Protocol):
             ResponseTooLarge: If the body outgrew `max_bytes`. The read is abandoned.
             ContentEncodingRejected: If the server applied a `Content-Encoding`.
             TimeoutError: If the fetch timed out.
-            Exception: Whatever the underlying HTTP client raises for a non-timeout
-                connection or TLS failure, untranslated.
+            TransportFailure: For any other transport-level failure - a refused connection,
+                a TLS error, a mid-response disconnect - carrying no part of the request.
         """
         ...
 
@@ -261,7 +305,7 @@ class Transport(Protocol):
             ResponseTooLarge: If the body outgrew `max_bytes`. The read is abandoned.
             ContentEncodingRejected: If the server applied a `Content-Encoding`.
             TimeoutError: If the fetch timed out.
-            Exception: Whatever the underlying HTTP client raises for a non-timeout
-                connection or TLS failure, untranslated.
+            TransportFailure: For any other transport-level failure - a refused connection,
+                a TLS error, a mid-response disconnect - carrying no part of the request.
         """
         ...

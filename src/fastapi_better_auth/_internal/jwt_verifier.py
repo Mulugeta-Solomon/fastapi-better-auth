@@ -57,6 +57,12 @@ class JwtVerifier:
       is looked at. The allowlist is asymmetric-only and validated at construction, so `HS256`
       - the attack that signs a token with the *published* public key as an HMAC secret - is
       not configurable at all, and `none` never reaches a decode.
+    - **A `crit` header declaring critical extensions**, refused right after the header is read
+      and with no fetch. RFC 7515 4.1.11: a recipient must understand every extension a `crit`
+      names, or reject - Better Auth emits none and this library implements none, so any
+      declaration is a no, an empty list and a non-list included. Left to PyJWT the answer is
+      version-dependent (it honours the one extension it implements, `b64`, and older versions
+      honoured every name), which is exactly why it is decided here instead.
     - **A missing or unusable `kid`.** Every published key is never tried in turn: one weak
       key in a rotated set would otherwise verify anything.
     - **A missing `exp`, `iat`, `iss`, `aud` or `sub`.** PyJWT requires no claim by default,
@@ -196,6 +202,7 @@ class JwtVerifier:
         try:
             marker = _checked_shape(token)
             header = _unverified_header(token, marker)
+            _no_critical_extensions(header, marker)
             kid = _usable_kid(header, marker)
             algorithm = _allowed_algorithm(header, self._algorithms, marker)
             key = await self._key_for(kid, algorithm, marker)
@@ -250,10 +257,24 @@ def _unverified_header(token: str, marker: str) -> Mapping[str, Any]:
     """
     try:
         return jwt.get_unverified_header(token)
-    except (jwt.PyJWTError, ValueError, TypeError) as exc:
+    except (jwt.PyJWTError, ValueError, TypeError, RecursionError) as exc:
         failure = type(exc).__name__
     token = ""
     raise InvalidCredential(reason=f"unreadable token header [{failure}] {marker}") from None
+
+
+def _no_critical_extensions(header: Mapping[str, Any], marker: str) -> None:
+    """RFC 7515 4.1.11: `crit` names extensions a recipient must understand, or refuse.
+
+    Upstream emits none and this library implements none, so any declaration is a refusal -
+    an empty list and a non-list included, because both are still a declaration. Left to the
+    JWT library the answer would depend on which version is installed: `b64` (RFC 7797) is
+    understood there and would be honoured, and older versions honoured every extension name.
+    """
+    if "crit" in header:
+        raise InvalidCredential(
+            reason=f"token declares critical header extensions; none are supported {marker}"
+        )
 
 
 def _usable_kid(header: Mapping[str, Any], marker: str) -> str:
@@ -290,7 +311,7 @@ def _decoded(token: str, key: Jwk, verifier: JwtVerifier, marker: str) -> Mappin
         )
     except jwt.ExpiredSignatureError:
         expired, failure = True, "ExpiredSignatureError"
-    except (jwt.PyJWTError, ValueError, TypeError) as exc:
+    except (jwt.PyJWTError, ValueError, TypeError, RecursionError) as exc:
         expired, failure = False, type(exc).__name__
     token = ""
     if expired:
