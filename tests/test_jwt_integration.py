@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import time
 
+import jwt
 import pytest
 
 from fastapi_better_auth import BetterAuth, ConfigurationError, JwtVerifier, User
@@ -25,6 +26,7 @@ from tests.tokens import (
     deep_header_token,
     deepest_under,
     ed25519_signer,
+    exhausted_parse,
     key_set,
 )
 from tests.transports import ScriptedTransport, json_reply
@@ -147,15 +149,39 @@ def test_the_user_model_the_application_asked_for_is_the_one_it_gets(
     assert response.json() == {"id": SUBJECT, "model": "Staff"}
 
 
-def test_a_token_that_defeats_the_json_parser_logs_no_traceback(
+def test_a_token_the_json_parser_gives_up_on_logs_no_traceback(
     client_backend: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """SA-4, measured where it actually cost something. The wire answer was already the
-    uniform 401 - `core._contained` caught the `RecursionError` that escaped the verifier -
-    but containment logs, so every one of these unauthenticated ~8 KiB requests bought an
-    ERROR record carrying a full traceback. That is a log-amplification lever an attacker
-    pulls for free, and the reason a malformed token has to be refused *as* a malformed token.
+    """SA-4, measured where it actually cost something, and pinned by construction.
+
+    The wire answer was already the uniform 401 - `core._contained` caught the
+    `RecursionError` that escaped the verifier - but containment logs, so every one of these
+    unauthenticated ~8 KiB requests bought an ERROR record carrying a full traceback. That is
+    a log-amplification lever an attacker pulls for free, and the reason a malformed token has
+    to be refused *as* a malformed token. The parse is made to give up here rather than
+    driven there by a probe, because whether a probe under the size cap can reach that state
+    is a property of the interpreter, and this cost is not.
     """
+    auth, transport = bridge()
+
+    with caplog.at_level(logging.ERROR), pytest.MonkeyPatch.context() as patch:
+        patch.setattr(jwt, "get_unverified_header", exhausted_parse)
+        with client(session_app(auth), client_backend) as driver:
+            response = driver.get("/required", headers=bearer(SIGNER.sign(claims())))
+
+    assert response.status_code == 401
+    assert response.content == b'{"detail":"Not authenticated"}'
+    assert caplog.records == []
+    assert transport.calls == 0
+
+
+def test_a_token_nested_as_deep_as_the_cap_allows_logs_no_traceback(
+    client_backend: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same cost, driven by the deepest header an unauthenticated client may actually
+    send. Where that body defeats this interpreter's scanner it is the escape above walked
+    for real; where it does not, PyJWT refuses the parsed list as "not a json object". Either
+    way the request must be a silent 401, which is the property being measured."""
     auth, transport = bridge()
 
     with caplog.at_level(logging.ERROR), client(session_app(auth), client_backend) as driver:

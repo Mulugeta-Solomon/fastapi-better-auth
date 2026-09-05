@@ -41,11 +41,13 @@ from fastapi_better_auth._internal.jwks import (
 )
 from fastapi_better_auth._internal.reasons import REDACTED
 from tests.tokens import (
-    NESTING_START,
     ORIGIN,
     Clock,
     Signer,
+    deepest_depth,
+    defeats_the_json_parser,
     ed25519_signer,
+    exhausted_parse,
     key_set,
     nested_arrays,
     rsa_signer,
@@ -56,8 +58,18 @@ from tests.transports import NotATransport, Reply, ScriptedTransport, json_reply
 SIGNER = ed25519_signer("cached-1")
 ROTATED = ed25519_signer("cached-2")
 KEY_SET = key_set(SIGNER)
-DEEP_DOCUMENT = nested_arrays(min(NESTING_START, MAX_JWKS_BYTES // 2))
-"""A key-set body nested deep enough to exhaust the JSON scanner, and still under the cap."""
+DEEP_DOCUMENT_DEPTH = deepest_depth(nested_arrays, MAX_JWKS_BYTES)
+DEEP_DOCUMENT = nested_arrays(DEEP_DOCUMENT_DEPTH)
+"""The deepest key-set body `MAX_JWKS_BYTES` admits: what an upstream that has been taken over
+may actually send, bounded by the cap rather than by anything this process controls."""
+DOCUMENT_OVERFLOWS = defeats_the_json_parser(DEEP_DOCUMENT)
+"""Whether that body defeats *this* interpreter's scanner, which is a platform fact - see
+`test_a_key_set_the_json_parser_gives_up_on_is_unusable` for the part that is not."""
+OUT_OF_REACH = (
+    f"this interpreter's JSON scanner survives {DEEP_DOCUMENT_DEPTH} nested arrays, which is "
+    f"the deepest body MAX_JWKS_BYTES ({MAX_JWKS_BYTES}) admits, so the overflow is not "
+    f"reachable under the cap here"
+)
 LIBRARY_LOGGER = "fastapi_better_auth"
 SKIP_PREFIX = "jwks key %s is not usable"
 """The head of the skip template. Matched on the *template*, so a test asserting "one skip"
@@ -243,20 +255,52 @@ async def test_a_malformed_key_set_is_unavailable(document: bytes) -> None:
         await keys.key_for(SIGNER.kid)
 
 
-def test_the_nesting_probe_really_defeats_the_json_parser() -> None:
-    """Prove the instrument before the observation. A body past `MAX_JWKS_BYTES` never reaches
-    the parser at all, so a probe built past it would pass the test below while proving
-    nothing; a body the scanner survives would do the same from the other side."""
+@pytest.mark.anyio
+async def test_a_key_set_the_json_parser_gives_up_on_is_unusable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """SA-4's sibling, by construction rather than by probe, so it holds on every lane.
+
+    `RecursionError` is a `RuntimeError`, so it sat outside the except tuple around the parse
+    and escaped `key_for` as itself - the one answer this client is built never to give, since
+    every other unparseable body is an `AuthServiceUnavailable`. The real deep-body probe
+    below reaches this parser only where the cap admits a body deeper than the interpreter's
+    own ceiling; this does not depend on which interpreter is running it.
+    """
+    keys, _transport = client(json_reply(KEY_SET))
+
+    with caplog.at_level(logging.ERROR), pytest.MonkeyPatch.context() as patch:
+        patch.setattr(json, "loads", exhausted_parse)
+        with pytest.raises(AuthServiceUnavailable) as caught:
+            await keys.key_for(SIGNER.kid)
+
+    assert caught.value.reason.endswith("is unusable: it is not JSON")
+    assert caplog.records == []
+
+
+def test_the_nesting_probe_is_the_deepest_the_cap_admits() -> None:
+    """Prove the instrument before the observation, on every interpreter. A body past
+    `MAX_JWKS_BYTES` never reaches the parser at all, so a probe built past it would pass the
+    tests below while proving nothing; one level deeper than this is over the cap."""
     assert len(DEEP_DOCUMENT) <= MAX_JWKS_BYTES
+    assert len(nested_arrays(DEEP_DOCUMENT_DEPTH + 1)) > MAX_JWKS_BYTES
+
+
+@pytest.mark.skipif(not DOCUMENT_OVERFLOWS, reason=OUT_OF_REACH)
+def test_the_nesting_probe_really_defeats_this_interpreters_json_parser() -> None:
+    """Platform evidence: here the cap admits a body this scanner cannot finish reading.
+    Where it does not, this skips with the measured depth rather than asserting a fact that
+    is not true there - the containment itself is pinned by the guard above."""
     with pytest.raises(RecursionError):
         json.loads(DEEP_DOCUMENT)
 
 
 @pytest.mark.anyio
-async def test_a_deeply_nested_key_set_is_unusable_rather_than_an_escape() -> None:
-    """SA-4's sibling. `RecursionError` is a `RuntimeError`, so it sat outside the except
-    tuple around the parse and escaped `key_for` as itself - the one answer this client is
-    built never to give, since every other unparseable body is an `AuthServiceUnavailable`."""
+async def test_a_key_set_nested_as_deep_as_the_cap_allows_is_unusable() -> None:
+    """The deepest body the cap admits, end to end. Where the probe overflows this
+    interpreter, this is the escape route walked for real; where it does not, the scanner
+    returns a list and the document is refused for not being a JSON object. Both are the
+    same verdict, which is why this holds everywhere."""
     keys, _transport = client(Reply(content=DEEP_DOCUMENT))
 
     with pytest.raises(AuthServiceUnavailable):

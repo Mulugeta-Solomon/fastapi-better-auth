@@ -23,12 +23,11 @@ import contextlib
 import functools
 import json
 import pathlib
-import sys
 import time
 from collections.abc import Callable, Generator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NoReturn, TypeVar
 
 import jwt
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
@@ -208,36 +207,68 @@ def forged(
     return f"{head}.{body}.{signature}"
 
 
-NESTING_START = sys.getrecursionlimit() * 4
-"""Where the search for a parser-defeating depth begins.
-
-Scaled off the interpreter rather than written down, because the depth that exhausts a JSON
-scanner is an interpreter property. It is only a *start*: on 3.12+ the C-level recursion
-ceiling is set separately from `sys.setrecursionlimit`, and the token cap bounds the search
-from the other side, so what the probes actually use is whatever fits - see `deepest_under`.
-"""
-
-
 def nested_arrays(depth: int) -> bytes:
     """`depth` nested empty JSON arrays: valid JSON that costs the scanner a frame per level."""
     return ("[" * depth + "]" * depth).encode()
 
 
-def deepest_under(build: Callable[[int], str], cap: int) -> str:
+Probe = TypeVar("Probe", str, bytes)
+
+
+def deepest_depth(build: Callable[[int], Probe], cap: int) -> int:
     """The deepest nesting `build` can express while the result still fits `cap` bytes.
 
-    A probe built past the cap is refused for its *length* before any parser sees it, so it
-    would pass every test below while proving nothing. Bisected, so the search is a dozen
-    builds rather than a thousand.
+    The size cap is the only bound here, and that is the whole point: it is what decides how
+    deep a body an attacker may actually send. The interpreter's own ceiling looked like the
+    other bound and is not one - it is `sys.getrecursionlimit()` up to 3.11, a compile-time
+    constant on 3.12/3.13 and stack headroom on 3.14+, so it moves per platform while the cap
+    does not. Whether a probe the cap admits defeats *this* interpreter is measured instead,
+    by `defeats_the_json_parser`.
+
+    Bisected; every level costs at least one byte, so `cap` is a safe upper bound on the
+    search, and a dozen builds settle it rather than a thousand.
     """
-    low, high = 1, NESTING_START
+    low, high = 1, cap
     while low < high:
         middle = (low + high + 1) // 2
         if len(build(middle)) > cap:
             high = middle - 1
         else:
             low = middle
-    return build(low)
+    return low
+
+
+def deepest_under(build: Callable[[int], Probe], cap: int) -> Probe:
+    """The deepest probe `build` can express while the result still fits `cap` bytes.
+
+    A probe built past the cap is refused for its *length* before any parser sees it, so it
+    would pass every test that uses it while reaching nothing.
+    """
+    return build(deepest_depth(build, cap))
+
+
+def defeats_the_json_parser(document: bytes) -> bool:
+    """Whether this interpreter's JSON scanner exhausts itself reading `document`.
+
+    Measured, never assumed: the deepest body a size cap admits overflows the scanner on some
+    interpreters and parses cleanly on others, because the ceiling is `sys.getrecursionlimit()`
+    up to 3.11, a compile-time constant on 3.12/3.13 and stack headroom on 3.14+. A test that
+    asserts the overflow therefore has to know which one it is running on.
+    """
+    try:
+        json.loads(document)
+    except RecursionError:
+        return True
+    return False
+
+
+def exhausted_parse(*_arguments: object, **_keywords: object) -> NoReturn:
+    """A JSON parse that ran out of stack, on every platform and every run.
+
+    The probes above reach the real thing only where the cap admits a body deep enough for
+    this interpreter; this reaches it everywhere, which is what a regression guard needs.
+    """
+    raise RecursionError("probe")
 
 
 def deep_header_token(depth: int) -> str:
