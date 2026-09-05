@@ -486,6 +486,24 @@ class TestBans:
 
         assert session is not None
 
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("banned", [1, "true", "yes", 2, [1], 0, ""], ids=repr)
+    async def test_a_banned_value_that_is_not_a_bool_is_refused(self, banned: Any) -> None:
+        """Fail CLOSED: only `None` and `False` are "not banned", and everything else is banned.
+
+        `StoredUser` refuses a non-bool `banned` at construction, so the only way to hold one is
+        to plant it past the constructor - which is exactly the record a third-party store built
+        before that check existed, or one written by a store that does its own construction. The
+        check is kept beside the constructor because a guard that assumes someone else validated
+        is a guard with a caller it has never met.
+        """
+        user = stored_user()
+        object.__setattr__(user, "banned", banned)
+        store = FakeStore(sessions={CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN, user=user)})
+
+        with pytest.raises(SessionRevoked):
+            await run(verifier(store=store), http(cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}"))
+
 
 # ---------------------------------------------------------------- CSRF ordering + zero-call
 

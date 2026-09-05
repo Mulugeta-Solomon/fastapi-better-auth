@@ -16,6 +16,9 @@ directly; `SyncStoreAdapter` has no such constraint and is run on both backends 
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import importlib
 import logging
 import pathlib
@@ -27,13 +30,19 @@ from typing import Any
 import pytest
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine
+from starlette.requests import HTTPConnection
 
 from fastapi_better_auth import (
     AuthServiceUnavailable,
     ConfigurationError,
+    CookieVerifier,
+    CsrfDisabled,
+    SessionError,
     SessionStore,
+    SharedSecret,
     SqlAlchemySessionStore,
     SyncStoreAdapter,
+    User,
 )
 from fastapi_better_auth._internal.stores.sqlalchemy_core import (
     SESSION_COLUMNS,
@@ -59,7 +68,9 @@ from tests.stores import (
 FLAVOURS = ("async", "sync")
 UNKNOWN_TOKEN = "5RmMvJt3xQ8bWfKcApZnUhLd2YeGsT7q"
 BAN_EXPIRES = datetime(2026, 12, 1, tzinfo=timezone.utc)
+FAR_FUTURE = datetime(2999, 1, 1, tzinfo=timezone.utc)
 PACKAGE = "fastapi_better_auth._internal.stores"
+VERIFIER_SECRET = SharedSecret("Qb8Xm2vTz6Lp1RkYd9Wn4Hs7Cj3Fg5Ae")
 
 Build = Callable[..., "tuple[SessionStore, StatementLog]"]
 
@@ -710,6 +721,46 @@ class TestMalformedBanned:
             assert user_from([row], plan, "probe") is None
 
         assert any("banned field is not a boolean" in e.getMessage() for e in caplog.records)
+
+
+class TestBannedThroughTheVerifier:
+    """B2. `StoredUser` now refuses a `banned` that is not `bool | None` with a `TypeError`, so
+    the question is whether a real column value can reach it. It cannot: SQLite and MySQL encode
+    a boolean column as the integer 0/1, which `as_db_flag` reads as the bool it is, so a stored
+    `1` is a genuine ban and ends in the refusal a ban is - never a 500."""
+
+    @pytest.mark.anyio
+    async def test_a_banned_of_one_is_a_refusal_and_never_an_escape(self, build: Build) -> None:
+        store, _log = build(
+            sessions=({**SESSION_ROW, "expiresAt": FAR_FUTURE},),
+            users=({**USER_ROW, "banned": 1},),
+        )
+        verifier = CookieVerifier(
+            secret=VERIFIER_SECRET,
+            store=store,
+            csrf=CsrfDisabled(reason="this row is about the ban check, not CSRF"),
+        )
+        connection = _cookie_connection(TOKEN)
+        credential = verifier.extract(connection)
+        assert credential is not None
+
+        with pytest.raises(SessionError):
+            await verifier.verify(credential, User)
+
+
+def _cookie_connection(token: str) -> HTTPConnection:
+    digest = hmac.new(
+        VERIFIER_SECRET.get_secret_value().encode(), token.encode(), hashlib.sha256
+    ).digest()
+    value = f"{token}.{base64.b64encode(digest).decode()}"
+    return HTTPConnection(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [(b"cookie", f"better-auth.session_token={value}".encode())],
+        }
+    )
 
 
 class TestConcurrentDiscovery:

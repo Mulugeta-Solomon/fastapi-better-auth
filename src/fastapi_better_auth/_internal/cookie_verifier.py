@@ -393,8 +393,13 @@ def _check_ban(user: StoredUser, marker: str) -> None:
     `None` means the admin plugin is not installed, so there is no ban state at all - reading its
     absence as "banned" would refuse every user on a deployment without the plugin. A `ban_expires`
     of `None` on a banned user is a permanent ban, not a lapsed one.
+
+    Everything else is banned. `StoredUser` refuses a `banned` that is not `bool | None`, but a
+    record can be built outside a store, and a ban check that assumed someone else had validated
+    would be a check with a caller it has never met - so the two "not banned" values are named
+    here and nothing is inferred from truthiness (D-182).
     """
-    if user.banned is not True:
+    if user.banned is None or user.banned is False:
         return
     lapsed = user.ban_expires is not None and user.ban_expires <= datetime.now(timezone.utc)
     if not lapsed:
