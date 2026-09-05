@@ -111,11 +111,32 @@ last ALLOWED request), so a slow runner reads one less than a fast one. Never th
 assert DEFAULT_BACKOFF not in RETRY_AFTER_RANGE, "the range would hide a parser that read no header"
 
 
+NO_SESSION = "upstream reports no session for this cookie"
+"""The reason a live `200 null` maps to when no secret is configured: `InvalidCredential`."""
+WINDOW_CLEARANCE = THROTTLE_WINDOW_SECONDS + 1
+"""One second past the window: 1.6.30 resets the bucket on strictly-greater, 1.7.1 on >=."""
+
+
 def backing_off(reason: str) -> int:
     """The seconds a 429 refusal reason says it is backing off for."""
     found = re.search(r"backing off (\d+)s", reason)
     assert found is not None, reason
     return int(found.group(1))
+
+
+async def refused_with(verifier: RemoteVerifier, cookie: str) -> BaseException:
+    """Verify `cookie` directly and hand back the refusal, so a leg can pin its class and reason.
+
+    On the wire every refusal is the same 401 - and so is an outage-shaped `AuthServiceUnavailable`,
+    which is why a status code alone cannot tell "upstream said no" from "upstream was unreachable".
+    """
+    credential = verifier.extract(connection(cookie=f"{SESSION_COOKIE}={cookie}"))
+    assert credential is not None
+    try:
+        await verifier.verify(credential, User)
+    except (InvalidCredential, SessionRevoked, AuthServiceUnavailable) as refusal:
+        return refusal
+    raise AssertionError("the cookie was accepted")
 
 
 @pytest.fixture
@@ -241,13 +262,17 @@ class TestLiveSession:
         cookie = sign_in(topology, SEED_EMAIL, SEED_PASSWORD)
 
         async with HttpxTransport() as transport:
-            app = session_app(BetterAuth(verifiers=[build(topology, transport)]))
+            verifier = build(topology, transport)
+            app = session_app(BetterAuth(verifiers=[verifier]))
             before = await drive(app, headers=cookie_header(cookie))
             sign_out(topology, cookie)
             after = await drive(app, headers=cookie_header(cookie))
+            refusal = await refused_with(verifier, cookie)
 
         assert before.status_code == 200, before.text
         assert after.status_code == 401
+        assert isinstance(refusal, InvalidCredential), refusal
+        assert NO_SESSION in refusal.reason, "the 401 must be upstream's answer, not an outage"
 
     @pytest.mark.anyio
     async def test_a_tampered_signature_is_refused(self, topology: str) -> None:
@@ -256,10 +281,14 @@ class TestLiveSession:
         cookie = sign_in(topology, SEED_EMAIL, SEED_PASSWORD)
 
         async with HttpxTransport() as transport:
-            app = session_app(BetterAuth(verifiers=[build(topology, transport)]))
+            verifier = build(topology, transport)
+            app = session_app(BetterAuth(verifiers=[verifier]))
             refused = await drive(app, headers=cookie_header(tampered(cookie)))
+            refusal = await refused_with(verifier, tampered(cookie))
 
         assert refused.status_code == 401
+        assert isinstance(refusal, InvalidCredential), refusal
+        assert NO_SESSION in refusal.reason, "the 401 must be upstream's answer, not an outage"
         sign_out(topology, cookie)
 
 
@@ -345,16 +374,20 @@ class TestUpstreamState:
         token = raw_token(cookie)
 
         async with HttpxTransport() as transport:
-            app = session_app(BetterAuth(verifiers=[build(harness, transport)]))
+            verifier = build(harness, transport)
+            app = session_app(BetterAuth(verifiers=[verifier]))
             before = await drive(app, headers=cookie_header(cookie))
             harness_sql(
                 f"""UPDATE session SET "expiresAt" = now() - interval '1 hour'"""
                 f""" WHERE token = '{token}'"""
             )
             after = await drive(app, headers=cookie_header(cookie))
+            refusal = await refused_with(verifier, cookie)
 
         assert before.status_code == 200, before.text
         assert after.status_code == 401
+        assert isinstance(refusal, InvalidCredential), refusal
+        assert NO_SESSION in refusal.reason, "the 401 must be upstream's answer, not an outage"
 
     @pytest.mark.anyio
     async def test_a_database_direct_ban_is_refused_by_this_library(self, harness: str) -> None:
@@ -380,6 +413,8 @@ class TestUpstreamState:
                 answered = await fetch(
                     f"{harness}/api/auth/get-session", headers=cookie_header(cookie)
                 )
+                # A bool, so a failure never reprs the session document upstream answered with.
+                banned_upstream = answered.json()["user"]["banned"] is True
                 after = await drive(app, headers=cookie_header(cookie))
                 credential = verifier.extract(connection(cookie=f"{SESSION_COOKIE}={cookie}"))
                 assert credential is not None
@@ -391,7 +426,7 @@ class TestUpstreamState:
             )
 
         assert before.status_code == 200, before.text
-        assert answered.json()["user"]["banned"] is True, "upstream still answers a session"
+        assert banned_upstream, "upstream should still answer a session, with banned: true"
         assert after.status_code == 401
         assert "banned" in refusal.value.reason
 
@@ -588,13 +623,16 @@ class TestProbe:
                 headers={"accept": "application/json"},
                 max_bytes=DOCUMENT_BYTES,
             )
+            # Bools, so a failure never reprs a session document (its token is a live credential).
+            refreshed_a_session = json.loads(refreshed.content) is not None
+            answered_nobody = json.loads(bare.content) is None
             await verifier.probe()
 
         assert authorized.status_code == 200, authorized.text
         assert refreshed.status_code == 200
-        assert json.loads(refreshed.content) is not None, "the aged session should still verify"
+        assert refreshed_a_session, "the aged session should still verify"
         assert "set-cookie" in refreshed.headers, "no refresh: the jar was never offered a cookie"
-        assert json.loads(bare.content) is None, "a bare request was answered as somebody"
+        assert answered_nobody, "a bare request was answered as somebody"
         sign_out(harness, cookie)
 
 
@@ -610,18 +648,13 @@ class TestRateLimited:
 
     Two window-length waits bracket the probe, so the leg starts from a bucket whose state it
     knows. Upstream keys the bucket on the last request it allowed (a refused one leaves it
-    untouched), so a window only clears after that many seconds without an allowed request.
+    untouched), so a window only clears after that many seconds without an allowed request. The
+    bucket is keyed on the source IP, so one pytest process at a time may touch `:3103`.
     """
 
     async def refuse(self, verifier: RemoteVerifier) -> BaseException:
         """One verification of a fresh forgery, returning whatever it refused with."""
-        credential = verifier.extract(connection(cookie=f"{SESSION_COOKIE}={forged()}"))
-        assert credential is not None
-        try:
-            await verifier.verify(credential, User)
-        except (InvalidCredential, AuthServiceUnavailable) as refusal:
-            return refusal
-        raise AssertionError("a forged cookie was accepted")
+        return await refused_with(verifier, forged())
 
     @pytest.mark.anyio
     async def test_a_real_429_refuses_and_latches_with_no_further_calls(
@@ -631,10 +664,10 @@ class TestRateLimited:
             async with HttpxTransport() as inner:
                 counting = CountingTransport(inner)
                 verifier = build(throttled_harness, counting)
-                await anyio.sleep(THROTTLE_WINDOW_SECONDS)
+                await anyio.sleep(WINDOW_CLEARANCE)
                 await verifier.prepare()
                 probed = counting.calls
-                await anyio.sleep(THROTTLE_WINDOW_SECONDS)
+                await anyio.sleep(WINDOW_CLEARANCE)
 
                 allowed = [await self.refuse(verifier) for _ in range(THROTTLE_MAX)]
                 limited = await self.refuse(verifier)

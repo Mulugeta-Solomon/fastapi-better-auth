@@ -15,7 +15,7 @@ const requireSignature = ["1", "true", "yes", "on"].includes(
 // `enabled: true` is explicit on purpose: upstream defaults it to NODE_ENV === "production",
 // and setting NODE_ENV would also flip the cookie prefix to __Secure- over http.
 const getSessionMax = Number.parseInt(process.env.RATE_LIMIT_GET_SESSION_MAX ?? "", 10);
-const rateLimit = Number.isInteger(getSessionMax)
+const rateLimit = Number.isInteger(getSessionMax) && getSessionMax > 0
   ? { enabled: true, customRules: { "/get-session": { window: 10, max: getSessionMax } } }
   : null;
 

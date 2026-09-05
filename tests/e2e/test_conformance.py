@@ -170,7 +170,9 @@ class TestBearerPosture:
         assert resp.status_code == 200
         body = resp.json()
         assert body is not None, "the default posture self-signs a raw token into a session"
-        assert body["session"]["token"] == token
+        # A bool, not `==`: a failing equality would print both live tokens into the report.
+        round_tripped = hmac.compare_digest(body["session"]["token"], token)
+        assert round_tripped, "the session answered is not the one the raw token names"
 
     def test_the_strict_posture_answers_the_same_raw_session_token_with_null(
         self, strict_harness: str
@@ -184,7 +186,8 @@ class TestBearerPosture:
         token, _ = _split(raw)
         # The anti-vacuum control: this token is live on this very server, through its cookie.
         alive = httpx.get(f"{strict_harness}/api/auth/get-session", cookies={SESSION_COOKIE: raw})
-        assert alive.json()["session"]["token"] == token
+        alive_here = hmac.compare_digest(alive.json()["session"]["token"], token)
+        assert alive_here, "the control cookie did not verify on the strict server"
 
         resp = httpx.get(
             f"{strict_harness}/api/auth/get-session", headers={"Authorization": f"Bearer {token}"}
