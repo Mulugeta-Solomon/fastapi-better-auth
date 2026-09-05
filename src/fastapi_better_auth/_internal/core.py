@@ -386,6 +386,9 @@ def _extracted(verifier: Verifier, connection: HTTPConnection) -> object | None:
 
 
 async def _verified(verifier: Verifier, credential: object, user_model: type[UserModelT]) -> Any:
+    # Every refusal of every verifier passes through this frame, which holds the raw credential
+    # in a parameter: a parameter is a frame local, and a locals-capturing reporter reads it
+    # (D-094, D-180). Scrubbed in `finally`, so no path can skip it.
     try:
         answer = verifier.verify(credential, user_model)
         if not inspect.isawaitable(answer):
@@ -398,6 +401,8 @@ async def _verified(verifier: Verifier, credential: object, user_model: type[Use
         raise
     except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
         raise _resolved(exc, verifier, "verify", (BetterAuthError, SessionError)) from None
+    finally:
+        credential = None
 
 
 def _unwrapped(exc: BaseException) -> BaseException:

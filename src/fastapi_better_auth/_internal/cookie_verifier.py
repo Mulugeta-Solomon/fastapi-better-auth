@@ -20,7 +20,7 @@ import hashlib
 import hmac
 import logging
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any, TypeVar, cast
 
@@ -268,14 +268,20 @@ class CookieVerifier:
             _verify_signature(self._secrets, token, signature, marker)
             return await self._resolved(token, marker, user_model)
         finally:
+            # `credential` is a parameter, and a parameter is a frame local like any other
+            # (D-094, D-180): it carries the whole cookie value, signature included.
+            credential = None
             material = token = signature = ""
             parsed = None
 
     async def _resolved(
         self, token: str, marker: str, user_model: type[UserModelT]
     ) -> Session[UserModelT]:
-        # This frame holds the raw token across the store/expiry/ban refusals; scrub it before any
-        # of them propagates, so a reporter capturing this frame's locals finds nothing (D-094).
+        # This frame holds the raw token across the store/expiry/ban refusals, and `record` holds
+        # it too - `StoredSession.token` is the raw token the store was found by (D-181). Scrub
+        # both before any of them propagates (D-094).
+        record: StoredSession | None = None
+        stored: StoredUser | None = None
         try:
             record = await self._looked_up(token, marker)
             if record is None:
@@ -290,6 +296,7 @@ class CookieVerifier:
             return _session(record, stored, token, user_model)
         finally:
             token = ""
+            record = stored = None
 
     async def _looked_up(self, token: str, marker: str) -> StoredSession | None:
         try:
@@ -369,8 +376,14 @@ def _verify_signature(
 
 
 def _check_expiry(record: StoredSession, marker: str) -> None:
-    """A stored session whose `expiresAt` has elapsed - which upstream's findSession does not check."""
-    if record.expires_at <= datetime.now(timezone.utc):
+    """A stored session whose `expiresAt` has elapsed - which upstream's findSession does not check.
+
+    The record carries the raw session token, so this frame reads the one field it needs and
+    drops the record before the refusal can put the frame on a traceback (D-094, D-181).
+    """
+    expires_at = record.expires_at
+    del record
+    if expires_at <= datetime.now(timezone.utc):
         raise SessionExpired(reason=f"the stored session has expired [{marker}]")
 
 
@@ -391,17 +404,23 @@ def _check_ban(user: StoredUser, marker: str) -> None:
 def _session(
     record: StoredSession, user: StoredUser, token: str, user_model: type[UserModelT]
 ) -> Session[UserModelT]:
-    # parse_user may raise InvalidCredential from this frame, which holds the raw token; scrub it in
-    # finally. On success the token lives on only as the returned Session's masked SecretStr.
+    # parse_user may raise InvalidCredential from this frame, which holds the raw token three
+    # times: in `token`, inside `record`, and inside the session payload, whose `token` column is
+    # upstream's own (D-181). The record is dropped and the other two scrubbed in finally; the
+    # constructed Session keeps its own references, so only the locals are cleared.
+    expires_at = record.expires_at
+    raw: Mapping[str, Any] = record.payload
+    del record
     try:
         return Session(
             user=parse_user(user_model, user.payload),
-            expires_at=record.expires_at,
+            expires_at=expires_at,
             token=SecretStr(token),
-            raw=record.payload,
+            raw=raw,
         )
     finally:
         token = ""
+        raw = {}
 
 
 def _validated_keyring(

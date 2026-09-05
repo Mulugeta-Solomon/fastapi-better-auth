@@ -163,8 +163,19 @@ class CsrfPolicy(Protocol):
             required_header = None
 
             def check(self, facts: CsrfFacts, session_token: str) -> None:
-                if facts.requires_check and facts.origin != "https://app.example.com":
-                    raise CsrfFailure(reason="origin not allowed")
+                try:
+                    if facts.requires_check and facts.origin != "https://app.example.com":
+                        raise CsrfFailure(reason="origin not allowed")
+                finally:
+                    session_token = ""
+
+    **Your `check` must drop `session_token` from its own frame before it raises**, exactly as
+    the `finally` above does. A `CsrfFailure` is raised on an attacker-induced cross-site
+    request, so its traceback carries the *victim's* live session token - and an error reporter
+    that captures frame locals serializes every local of every frame on it. This library scrubs
+    every frame it owns; it cannot reach into yours, so the obligation is yours, and it is a
+    `finally` rather than a line before each `raise` because a path that forgets one is a path
+    that leaks. The shipped policies all do this; read `OriginCheck.check` for the shape.
 
     **The check runs before the session token is verified**, and that ordering is a security
     decision rather than an optimization: a cross-site attacker who could tell a CSRF refusal
@@ -201,7 +212,8 @@ class CsrfPolicy(Protocol):
         Args:
             facts: The request snapshot, captured at extraction time.
             session_token: The parsed-but-unverified session token, for binding a submitted
-                value to this session. Its signature has **not** been checked yet.
+                value to this session. Its signature has **not** been checked yet. Drop it from
+                your frame in a `finally` before any raise; see the class docstring.
 
         Raises:
             CsrfFailure: For every refusal. The `reason` reaches operators; the client sees a
@@ -274,11 +286,16 @@ class OriginCheck:
 
     def check(self, facts: CsrfFacts, session_token: str) -> None:
         """Walk the three rungs. See `CsrfPolicy.check`."""
-        if not facts.requires_check:
-            return
-        _reject_bad_origin(facts, self._encoded)
-        if self._header is not None:
-            _presented_header(facts, self._header)
+        try:
+            if not facts.requires_check:
+                return
+            _reject_bad_origin(facts, self._encoded)
+            if self._header is not None:
+                _presented_header(facts, self._header)
+        finally:
+            # `del`, not `= ""`: this policy never reads the token, so a rebinding would be an
+            # unused assignment. Either way the local is gone before the refusal propagates.
+            del session_token
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(allowed_origins={self._allowed!r})"
@@ -371,11 +388,15 @@ class SignedDoubleSubmit:
 
     def check(self, facts: CsrfFacts, session_token: str) -> None:
         """Walk `OriginCheck`'s rungs, then the token. See `CsrfPolicy.check`."""
-        if not facts.requires_check:
-            return
-        _reject_bad_origin(facts, self._encoded)
-        presented = _presented_header(facts, self._header)
-        _reject_forged_token(self._secret, session_token, presented, self._header)
+        presented = ""
+        try:
+            if not facts.requires_check:
+                return
+            _reject_bad_origin(facts, self._encoded)
+            presented = _presented_header(facts, self._header)
+            _reject_forged_token(self._secret, session_token, presented, self._header)
+        finally:
+            session_token = presented = ""
 
     def __repr__(self) -> str:
         return (
@@ -421,6 +442,7 @@ class CsrfDisabled:
 
     def check(self, facts: CsrfFacts, session_token: str) -> None:
         """Allow every request, whatever it looks like. See `CsrfPolicy.check`."""
+        del session_token
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(reason={self._reason!r})"
@@ -467,29 +489,39 @@ def _presented_header(facts: CsrfFacts, name: str) -> str:
 def _reject_forged_token(
     secret: SharedSecret, session_token: object, presented: str, name: str
 ) -> None:
-    if not isinstance(session_token, str):
-        kind = type(session_token).__name__
-        raise CsrfFailure(
-            reason=f"the session credential handed to this policy is a {kind}, not a str, so"
-            " nothing could be bound to it"
-        )
-    expected = _digest(secret, session_token)
-    if not hmac.compare_digest(expected.encode("ascii"), presented.encode("utf-8", "replace")):
-        raise CsrfFailure(
-            reason=f"the {name!r} header does not carry the CSRF token bound to session"
-            f" {fingerprint(session_token)}"
-        )
+    # The refusal raised here is the one a cross-site attacker induces, so this frame is on a
+    # traceback with the VICTIM's live token in it. `expected` is derived from that token with
+    # the server's own secret, so it is scrubbed alongside it (D-094, D-180).
+    expected = ""
+    try:
+        if not isinstance(session_token, str):
+            kind = type(session_token).__name__
+            raise CsrfFailure(
+                reason=f"the session credential handed to this policy is a {kind}, not a str, so"
+                " nothing could be bound to it"
+            )
+        expected = _digest(secret, session_token)
+        if not hmac.compare_digest(expected.encode("ascii"), presented.encode("utf-8", "replace")):
+            raise CsrfFailure(
+                reason=f"the {name!r} header does not carry the CSRF token bound to session"
+                f" {fingerprint(session_token)}"
+            )
+    finally:
+        session_token = expected = presented = ""
 
 
 def _digest(secret: SharedSecret, session_token: object) -> str:
-    if not isinstance(session_token, str):
-        kind = type(session_token).__name__
-        raise TypeError(f"token_for() takes the session token as a str; got {kind}.")
-    return hmac.new(
-        secret.get_secret_value().encode("utf-8"),
-        session_token.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+    try:
+        if not isinstance(session_token, str):
+            kind = type(session_token).__name__
+            raise TypeError(f"token_for() takes the session token as a str; got {kind}.")
+        return hmac.new(
+            secret.get_secret_value().encode("utf-8"),
+            session_token.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+    finally:
+        session_token = ""
 
 
 # ---------------------------------------------------------------- eager configuration
@@ -503,13 +535,16 @@ def enforce_policy(policy: CsrfPolicy, facts: CsrfFacts, session_token: str) -> 
     that ignored the answer - the same hazard `core._checked` exists for, answered the same
     way: loudly, as a `ConfigurationError`, rather than by guessing what was meant.
     """
-    answer = policy.check(facts, session_token)
-    if answer is not None:
-        raise ConfigurationError(
-            f"{type(policy).__name__}.check() returned {type(answer).__name__}; a CsrfPolicy"
-            " allows a request by returning None and refuses one by raising CsrfFailure. A"
-            " returned answer is ignored by every caller, so it would allow the request."
-        )
+    try:
+        answer = policy.check(facts, session_token)
+        if answer is not None:
+            raise ConfigurationError(
+                f"{type(policy).__name__}.check() returned {type(answer).__name__}; a CsrfPolicy"
+                " allows a request by returning None and refuses one by raising CsrfFailure. A"
+                " returned answer is ignored by every caller, so it would allow the request."
+            )
+    finally:
+        session_token = ""
 
 
 def validated_policy(policy: object, *, where: str) -> CsrfPolicy:
