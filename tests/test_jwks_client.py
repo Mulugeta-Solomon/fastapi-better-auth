@@ -37,6 +37,7 @@ from fastapi_better_auth._internal.jwks import (
     MAX_REMEMBERED_MISSES,
     MIN_CACHE_TTL,
     MIN_RSA_KEY_BITS,
+    Jwk,
     JwksClient,
 )
 from fastapi_better_auth._internal.reasons import REDACTED
@@ -594,16 +595,16 @@ async def test_concurrent_misses_coalesce_behind_one_fetch() -> None:
 
 
 @pytest.mark.anyio
-async def test_a_cancelled_fetch_still_counts_as_the_windows_attempt() -> None:
-    """R12 (fix round 2). The window is stamped *before* the await, so the moment a fetch
-    begins the attempt is spent, and a caller whose own deadline expires mid-flight cannot
-    roll it back: a second lookup inside the window sees `_may_fetch()` False and never dials.
+async def test_a_cancelled_cold_fetch_does_not_burn_the_refetch_window() -> None:
+    """E1 (D-196), the inverse of the reverted R12 rule. A fetch cancelled mid-flight on a cold
+    cache produced no answer, so it must not spend the window: `_attempted_at` is rolled back to
+    what it was and the next lookup is free to dial again. RED before the rollback: `_may_fetch()`
+    stayed False and the next lookup raised AuthServiceUnavailable with no second call.
 
-    Stamping on completion instead reopens D-084. A per-request deadline shorter than a slow
-    JWKS answer would then leave `_attempted_at` untouched on every cancelled request, so each
-    one re-fetches - one outbound fetch per request, single-flight notwithstanding - and a
-    `kid` an attacker chose is back to costing a fetch. D-084 is the settled invariant; the
-    availability nit this restores (one cancelled fetch burns one window) is the accepted cost.
+    This does NOT reopen the D-084 flood the R12 revert guarded: a fetch that *finished* badly
+    keeps its stamp (see `test_a_fetch_that_finished_badly_is_still_an_attempt`). Only a genuinely
+    abandoned attempt, which rate-limited nothing, is rolled back - the cancellation exception,
+    never a completed refusal.
 
     Cut on a *signal*, not a stopwatch: the scope is cancelled only once the transport has
     recorded the call, so the stamp under test is provably the one the fetch set.
@@ -626,11 +627,107 @@ async def test_a_cancelled_fetch_still_counts_as_the_windows_attempt() -> None:
         scopes[0].cancel()
 
     assert transport.calls == 1, "the fetch never started; this probe proves nothing"
-    assert keys._may_fetch() is False  # pyright: ignore[reportPrivateUsage]
+    assert keys._may_fetch() is True  # pyright: ignore[reportPrivateUsage]
 
-    with pytest.raises(AuthServiceUnavailable):
-        await keys.key_for(SIGNER.kid)
-    assert transport.calls == 1, "a cancelled fetch reopened the window - the D-084 flood"
+    gate.set()
+    assert await keys.key_for(SIGNER.kid) is not None
+    assert transport.calls == 2
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_cold_fetch_frees_a_queued_bystander() -> None:
+    """E1 (D-196), the headline. On a cold cache a leader holding the single-flight lock and
+    cancelled mid-fetch used to poison a bystander queued behind it: the leader had stamped
+    `_attempted_at` before the await, so when the bystander acquired the lock it saw `_may_fetch()`
+    False, fell through to `_answer` with no key set on hand, and got a spurious
+    AuthServiceUnavailable - a 401 for a legitimate request that could have fetched. The cancelled
+    attempt produced no answer, so rolling the stamp back lets the bystander try. RED before the
+    rollback: the bystander raised AuthServiceUnavailable and never dialled.
+    """
+    clock = Clock()
+    gate = anyio.Event()
+    keys, transport = client(json_reply(KEY_SET), clock=clock, gate=gate)
+    scopes: list[anyio.CancelScope] = []
+    outcome: list[object] = []
+
+    async def leader() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await keys.key_for(SIGNER.kid)
+
+    async def bystander() -> None:
+        try:
+            outcome.append(await keys.key_for(SIGNER.kid))
+        except BaseException as exc:  # noqa: BLE001 - the outcome itself is under test
+            outcome.append(exc)
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(leader)
+        with anyio.fail_after(2):
+            while transport.calls < 1 or not scopes:
+                await anyio.lowlevel.checkpoint()
+        group.start_soon(bystander)
+        with anyio.fail_after(2):
+            while keys.waiting < 1:
+                await anyio.lowlevel.checkpoint()
+        scopes[0].cancel()
+        with anyio.fail_after(2):
+            while not scopes[0].cancelled_caught:
+                await anyio.lowlevel.checkpoint()
+        gate.set()
+
+    assert len(outcome) == 1
+    found = outcome[0]
+    assert not isinstance(found, BaseException), f"the bystander was poisoned: {found!r}"
+    assert isinstance(found, Jwk) and found.kid == SIGNER.kid
+    assert transport.calls == 2
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_rotation_refetch_does_not_negative_cache_the_new_kid() -> None:
+    """E1 (D-196), the rotation half. A fresh key set is on hand and the refetch window is open,
+    so a lookup for a just-rotated kid opens a refetch to pick it up (D-095). The old code stamped
+    `_attempted_at` before the await, so when that refetch was cancelled the window stayed shut -
+    and the next lookup fell through to `_answer`, saw the fresh-but-pre-rotation set, and
+    NEGATIVE-CACHED the rotated kid: a valid token signed by the new key refused for the whole
+    negative TTL. Rolling the stamp back on cancellation keeps the window open, so the next lookup
+    fetches the rotation instead of caching the kid as absent.
+    """
+    clock = Clock()
+    keys, transport = client(
+        json_reply(KEY_SET),  # t0: pre-rotation, only SIGNER
+        json_reply(key_set(SIGNER, ROTATED)),  # the rotation, once it is fetched
+        clock=clock,
+    )
+
+    assert await keys.key_for(SIGNER.kid) is not None  # warm the cache
+    assert transport.calls == 1
+    clock.advance(11)  # past the 10s window; the set is still fresh (cache_ttl 300)
+
+    gate = anyio.Event()
+    transport.gate = gate  # hold the rotation refetch open so it can be cancelled mid-flight
+    scopes: list[anyio.CancelScope] = []
+
+    async def look_up() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await keys.key_for(ROTATED.kid)
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(look_up)
+        with anyio.fail_after(2):
+            while transport.calls < 2 or not scopes:
+                await anyio.lowlevel.checkpoint()
+        scopes[0].cancel()
+
+    assert transport.calls == 2, "the refetch never started; this probe proves nothing"
+
+    gate.set()  # the next lookup's fetch may complete
+    found = await keys.key_for(ROTATED.kid)
+    assert found is not None, "the cancelled refetch negative-cached the rotated kid"
+    assert found.kid == ROTATED.kid
+    assert keys.remembered == 0
+    assert transport.calls == 3
 
 
 @pytest.mark.anyio
