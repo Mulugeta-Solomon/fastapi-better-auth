@@ -1,15 +1,10 @@
-"""D-094, walked rather than described: no refusal leaves the credential in a frame local.
+"""The instrument the refusal-frame suites share: a frame-locals walker and the rows it walks.
 
-An error reporter that captures frame locals - Sentry, `cgitb`, a debug middleware - serializes
-every local of every frame on a traceback. A refusal path that still holds the raw session token
-in one of those frames therefore ships the victim's live credential to whatever is listening,
-and the CSRF paths do it on the exact attacker-induced cross-site request the control exists for.
-
-The other suites assert this one frame at a time, from the inside. This one asserts it from the
-outside and for every path at once: drive the dispatcher through the resolver FastAPI itself
-awaits - so the dispatcher's own frames are on the traceback too - through every refusal both
-modes can produce, then walk every frame of the resulting exception (and of everything it chains
-to) looking for the credential.
+D-094 promises that an error reporter which captures frame locals - Sentry, `cgitb`, a debug
+middleware - finds nothing on any refusal traceback this library produces. `holding` is how that
+is checked from the outside: drive the dispatcher through the resolver FastAPI itself awaits, then
+walk every frame of the resulting exception, and of everything it chains to, looking for the
+credential.
 
 Two objects are deliberately out of scope, and each row passes them to `holding(ignore=...)`:
 
@@ -19,9 +14,9 @@ Two objects are deliberately out of scope, and each row passes them to `holding(
 * **The store.** It is the operator's object; the fakes here hold the seeded record in memory by
   construction, which is a property of the test fixture and not of any code under test.
 
-`TestTheWalker` proves the instrument before the matrix uses it: a planted unscrubbed frame is
-caught, a chained exception is followed, a credential four containers deep is reached, and a
-`SecretStr` is not a hit where the same value as a bare `str` is.
+A plain module rather than a test file - the peer of `tests/tokens.py` and `tests/stores.py` - so
+that the cookie matrix, the bearer matrix and the dispatcher rows all walk the same instrument.
+`test_refusal_frames_cookie.py` proves it before using it.
 """
 
 from __future__ import annotations
@@ -43,11 +38,8 @@ from fastapi_better_auth import (
     BetterAuthError,
     CookieVerifier,
     CsrfDisabled,
-    CsrfFacts,
-    CsrfFailure,
     OriginCheck,
     SessionError,
-    SessionStore,
     SharedSecret,
     SignedDoubleSubmit,
     StoredSession,
@@ -57,7 +49,9 @@ from fastapi_better_auth import (
 from fastapi_better_auth._internal.jwt_verifier import JwtVerifier
 from tests.fakes import resolver_of
 from tests.tokens import (
+    GOLDEN_JWKS,
     GOLDEN_KID,
+    GOLDEN_TOKEN,
     ORIGIN,
     claims,
     ed25519_signer,
@@ -74,10 +68,14 @@ APP = "https://app.example.com"
 EVIL = "https://evil.example.com"
 USER_ID = "u1"
 
-MAX_DEPTH = 4
-"""How far into a frame local the walk reaches. Four is one level past every container the
-library builds (a credential inside a record inside a list inside a dict), so a value that
-survives this walk is not merely hidden one indirection deeper."""
+MAX_DEPTH = 6
+"""How far into a frame local the walk reaches.
+
+One level past the deepest container the library actually builds, which is the dispatcher's
+`presented`: a list of `(verifier, credential)` pairs, whose `CookieCredential` holds a tuple of
+`(name, value)` cookie pairs - list, tuple, credential, tuple, tuple, str, five deep. A walk that
+stopped at four would report the bearer token in that frame and miss the cookie value beside it,
+so the ambiguous row's cookie assertions would have been unfalsifiable."""
 
 FAR_FUTURE = datetime.now(timezone.utc) + timedelta(days=7)
 FAR_PAST = datetime(2000, 1, 1, tzinfo=timezone.utc)
@@ -210,6 +208,19 @@ def request(method: str = "GET", *, cookies: Sequence[str] = (), **headers: str)
     return HTTPConnection({"type": "http", "method": method, "path": "/x", "headers": raw})
 
 
+def ws_request(*, cookies: Sequence[str] = (), **headers: str) -> HTTPConnection:
+    """A handshake scope: no `method` key at all, so `requires_check` is forced on by the type.
+
+    The handshake is a GET the same-origin policy does not cover, so a cross-site page can open
+    one and the browser attaches the cookie anyway. It is therefore the one refusal path where
+    CSRF runs on a request no method test would have selected - and the CSRF frames are the ones
+    that hold the victim's live session token (D-180).
+    """
+    raw = [(b"cookie", value.encode()) for value in cookies]
+    raw += [(key.replace("_", "-").encode(), value.encode()) for key, value in headers.items()]
+    return HTTPConnection({"type": "websocket", "path": "/ws", "headers": raw})
+
+
 class Unparsable(User):
     """A model no stored payload here satisfies, so `parse_user` refuses at the last rung."""
 
@@ -219,80 +230,26 @@ class Unparsable(User):
 REFUSALS = (BetterAuthError, SessionError)
 
 
-async def refused(
-    verifier: Any, connection: HTTPConnection, *, model: type[User] = User
+async def refused_by(
+    verifiers: Sequence[Any], connection: HTTPConnection, *, model: type[User] = User
 ) -> BaseException:
     """Drive the dispatcher through its resolver - the callable FastAPI itself awaits.
 
     Going through `resolver_of` rather than reaching for `_authenticate` keeps the walk on the
     same frames a real request produces, dependency wrapper included.
     """
-    auth = BetterAuth(verifiers=[verifier])
+    auth = BetterAuth(verifiers=list(verifiers))
     resolve = resolver_of(auth.current_session(user_model=model))
     with pytest.raises(REFUSALS) as caught:
         await resolve(connection)
     return caught.value
 
 
-# ---------------------------------------------------------------- the instrument itself
-
-
-class TestTheWalker:
-    def test_it_sees_a_frame_that_does_not_scrub(self) -> None:
-        """The liveness probe: a frame that keeps the token is reported, by name."""
-
-        def leaky(session_token: str) -> None:
-            raise ValueError("refused")
-
-        with pytest.raises(ValueError) as caught:
-            leaky(TOKEN)
-
-        assert holding(caught.value, TOKEN) == ["test_refusal_frames.py:leaky.session_token"]
-
-    def test_a_secret_str_is_not_a_hit(self) -> None:
-        def masked(session_token: SecretStr) -> None:
-            raise ValueError("refused")
-
-        with pytest.raises(ValueError) as caught:
-            masked(SecretStr(TOKEN))
-
-        assert holding(caught.value, TOKEN) == []
-
-    def test_an_ignored_object_is_not_a_hit(self) -> None:
-        carrier = [TOKEN]
-
-        def carrying(held: list[str]) -> None:
-            raise ValueError("refused")
-
-        with pytest.raises(ValueError) as caught:
-            carrying(carrier)
-
-        assert holding(caught.value, TOKEN) != []
-        assert holding(caught.value, TOKEN, ignore=[carrier]) == []
-
-    def test_it_follows_a_chained_exception(self) -> None:
-        def inner(session_token: str) -> None:
-            raise ValueError("first")
-
-        def outer() -> None:
-            try:
-                inner(TOKEN)
-            except ValueError as exc:
-                raise RuntimeError("second") from exc
-
-        with pytest.raises(RuntimeError) as caught:
-            outer()
-
-        assert "test_refusal_frames.py:inner.session_token" in holding(caught.value, TOKEN)
-
-    def test_it_reaches_a_credential_four_containers_deep(self) -> None:
-        def buried(held: dict[str, list[tuple[str, ...]]]) -> None:
-            raise ValueError("refused")
-
-        with pytest.raises(ValueError) as caught:
-            buried({"a": [(TOKEN,)]})
-
-        assert holding(caught.value, TOKEN) == ["test_refusal_frames.py:buried.held"]
+async def refused(
+    verifier: Any, connection: HTTPConnection, *, model: type[User] = User
+) -> BaseException:
+    """One verifier's refusal, walked exactly as a composed one is."""
+    return await refused_by([verifier], connection, model=model)
 
 
 # ---------------------------------------------------------------- cookie mode
@@ -322,6 +279,12 @@ def cookie_row(
     elif label == "origin absent":
         policy = OriginCheck(allowed_origins=[APP])
         connection = request("POST", cookies=[f"{COOKIE_NAME}={COOKIE_VALUE}"])
+    elif label == "websocket origin cross-site":
+        policy = OriginCheck(allowed_origins=[APP])
+        connection = ws_request(cookies=[f"{COOKIE_NAME}={COOKIE_VALUE}"], origin=EVIL)
+    elif label == "websocket origin absent":
+        policy = OriginCheck(allowed_origins=[APP])
+        connection = ws_request(cookies=[f"{COOKIE_NAME}={COOKIE_VALUE}"])
     elif label == "double submit header absent":
         policy = SignedDoubleSubmit(secret=SECRET, allowed_origins=[APP])
         connection = request("POST", cookies=[f"{COOKIE_NAME}={COOKIE_VALUE}"], origin=APP)
@@ -350,12 +313,15 @@ def cookie_row(
     return verifier, connection, model, store
 
 
+WEBSOCKET_ROWS = ("websocket origin cross-site", "websocket origin absent")
+
 COOKIE_ROWS = (
     "malformed value",
     "duplicate cookie name",
     "bad signature",
     "origin cross-site",
     "origin absent",
+    *WEBSOCKET_ROWS,
     "double submit header absent",
     "double submit header forged",
     "store miss",
@@ -366,44 +332,23 @@ COOKIE_ROWS = (
 )
 
 
-class TestCookieRefusals:
-    @pytest.mark.anyio
-    @pytest.mark.parametrize("label", COOKIE_ROWS)
-    async def test_no_frame_holds_the_session_token(self, label: str) -> None:
-        verifier, connection, model, store = cookie_row(label)
-
-        error = await refused(verifier, connection, model=model)
-
-        assert holding(error, TOKEN, ignore=[connection, store]) == []
-
-    @pytest.mark.anyio
-    @pytest.mark.parametrize("label", COOKIE_ROWS)
-    async def test_no_frame_holds_the_whole_cookie_value(self, label: str) -> None:
-        """The signature is credential material too: it is what makes a stolen token usable."""
-        verifier, connection, model, store = cookie_row(label)
-
-        error = await refused(verifier, connection, model=model)
-
-        assert holding(error, COOKIE_VALUE, ignore=[connection, store]) == []
-
-
 # ---------------------------------------------------------------- bearer mode
 
 
 def bearer_row(label: str) -> tuple[JwtVerifier, str]:
     """One bearer refusal: the verifier over a scripted key set, and the token to present."""
     if label == "malformed":
-        return _jwt_verifier(json_reply(KEY_SET)), "two.segments"
+        return jwt_verifier(json_reply(KEY_SET)), "two.segments"
     if label == "unknown kid, unreachable key set":
-        return _jwt_verifier(RuntimeError("the key set host is gone")), _minted(kid=GOLDEN_KID)
+        return jwt_verifier(RuntimeError("the key set host is gone")), _minted(kid=GOLDEN_KID)
     if label == "bad signature":
-        return _jwt_verifier(json_reply(KEY_SET)), tampered(_minted())
+        return jwt_verifier(json_reply(KEY_SET)), tampered(_minted())
     if label == "expired":
-        return _jwt_verifier(json_reply(KEY_SET)), _minted(expired=True)
+        return jwt_verifier(json_reply(KEY_SET)), _minted(expired=True)
     raise AssertionError(f"unknown row {label!r}")  # pragma: no cover - as cookie_row
 
 
-def _jwt_verifier(answer: Any) -> JwtVerifier:
+def jwt_verifier(answer: Any) -> JwtVerifier:
     return JwtVerifier(base_url=ORIGIN, transport=ScriptedTransport(answer))
 
 
@@ -417,51 +362,26 @@ def _minted(*, kid: str | None = None, expired: bool = False) -> str:
 BEARER_ROWS = ("malformed", "unknown kid, unreachable key set", "bad signature", "expired")
 
 
-class TestBearerRefusals:
-    @pytest.mark.anyio
-    @pytest.mark.parametrize("label", BEARER_ROWS)
-    async def test_no_frame_holds_the_token(self, label: str) -> None:
-        verifier, token = bearer_row(label)
-        connection = request(authorization=f"Bearer {token}")
-
-        error = await refused(verifier, connection)
-
-        assert holding(error, token, ignore=[connection]) == []
+# ---------------------------------------------------------------- both modes at once
 
 
-# ---------------------------------------------------------------- the third-party contract
+def ambiguous_row() -> tuple[list[Any], HTTPConnection, Store]:
+    """One request carrying a valid cookie AND a bearer token: the dispatcher's own refusal.
 
-
-class Careless:
-    """A third-party policy that refuses while its own frame still holds the session token."""
-
-    required_header = None
-
-    def check(self, facts: CsrfFacts, session_token: str) -> None:
-        raise CsrfFailure(reason="refused, and the token is still in this frame")
-
-
-@pytest.mark.anyio
-async def test_a_policy_that_does_not_scrub_is_visible_to_the_walker() -> None:
-    """The library cannot scrub a frame it does not own, which is why `CsrfPolicy.check` says so.
-
-    A third-party policy that raises while still holding `session_token` puts the victim's live
-    token on the traceback from *its* frame. This is that hazard, demonstrated - and the reason
-    the protocol docstring makes the `finally` an obligation rather than a suggestion. Everything
-    the library owns on that same traceback is clean, which is what makes the remaining frame
-    attributable.
+    Neither verifier is ever asked to verify, so this is the one refusal whose only library
+    frames are `_authenticate`'s - which holds the cookie credential and the bearer token in
+    `presented`, and the last-extracted one in `credential`, at the moment it raises.
     """
     store = Store(session=stored_session())
-    verifier = CookieVerifier(secret=SECRET, store=store, csrf=Careless())
-    connection = request("POST", cookies=[f"{COOKIE_NAME}={COOKIE_VALUE}"])
-
-    error = await refused(verifier, connection)
-
-    assert holding(error, TOKEN, ignore=[connection, store]) == [
-        "test_refusal_frames.py:check.session_token"
+    verifiers: list[Any] = [
+        CookieVerifier(
+            secret=SECRET,
+            store=store,
+            csrf=CsrfDisabled(reason="this row is not about cross-site request forgery"),
+        ),
+        jwt_verifier(json_reply(GOLDEN_JWKS)),
     ]
-
-
-def test_the_store_protocol_is_still_what_the_fakes_implement() -> None:
-    """The fakes here stand in for a real store; if they drifted, every row above would be a lie."""
-    assert isinstance(Store(), SessionStore)
+    connection = request(
+        cookies=[f"{COOKIE_NAME}={COOKIE_VALUE}"], authorization=f"Bearer {GOLDEN_TOKEN}"
+    )
+    return verifiers, connection, store
