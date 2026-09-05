@@ -52,7 +52,7 @@ lockfile and would never exercise a floor.
 | `fastapi` | `>=0.133` |
 | `starlette` | `>=1.3.1` |
 | `pydantic` | `>=2.7` |
-| `pyjwt[crypto]` | `>=2.10` |
+| `pyjwt[crypto]` | `>=2.12.0` (CVE-2026-32597; `crit` is refused regardless) |
 | `anyio` | `>=4.1` |
 | `httpx` (extra `[httpx]`) | `>=0.27` |
 | `httpx2` (extra `[httpx2]`) | `>=2.0` |

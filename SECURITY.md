@@ -15,10 +15,53 @@ Pre-1.0: only the **latest released version** receives fixes.
 
 ## Better Auth compatibility floor
 
-This library bridges to a Better Auth (TypeScript) server you operate. Once 0.1.0 ships, this file
-will pin a **minimum safe Better Auth version** (at least ≥ 1.4.9 — earlier versions are affected by
-CVE-2026-67337, a critical 2FA bypass via the session cookie cache). Keeping your Better Auth server
-current is part of your deployment's security posture; this library cannot patch the server side.
+This library bridges to a Better Auth (TypeScript) server you operate. Run **Better Auth 1.4.9 or
+newer**: earlier versions are affected by CVE-2026-67337, a critical 2FA bypass via the
+`session_data` cookie cache. This library never reads that cookie and warns once if it sees one,
+but it cannot patch the server side — keeping your Better Auth server current is part of your
+deployment's security posture. The versions each release is verified against are listed in
+[COMPATIBILITY.md](COMPATIBILITY.md).
+
+## Dependency floors
+
+The declared lower bounds are security floors, not merely API floors. In particular `PyJWT` is
+required at **2.12.0 or newer** (CVE-2026-32597: unknown `crit` header extensions were accepted),
+and independently of the installed version this library refuses any token that declares a `crit`
+header at all, because Better Auth never emits one and no extension is supported here.
+
+## What this library trusts, and what it does not
+
+- **Your configuration.** `base_url`, the shared secret, the session store and the CSRF
+  allowlist are trusted as given. Nothing is ever read from the incoming request to decide who
+  the auth server is (no `Host`, no `X-Forwarded-*`, no `request.url`).
+- **The process environment, through the HTTP client it builds.** When you do not inject a
+  client, the default `httpx`/`httpx2` client honours the standard environment: `HTTP_PROXY`,
+  `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`/`SSL_CERT_DIR` and `~/.netrc`. Whoever can set those
+  can route or re-trust the JWKS fetch — the same party who can set `BETTER_AUTH_URL`. If your
+  process must not honour them, inject your own client:
+  `JwtVerifier(..., transport=HttpxTransport(client=httpx.AsyncClient(trust_env=False)))`.
+  An injected client with TLS verification disabled is likewise your explicit choice; the library
+  does not inspect it.
+- **Upstream `Set-Cookie` on the JWKS response is never stored or replayed** (the client's cookie
+  jar is disabled on construction, for owned and injected clients alike).
+
+## Behaviours worth knowing before you deploy
+
+- **Refusals are uniform on the wire.** Every rejected credential answers the same 401 body; the
+  reason lives only on the exception's `.reason` and in your logs. Timing is not uniform by design:
+  a cookie whose signature does not verify is refused before the session store is consulted, so
+  the store is never a lever for unauthenticated traffic.
+- **Duplicate session cookies are refused, not resolved.** A sibling subdomain that plants a
+  cookie of the same name locks the victim out of this API until that cookie is gone — a denial
+  of service, never a login as someone else. Better Auth uses the `__Secure-` prefix, which does
+  not prevent this; only a `__Host-` cookie would, and that is an upstream choice.
+- **Bans are enforced locally and fail closed.** A stored `banned` value that is not `true`,
+  `false` or absent is treated as banned; a store that hands the verifier a malformed record is a
+  refusal, never an exception.
+- **Traceback hygiene.** Every frame of this library that holds a raw credential drops it before a
+  refusal propagates, so an error reporter that captures frame locals finds nothing. If you write
+  your own `Verifier`, `SessionStore` or `CsrfPolicy`, the frames you own are yours to scrub the
+  same way — the library cannot reach into them.
 
 ## Maintainer inactivity policy
 

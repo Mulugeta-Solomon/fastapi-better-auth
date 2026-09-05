@@ -36,6 +36,12 @@ your project already has, or install neither extra and pass your own `Transport`
 | `[httpx]` | `httpx>=0.27` | `HttpxTransport`, used by default when you pass no `transport=` |
 | `[httpx2]` | `httpx2>=2.0` | `Httpx2Transport` |
 
+The default client honours the process environment the way `httpx` does — `HTTP_PROXY`,
+`HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`/`SSL_CERT_DIR` and `~/.netrc`. That is usually what a
+deployment behind an egress proxy or a private CA wants; if it is not, pass your own
+`HttpxTransport(client=httpx.AsyncClient(trust_env=False))`. Either way the client never follows a
+redirect and never keeps a cookie. [SECURITY.md](SECURITY.md) spells out what the library trusts.
+
 ```bash
 pip install "fastapi-better-auth-bridge[httpx]"   # or: uv add "fastapi-better-auth-bridge[httpx]"
 ```
