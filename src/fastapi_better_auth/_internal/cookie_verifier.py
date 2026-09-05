@@ -82,9 +82,6 @@ class _Once:
             return True
 
 
-_SESSION_DATA_ONCE = _Once()
-
-
 class CookieCredential:
     """What `extract` hands `verify`: the matched cookie pairs, and the CSRF snapshot.
 
@@ -209,6 +206,10 @@ class CookieVerifier:
         self._data_names = session_data_names(
             self._cookie_name, self._secure_prefix, self._secure_cookies
         )
+        # Per-instance, not process-wide: two verifiers in one process each warn once on their
+        # own first session_data cookie, so a second deployment's CVE-2026-67337 warning is not
+        # eaten by the first (D-197).
+        self._session_data_once = _Once()
         self.credential_source = f"{COOKIE_SOURCE_PREFIX}{self._cookie_name}"
 
     @property
@@ -363,7 +364,7 @@ class CookieVerifier:
 
     def _observe_session_data(self, pairs: tuple[tuple[str, str], ...]) -> None:
         observed = next((name for name, _ in pairs if name in self._data_names), None)
-        if observed is not None and _SESSION_DATA_ONCE.fire():
+        if observed is not None and self._session_data_once.fire():
             logger.warning(
                 "a %s cookie was observed; the session-data cookie cache is out of scope in this"
                 " version (CVE-2026-67337, a 2FA bypass through exactly that cache) and is never"

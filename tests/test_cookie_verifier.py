@@ -667,11 +667,10 @@ class TestFrameLocalsHygiene:
 
 
 def test_a_session_data_cookie_is_observed_once_and_never_parsed(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """CVE-2026-67337: the cookie cache is out of scope. Seeing one warns exactly once, loud, and
-    the value is never read."""
-    monkeypatch.setattr(cv._SESSION_DATA_ONCE, "_fired", False, raising=False)  # pyright: ignore[reportPrivateUsage]
+    the value is never read. The latch is per-verifier (D-197), so a fresh verifier starts unfired."""
     built = verifier()
 
     with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
@@ -681,3 +680,24 @@ def test_a_session_data_cookie_is_observed_once_and_never_parsed(
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
     assert len(warnings) == 1, "the session_data warning is not once-only"
     assert "secret-value" not in warnings[0].getMessage(), "the session_data value was rendered"
+
+
+def test_two_verifiers_each_warn_on_their_own_first_session_data_cookie(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """E2 (D-197). The session_data warning latch is per-instance, not process-wide: two
+    CookieVerifiers (two deployments composed in one process) must each warn once on their own
+    first `session_data` cookie. With a module-global latch the second verifier never warned,
+    because the first had already fired it - the CVE-2026-67337 warning silently lost for the
+    second deployment. RED before the fix: only one warning is emitted for the two verifiers."""
+    first = verifier()
+    second = verifier()
+
+    with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
+        first.extract(http(cookie="better-auth.session_data=secret-one"))
+        second.extract(http(cookie="better-auth.session_data=secret-two"))
+
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 2, "each verifier must warn once on its own first session_data cookie"
+    rendered = " ".join(record.getMessage() for record in warnings)
+    assert "secret-one" not in rendered and "secret-two" not in rendered

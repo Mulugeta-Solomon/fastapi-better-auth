@@ -178,6 +178,10 @@ class JwksClient:
 
     async def _refresh(self) -> None:
         """Attempt a fetch. A failure with keys already on hand is survivable; the first is not."""
+        # A cancelled attempt produced no answer, so it must not spend the window a bystander is
+        # gated behind; a COMPLETED refusal keeps the stamp so a failing upstream stays rate-
+        # limited (D-084/D-196). Only the cancellation exception rolls back - never a refusal.
+        previous = self._attempted_at
         self._attempted_at = self._clock()
         try:
             keys = await self._fetched()
@@ -186,6 +190,9 @@ class JwksClient:
                 raise
             logger.warning("jwks refresh failed for %s; serving the key set on hand", self._uri)
             return
+        except anyio.get_cancelled_exc_class():
+            self._attempted_at = previous
+            raise
         self._keys = keys
         self._fetched_at = self._clock()
         self._missing.clear()
