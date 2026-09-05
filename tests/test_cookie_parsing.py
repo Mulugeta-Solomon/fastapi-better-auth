@@ -83,32 +83,30 @@ class TestCookiePairs:
 
 
 class TestAcceptableNames:
-    def test_the_two_bases_and_their_chunk_names_are_accepted(self) -> None:
-        names = acceptable_names(COOKIE, PREFIX)
+    def test_the_single_base_and_its_chunk_names_are_accepted(self) -> None:
+        """D1: exactly one base's names, never both. The base is whatever the verifier resolved."""
+        names = acceptable_names(SECURE)
 
-        assert COOKIE in names
         assert SECURE in names
-        assert f"{COOKIE}.0" in names
+        assert f"{SECURE}.0" in names
         assert f"{SECURE}.99" in names
+        # The plain name is another cookie's now, not this verifier's second base.
+        assert COOKIE not in names
 
     def test_a_chunk_index_past_the_cap_is_not_a_name(self) -> None:
-        names = acceptable_names(COOKIE, PREFIX)
+        names = acceptable_names(COOKIE)
 
         assert f"{COOKIE}.100" not in names
-
-    def test_an_empty_prefix_collapses_to_one_base(self) -> None:
-        names = acceptable_names(COOKIE, "")
-
-        assert COOKIE in names
-        # No `__Secure-`-less second base beyond the plain one, and no spurious empty name.
         assert "" not in names
 
-    def test_the_session_data_names_are_derived_from_the_token_cookie(self) -> None:
-        names = session_data_names(COOKIE, PREFIX)
+    def test_the_session_data_name_matches_the_secure_choice(self) -> None:
+        """One session_data name, tracking the token cookie's secure/plain choice (D-189)."""
+        secure = session_data_names(COOKIE, PREFIX, True)
+        plain = session_data_names(COOKIE, PREFIX, False)
 
-        assert "better-auth.session_data" in names
-        assert "__Secure-better-auth.session_data" in names
-        assert COOKIE not in names
+        assert secure == frozenset({"__Secure-better-auth.session_data"})
+        assert plain == frozenset({"better-auth.session_data"})
+        assert COOKIE not in secure and COOKIE not in plain
 
 
 # ---------------------------------------------------------------- resolving the cookie value
@@ -119,26 +117,25 @@ def pairs(*items: tuple[str, str]) -> tuple[tuple[str, str], ...]:
 
 
 class TestResolveCookieValue:
-    def test_a_single_unprefixed_cookie_is_returned(self) -> None:
-        assert resolve_cookie_value(pairs((COOKIE, "value")), COOKIE, SECURE) == "value"
+    def test_a_single_cookie_for_the_base_is_returned(self) -> None:
+        assert resolve_cookie_value(pairs((COOKIE, "value")), COOKIE) == "value"
 
-    def test_the_secure_prefixed_cookie_is_preferred_over_the_plain_one(self) -> None:
-        """Both present is not a rejection: `__Secure-` wins, documented."""
-        resolved = resolve_cookie_value(
-            pairs((COOKIE, "plain"), (SECURE, "secure")), COOKIE, SECURE
-        )
+    def test_only_the_configured_base_is_read(self) -> None:
+        """D1: with the plain base configured, a `__Secure-` cookie beside it is not read at all -
+        the base resolves the plain value and the other name is another cookie's (D-189)."""
+        resolved = resolve_cookie_value(pairs((COOKIE, "plain"), (SECURE, "secure")), COOKIE)
 
-        assert resolved == "secure"
+        assert resolved == "plain"
 
     def test_a_duplicate_of_one_cookie_name_is_refused(self) -> None:
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(pairs((COOKIE, "one"), (COOKIE, "two")), COOKIE, SECURE)
+            resolve_cookie_value(pairs((COOKIE, "one"), (COOKIE, "two")), COOKIE)
 
         assert "more than once" in caught.value.reason
 
     def test_a_whole_and_a_chunked_cookie_for_one_base_is_refused(self) -> None:
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(pairs((COOKIE, "whole"), (f"{COOKIE}.0", "chunk")), COOKIE, SECURE)
+            resolve_cookie_value(pairs((COOKIE, "whole"), (f"{COOKIE}.0", "chunk")), COOKIE)
 
         assert "both whole and chunked" in caught.value.reason
 
@@ -146,51 +143,33 @@ class TestResolveCookieValue:
         resolved = resolve_cookie_value(
             pairs((f"{COOKIE}.1", "BB"), (f"{COOKIE}.0", "AA"), (f"{COOKIE}.2", "CC")),
             COOKIE,
-            SECURE,
         )
 
         assert resolved == "AABBCC"
 
     def test_a_gap_in_the_chunk_sequence_is_refused(self) -> None:
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(
-                pairs((f"{COOKIE}.0", "AA"), (f"{COOKIE}.2", "CC")), COOKIE, SECURE
-            )
+            resolve_cookie_value(pairs((f"{COOKIE}.0", "AA"), (f"{COOKIE}.2", "CC")), COOKIE)
 
         assert "contiguous" in caught.value.reason
 
     def test_a_duplicate_chunk_index_is_refused(self) -> None:
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(
-                pairs((f"{COOKIE}.0", "AA"), (f"{COOKIE}.0", "BB")), COOKIE, SECURE
-            )
+            resolve_cookie_value(pairs((f"{COOKIE}.0", "AA"), (f"{COOKIE}.0", "BB")), COOKIE)
 
         assert "contiguous" in caught.value.reason
 
     def test_chunks_that_do_not_start_at_zero_are_refused(self) -> None:
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(
-                pairs((f"{COOKIE}.1", "AA"), (f"{COOKIE}.2", "BB")), COOKIE, SECURE
-            )
+            resolve_cookie_value(pairs((f"{COOKIE}.1", "AA"), (f"{COOKIE}.2", "BB")), COOKIE)
 
         assert "contiguous" in caught.value.reason
-
-    def test_the_secure_chunks_win_when_both_bases_are_chunked(self) -> None:
-        resolved = resolve_cookie_value(
-            pairs((f"{COOKIE}.0", "plain"), (f"{SECURE}.0", "secure")), COOKIE, SECURE
-        )
-
-        assert resolved == "secure"
-
-    def test_a_none_secure_base_is_skipped(self) -> None:
-        """An empty prefix collapses the secure base to None; only the plain one is read."""
-        assert resolve_cookie_value(pairs((COOKIE, "value")), COOKIE, None) == "value"
 
     def test_no_material_at_all_is_refused_defensively(self) -> None:
         """Unreachable through extract, which only dispatches when a name matched; refused so a
         direct caller can never be handed an empty string."""
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(pairs(("unrelated", "x")), COOKIE, SECURE)
+            resolve_cookie_value(pairs(("unrelated", "x")), COOKIE)
 
         assert "no session cookie material" in caught.value.reason
 
@@ -198,7 +177,7 @@ class TestResolveCookieValue:
         half = MAX_COOKIE_BYTES // 2 + 1
         chunked = pairs((f"{COOKIE}.0", "a" * half), (f"{COOKIE}.1", "b" * half))
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(chunked, COOKIE, SECURE)
+            resolve_cookie_value(chunked, COOKIE)
 
         assert "over the cap" in caught.value.reason
 
@@ -351,21 +330,21 @@ class TestFrameLocalsHygiene:
     def test_a_non_contiguous_chunk_run_leaves_no_material_in_a_library_frame(self) -> None:
         crafted = pairs((f"{COOKIE}.0", MARK + "A"), (f"{COOKIE}.2", MARK + "C"))
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(crafted, COOKIE, SECURE)
+            resolve_cookie_value(crafted, COOKIE)
 
         assert MARK not in _rendered_frames(caught.value)
 
     def test_a_duplicate_cookie_leaves_no_material_in_a_library_frame(self) -> None:
         crafted = pairs((COOKIE, MARK + "one"), (COOKIE, MARK + "two"))
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(crafted, COOKIE, SECURE)
+            resolve_cookie_value(crafted, COOKIE)
 
         assert MARK not in _rendered_frames(caught.value)
 
     def test_a_whole_and_chunked_cookie_leaves_no_material_in_a_library_frame(self) -> None:
         crafted = pairs((COOKIE, MARK + "whole"), (f"{COOKIE}.0", MARK + "chunk"))
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(crafted, COOKIE, SECURE)
+            resolve_cookie_value(crafted, COOKIE)
 
         assert MARK not in _rendered_frames(caught.value)
 

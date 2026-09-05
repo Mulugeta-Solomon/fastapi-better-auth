@@ -309,7 +309,7 @@ def cookie_row(
     else:  # pragma: no cover - a typo in the matrix must not pass silently
         raise AssertionError(f"unknown row {label!r}")
 
-    verifier = CookieVerifier(secret=SECRET, store=store, csrf=policy)
+    verifier = CookieVerifier(secret=SECRET, store=store, csrf=policy, secure_cookies=False)
     return verifier, connection, model, store
 
 
@@ -378,6 +378,7 @@ def ambiguous_row() -> tuple[list[Any], HTTPConnection, Store]:
             secret=SECRET,
             store=store,
             csrf=CsrfDisabled(reason="this row is not about cross-site request forgery"),
+            secure_cookies=False,
         ),
         jwt_verifier(json_reply(GOLDEN_JWKS)),
     ]

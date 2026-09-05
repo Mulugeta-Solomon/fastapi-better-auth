@@ -251,6 +251,7 @@ def cookie_verifier_for_vectors() -> CookieVerifier:
         secret=SECRET,
         store=seeded_store(),
         csrf=CsrfDisabled(reason="golden vectors test signature parity only"),
+        secure_cookies=False,
     )
 
 
@@ -383,7 +384,12 @@ class TestCsrfOrdering:
         this verifier, so a spy on it cannot otherwise be attributed to one caller."""
         calls = self.keyring_spy(monkeypatch)
         store = seeded_store()
-        built = CookieVerifier(secret=SECRET, store=store, csrf=OriginCheck(allowed_origins=[APP]))
+        built = CookieVerifier(
+            secret=SECRET,
+            store=store,
+            csrf=OriginCheck(allowed_origins=[APP]),
+            secure_cookies=False,
+        )
         connection = http(
             "POST",
             cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}",
@@ -402,7 +408,10 @@ class TestCsrfOrdering:
         """The named Mode-A invariant: with a bad signature, nothing reaches the engine or Redis."""
         store = seeded_store()
         built = CookieVerifier(
-            secret=SECRET, store=store, csrf=CsrfDisabled(reason="isolating the signature rung")
+            secret=SECRET,
+            store=store,
+            csrf=CsrfDisabled(reason="isolating the signature rung"),
+            secure_cookies=False,
         )
         forged = sign(CAPTURED_TOKEN, secret=b"the-wrong-secret-thirty-two-plus!")
 
@@ -426,6 +435,7 @@ class TestCsrfOrdering:
             secrets=[SECRET, OTHER_SECRET],
             store=seeded_store(),
             csrf=CsrfDisabled(reason="isolating the keyring"),
+            secure_cookies=False,
         )
 
         session = await run(built, http(cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}"))
@@ -437,7 +447,9 @@ class TestCsrfOrdering:
     async def test_a_cross_origin_request_with_a_valid_double_submit_token_passes(self) -> None:
         """The stronger policy composes: the bound header token lets a same-site POST through."""
         policy = SignedDoubleSubmit(secret=CSRF_SECRET, allowed_origins=[APP])
-        built = CookieVerifier(secret=SECRET, store=seeded_store(), csrf=policy)
+        built = CookieVerifier(
+            secret=SECRET, store=seeded_store(), csrf=policy, secure_cookies=False
+        )
         header = policy.token_for(CAPTURED_TOKEN)
         connection = http(
             "POST", cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}", origin=APP, x_csrf_token=header
@@ -527,15 +539,20 @@ class TestStructuralRejections:
             await run(verifier(), http(cookie=f"{COOKIE}={signed}; {COOKIE}={signed}"))
 
     @pytest.mark.anyio
-    async def test_the_secure_prefixed_cookie_is_preferred(self) -> None:
-        """Both present is not ambiguous within one verifier: `__Secure-` wins."""
+    async def test_the_other_name_is_ignored_not_preferred(self) -> None:
+        """D1: exactly one name is read. On a plain-name deployment the `__Secure-` cookie a
+        sibling subdomain could plant is not read at all - the plain cookie resolves, and no
+        cross-name preference can hand the request to a planted credential (D-189). The fuller
+        both-directions matrix is test_secure_cookies.py."""
         good = sign(CAPTURED_TOKEN)
-        bad = sign(CAPTURED_TOKEN, secret=b"wrong-secret-value-thirty-two-ch!")
-        connection = http(cookie=f"{COOKIE}={bad}; {SECURE}={good}")
+        planted = sign(CAPTURED_TOKEN, secret=b"wrong-secret-value-thirty-two-ch!")
+        connection = http(cookie=f"{COOKIE}={good}; {SECURE}={planted}")
 
         session = await run(verifier(), connection)
 
         assert session is not None
+        assert session.token is not None
+        assert session.token.get_secret_value() == CAPTURED_TOKEN
 
 
 # ---------------------------------------------------------------- no bypass
@@ -553,7 +570,7 @@ class TestNoBypass:
     )
     async def test_no_policy_makes_an_unsigned_token_verify(self, csrf: Any) -> None:
         """There is no flag, and no CSRF choice, that accepts a token this keyring did not sign."""
-        built = CookieVerifier(secret=SECRET, store=seeded_store(), csrf=csrf)
+        built = CookieVerifier(secret=SECRET, store=seeded_store(), csrf=csrf, secure_cookies=False)
         unsigned = f"{CAPTURED_TOKEN}.{base64.b64encode(b'x' * 32).decode()}"
         connection = http("GET", cookie=f"{COOKIE}={unsigned}", origin=APP)
 

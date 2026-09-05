@@ -201,7 +201,7 @@ async def test_a_policy_that_does_not_scrub_is_visible_to_the_walker() -> None:
     attributable.
     """
     store = Store(session=stored_session())
-    verifier = CookieVerifier(secret=SECRET, store=store, csrf=Careless())
+    verifier = CookieVerifier(secret=SECRET, store=store, csrf=Careless(), secure_cookies=False)
     connection = request("POST", cookies=[f"{COOKIE_NAME}={COOKIE_VALUE}"])
 
     error = await refused(verifier, connection)

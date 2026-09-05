@@ -28,6 +28,8 @@ from pydantic import SecretStr
 from starlette.requests import HTTPConnection
 
 from .cookie_parsing import (
+    MAX_COOKIE_HEADER_BYTES,
+    MAX_COOKIE_PAIRS,
     ParsedCookie,
     acceptable_names,
     cookie_pairs,
@@ -155,10 +157,20 @@ class CookieVerifier:
             resurrect exactly the sessions a sign-out revoked.
         csrf: The cross-site request forgery policy. Required, keyword-only, no default.
         cookie_name: The unprefixed cookie name Better Auth sets, `better-auth.session_token` by
-            default. Its `__Secure-`-prefixed form and its `${name}.${index}` chunk names are read
-            as well, and it is the cookie `/docs` shows an Authorize field for.
-        secure_prefix: The prefix on the hardened cookie name, `__Secure-` by default. An empty
-            string reads only the plain name.
+            default. Exactly one name is read - the `__Secure-`-prefixed form or this plain one,
+            per `secure_cookies` - together with its `${name}.${index}` chunk names, and it is the
+            cookie `/docs` shows an Authorize field for.
+        secure_prefix: The prefix on the hardened cookie name, `__Secure-` by default, used only
+            when `secure_cookies` is `True`. **`__Host-` is the only prefix that stops a sibling
+            subdomain from planting a cookie your app will read; `__Secure-` does not** - a sibling
+            over TLS can set a `Domain`-scoped `__Secure-` cookie. Set `secure_prefix="__Host-"`
+            where you can harden Better Auth to emit `__Host-` cookies, and prefer it.
+        secure_cookies: Whether the server sets the `__Secure-`-prefixed cookie. `True` by default,
+            matching Better Auth's production `useSecureCookies` default, and then the *only* name
+            read is `{secure_prefix}{cookie_name}`. Set it `False` for a dev/HTTP deployment on the
+            plain name, and then the *only* name read is `{cookie_name}`. Never both: accepting the
+            plain and the prefixed name at once let a sibling subdomain plant the other name and be
+            authenticated as itself (a cross-name session fixation).
 
     Raises:
         ConfigurationError: For any unusable configuration, at construction: neither or both of
@@ -177,17 +189,26 @@ class CookieVerifier:
         csrf: CsrfPolicy,
         cookie_name: str = DEFAULT_COOKIE_NAME,
         secure_prefix: str = DEFAULT_SECURE_PREFIX,
+        secure_cookies: bool = True,
     ) -> None:
         self._secrets = _validated_keyring(secret, secrets)
         self._store = _validated_store(store)
         self._csrf = validated_policy(csrf, where="CookieVerifier(csrf=...)")
         self._cookie_name = _validated_cookie_name(cookie_name)
         self._secure_prefix = _validated_prefix(secure_prefix)
-        self._plain_base = self._cookie_name
-        prefixed = f"{self._secure_prefix}{self._cookie_name}"
-        self._secure_base = None if prefixed == self._cookie_name else prefixed
-        self._acceptable = acceptable_names(self._cookie_name, self._secure_prefix)
-        self._data_names = session_data_names(self._cookie_name, self._secure_prefix)
+        self._secure_cookies = _validated_secure_cookies(secure_cookies)
+        # Exactly one accepted base, never both: the `__Secure-`-prefixed name when the server
+        # sets secure cookies (better-auth's production default), or the plain name when it does
+        # not. Accepting both is the cross-name fixation D-189 closes.
+        self._base = (
+            f"{self._secure_prefix}{self._cookie_name}"
+            if self._secure_cookies
+            else self._cookie_name
+        )
+        self._acceptable = acceptable_names(self._base)
+        self._data_names = session_data_names(
+            self._cookie_name, self._secure_prefix, self._secure_cookies
+        )
         self.credential_source = f"{COOKIE_SOURCE_PREFIX}{self._cookie_name}"
 
     @property
@@ -199,6 +220,11 @@ class CookieVerifier:
     def secure_prefix(self) -> str:
         """The prefix on the hardened cookie name."""
         return self._secure_prefix
+
+    @property
+    def secure_cookies(self) -> bool:
+        """Whether the single accepted name is the `__Secure-`-prefixed one (`True`) or the plain."""
+        return self._secure_cookies
 
     @property
     def csrf(self) -> CsrfPolicy:
@@ -222,10 +248,20 @@ class CookieVerifier:
         defence: a real cookie beside a planted blank of the same name resolves to the real one,
         while two non-blank same-name cookies still reach the duplicate rejection in `verify`.
 
+        A Cookie header over `MAX_COOKIE_HEADER_BYTES`, or one that parses into more than
+        `MAX_COOKIE_PAIRS` pairs, reads as absent and is never parsed further: a request that
+        malformed carries no credential this library will spend CPU on, and capping here makes the
+        parse bound the library's own guarantee rather than the ASGI server's header cap (D-193).
+
         Synchronous and non-raising. The one side effect is a single, once-only warning if the
         out-of-scope `session_data` cookie is seen (CVE-2026-67337); its value is never read.
         """
-        pairs = cookie_pairs(_joined_cookie_header(connection))
+        header = _joined_cookie_header(connection)
+        if len(header) > MAX_COOKIE_HEADER_BYTES:
+            return None
+        pairs = cookie_pairs(header)
+        if len(pairs) > MAX_COOKIE_PAIRS:
+            return None
         self._observe_session_data(pairs)
         matched = tuple(
             (name, value) for name, value in pairs if name in self._acceptable and value.strip()
@@ -259,7 +295,7 @@ class CookieVerifier:
         material = token = signature = ""
         parsed: ParsedCookie | None = None
         try:
-            material = resolve_cookie_value(credential.pairs, self._plain_base, self._secure_base)
+            material = resolve_cookie_value(credential.pairs, self._base)
             parsed = parse_signed_value(material)
             token = parsed.token
             signature = parsed.signature
@@ -488,6 +524,16 @@ def _validated_cookie_name(cookie_name: object) -> str:
             f" ';', '=' or ','; got {cookie_name!r}."
         )
     return cookie_name
+
+
+def _validated_secure_cookies(secure_cookies: object) -> bool:
+    if not isinstance(secure_cookies, bool):
+        raise ConfigurationError(
+            "CookieVerifier(secure_cookies=...) must be a bool: True to read only the"
+            f" secure-prefixed cookie name, False to read only the plain one; got"
+            f" {type(secure_cookies).__name__}."
+        )
+    return secure_cookies
 
 
 def _validated_prefix(secure_prefix: object) -> str:

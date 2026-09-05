@@ -169,6 +169,7 @@ class TestBannedThroughTheVerifier:
             secret=VERIFIER_SECRET,
             store=store,
             csrf=CsrfDisabled(reason="this row is about the ban check, not CSRF"),
+            secure_cookies=False,
         )
         connection = _cookie_connection(TOKEN)
         credential = verifier.extract(connection)
