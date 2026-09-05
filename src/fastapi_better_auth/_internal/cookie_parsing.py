@@ -109,12 +109,17 @@ def session_data_names(
     return frozenset({f"{secure_prefix}{data}" if secure_cookies else data})
 
 
-def resolve_cookie_value(pairs: tuple[tuple[str, str], ...], base: str) -> str:
-    """The one signed cookie value these pairs carry for the single configured base.
+def resolve_named_cookie(pairs: tuple[tuple[str, str], ...], base: str) -> tuple[str, str]:
+    """The single configured base's `(name, value)`, reassembled if it arrived chunked.
 
-    Returns a single whole cookie, or a contiguous run of chunks reassembled in index order. A
-    base that carries both a whole cookie and chunks, a duplicated name, or a chunk run with a
-    gap, a repeat or a missing index 0 is refused: a server emits none of those shapes.
+    The name is always the `base` - the one name the audit's D-189 fix accepts, never a second
+    accept-both name - and the value is a single whole cookie or a contiguous run of chunks
+    joined in index order. A base carrying both a whole cookie and chunks, a duplicated name, or
+    a chunk run with a gap, a repeat or a missing index 0 is refused: a server emits none of
+    those shapes.
+
+    Mode C forwards exactly this pair as its outbound `cookie:` header, under the base name the
+    browser sent (`__Secure-` preserved verbatim), value still percent-encoded.
 
     Raises:
         InvalidCredential: For any malformed set, and (defensively) if the base has no material.
@@ -122,10 +127,25 @@ def resolve_cookie_value(pairs: tuple[tuple[str, str], ...], base: str) -> str:
     try:
         value = _value_for_base(pairs, base)
         if value is not None:
-            return value
+            return base, value
         # extract only dispatches when an acceptable name was present, so this is unreachable
         # through the real entry point; refused rather than returned so no direct caller gets ""
         raise InvalidCredential(reason="no session cookie material after resolution")
+    finally:
+        pairs = ()
+
+
+def resolve_cookie_value(pairs: tuple[tuple[str, str], ...], base: str) -> str:
+    """The one signed cookie value these pairs carry for the single configured base.
+
+    The `.value` projection of `resolve_named_cookie`, kept as the name Mode A reads (the cookie
+    verifier needs the value, never the name it resolved under, because it already knows the base).
+
+    Raises:
+        InvalidCredential: For any malformed set, and (defensively) if the base has no material.
+    """
+    try:
+        return resolve_named_cookie(pairs, base)[1]
     finally:
         pairs = ()
 

@@ -12,14 +12,12 @@ from ..errors import ConfigurationError
 from ..reasons import safe_label
 from .diagnostics import unusable
 from .records import StoredSession, StoredUser
-from .upstream import as_flag, as_moment, as_text
+from .session_document import SESSION_KEY, parse_session_document
 
 if TYPE_CHECKING:
     import redis.asyncio
 
 MAX_VALUE_BYTES = 64 * 1024
-SESSION_KEY = "session"
-USER_KEY = "user"
 
 MISSING = (
     "RedisSessionStore needs the redis package, which is not installed. Install it with:"
@@ -249,47 +247,15 @@ class RedisSessionStore:
         return cast("Mapping[str, Any]", parsed)
 
     def _record(self, document: Mapping[str, Any], token: str, key: str) -> StoredSession | None:
-        session = document.get(SESSION_KEY)
-        stored_user = document.get(USER_KEY)
-        if not isinstance(session, dict) or not isinstance(stored_user, dict):
-            unusable(SESSION_KEY, "it does not carry both a session and a user", key)
+        # The `{session, user}` promotion is the shared seam (session_document); the one check
+        # that stays here is the store's own: does the value name the key it was found under.
+        # Honouring a mismatch would authenticate whoever wrote that key.
+        record = parse_session_document(document, key)
+        if record is None:
             return None
-        payload = cast("Mapping[str, Any]", session)
-        user = self._user(cast("Mapping[str, Any]", stored_user), key)
-        expires_at = as_moment(payload.get("expiresAt"))
-        user_id = as_text(payload.get("userId"))
-        stored_token = as_text(payload.get("token"))
-        if expires_at is None or user_id is None or stored_token is None or user is None:
-            unusable(SESSION_KEY, "a value it must carry is missing or unreadable", key)
-            return None
-        if not hmac.compare_digest(stored_token.encode("utf-8"), token.encode("utf-8")):
+        if not hmac.compare_digest(record.token.encode("utf-8"), token.encode("utf-8")):
             unusable(
                 SESSION_KEY, "it names a different session than the key it was found under", key
             )
             return None
-        return StoredSession(
-            token=stored_token,
-            user_id=user_id,
-            expires_at=expires_at,
-            payload=payload,
-            user=user,
-            impersonated_by=as_text(payload.get("impersonatedBy")),
-        )
-
-    def _user(self, payload: Mapping[str, Any], key: str) -> StoredUser | None:
-        identifier = as_text(payload.get("id"))
-        if identifier is None:
-            unusable(USER_KEY, "its id is missing or blank", key)
-            return None
-        banned = payload.get("banned")
-        if banned is not None and as_flag(banned) is None:
-            unusable(USER_KEY, "its banned field is not a boolean", key)
-            return None
-        recorded = payload.get("banExpires")
-        ban_expires = None if recorded is None else as_moment(recorded)
-        if recorded is not None and ban_expires is None:
-            unusable(USER_KEY, "its banExpires is not a date", key)
-            return None
-        return StoredUser(
-            id=identifier, payload=payload, banned=as_flag(banned), ban_expires=ban_expires
-        )
+        return record

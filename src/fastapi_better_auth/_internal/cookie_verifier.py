@@ -15,9 +15,9 @@ the store is reached on a CSRF failure. These are named invariants, spy-tested, 
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
+# The keyring compare moved to `.signing`; `hmac` stays imported so the shared module is reachable
+# as `cookie_verifier.hmac`, the handle `test_cookie_verifier` spies `compare_digest` through.
+import hmac  # noqa: F401  # pyright: ignore[reportUnusedImport]
 import logging
 import threading
 from collections.abc import Mapping, Sequence
@@ -51,6 +51,7 @@ from .models import Session, User
 from .parsing import parse_user
 from .reasons import fingerprint, safe_label
 from .shared_secret import SharedSecret
+from .signing import verify_signature
 from .stores.protocol import SessionStore
 from .stores.records import StoredSession, StoredUser
 
@@ -302,7 +303,7 @@ class CookieVerifier:
             signature = parsed.signature
             marker = fingerprint(token)
             enforce_policy(self._csrf, credential.facts, token)
-            _verify_signature(self._secrets, token, signature, marker)
+            verify_signature(self._secrets, token, signature, marker)
             return await self._resolved(token, marker, user_model)
         finally:
             # `credential` is a parameter, and a parameter is a frame local like any other
@@ -379,37 +380,6 @@ def _joined_cookie_header(connection: HTTPConnection) -> str:
 
 def _store_unavailable(marker: str) -> AuthServiceUnavailable:
     return AuthServiceUnavailable(reason=f"session store lookup could not complete [{marker}]")
-
-
-def _verify_signature(
-    secrets: tuple[SharedSecret, ...], token: str, signature: str, marker: str
-) -> None:
-    """One `compare_digest` per keyring entry, no early return, accepted iff any matched.
-
-    The keyring is the `BETTER_AUTH_SECRETS` rotation: a cookie signed with any current secret must
-    verify. Iterating without an early return keeps the work independent of which key matched, and
-    `matched |=` accumulates so a match is never short-circuited away. The token, the signature and
-    every derived byte string are scrubbed in `finally` - this is the frame that raises the bad-sig
-    refusal, so a reporter capturing its locals must find no credential (D-094).
-    """
-    message = presented = expected = b""
-    digest = None
-    try:
-        message = token.encode("utf-8")
-        presented = signature.encode("ascii")
-        matched = False
-        for secret in secrets:
-            digest = hmac.new(secret.get_secret_value().encode("utf-8"), message, hashlib.sha256)
-            expected = base64.b64encode(digest.digest())
-            matched |= hmac.compare_digest(presented, expected)
-        if not matched:
-            raise InvalidCredential(
-                reason=f"signature verifies against no configured secret [{marker}]"
-            )
-    finally:
-        token = signature = ""
-        message = presented = expected = b""
-        digest = None
 
 
 def _check_expiry(record: StoredSession, marker: str) -> None:
