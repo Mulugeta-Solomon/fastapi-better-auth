@@ -38,7 +38,6 @@ Internal module, public class: `RemoteVerifier` is exported from the package roo
 from __future__ import annotations
 
 import hmac
-import math
 import time
 import urllib.parse
 from collections.abc import Callable, Sequence
@@ -58,11 +57,7 @@ from .cookie_parsing import (
     parse_signed_value,
     resolve_named_cookie,
 )
-from .cookie_verifier import (
-    DEFAULT_COOKIE_NAME,
-    DEFAULT_SECURE_PREFIX,
-    ILLEGAL_IN_A_COOKIE_NAME,
-)
+from .cookie_verifier import DEFAULT_COOKIE_NAME, DEFAULT_SECURE_PREFIX
 from .csrf import CsrfFacts, CsrfPolicy, enforce_policy, validated_policy
 from .errors import (
     AuthServiceUnavailable,
@@ -73,31 +68,33 @@ from .errors import (
     SessionExpired,
     SessionRevoked,
 )
-from .httpx_transports import HttpxTransport
 from .models import Session, User
-from .negative_cache import (
-    MAX_NEGATIVE_TTL,
-    MAX_REMEMBERED,
-    MAX_REMEMBERED_MISSES,
-    MIN_NEGATIVE_TTL,
-    MIN_REMEMBERED,
-    NEGATIVE_TTL,
-    NegativeCache,
-)
+from .negative_cache import MAX_REMEMBERED_MISSES, NEGATIVE_TTL, NegativeCache
 from .parsing import parse_user
 from .reasons import fingerprint
 from .remote_backoff import BackoffLatch
+from .remote_config import (
+    MAX_OUTBOUND_CONCURRENCY,
+    QUEUE_TIMEOUT,
+    validated_base_path,
+    validated_cap,
+    validated_clock,
+    validated_concurrency,
+    validated_cookie_name,
+    validated_max_remembered,
+    validated_negative_ttl,
+    validated_optional_keyring,
+    validated_prefix,
+    validated_queue_timeout,
+    validated_secure_cookies,
+    validated_transport,
+)
 from .remote_probe import run_probe
 from .remote_response import is_cacheable_null, null_outcome, session_document_from
 from .shared_secret import SharedSecret
 from .signing import verify_signature
 from .stores.records import StoredSession, StoredUser
-from .transport import (
-    ContentEncodingRejected,
-    ResponseTooLarge,
-    Transport,
-    TransportResponse,
-)
+from .transport import ContentEncodingRejected, ResponseTooLarge, Transport, TransportResponse
 from .urls import normalize_base_url
 
 UserModelT = TypeVar("UserModelT", bound=User)
@@ -112,18 +109,7 @@ GET_SESSION_QUERY = "?disableCookieCache=true&disableRefresh=true"
 MAX_SESSION_BYTES = 65536
 MAX_TOKEN_BYTES = 4096
 
-MAX_OUTBOUND_CONCURRENCY = 8
-MIN_CONCURRENCY = 1
-MAX_CONCURRENCY = 256
-QUEUE_TIMEOUT = 2.0
-MIN_QUEUE_TIMEOUT = 0.1
 PROBE_RETRY_INTERVAL = 10.0
-
-_BASE_PATH_MESSAGE = (
-    "RemoteVerifier(base_path=...) must be the path Better Auth is mounted at, starting with '/'"
-    " and with no trailing slash, query or fragment - '/api/auth' by default, or '' for a server"
-    " mounted at the root; got {got!r}."
-)
 
 
 class RemoteCredential:
@@ -239,27 +225,27 @@ class RemoteVerifier:
     ) -> None:
         self._origin = normalize_base_url(base_url)
         self._csrf = validated_policy(csrf, where="RemoteVerifier(csrf=...)")
-        self._transport = _validated_transport(transport)
-        self._secrets = _validated_optional_keyring(secret, secrets)
-        self._cookie_name = _validated_cookie_name(cookie_name)
-        self._secure_prefix = _validated_prefix(secure_prefix)
-        self._secure_cookies = _validated_secure_cookies(secure_cookies)
+        self._transport = validated_transport(transport)
+        self._secrets = validated_optional_keyring(secret, secrets)
+        self._cookie_name = validated_cookie_name(cookie_name)
+        self._secure_prefix = validated_prefix(secure_prefix)
+        self._secure_cookies = validated_secure_cookies(secure_cookies)
         self._base = (
             f"{self._secure_prefix}{self._cookie_name}"
             if self._secure_cookies
             else self._cookie_name
         )
         self._acceptable = acceptable_names(self._base)
-        self._base_path = _validated_base_path(base_path)
-        self._concurrency = _validated_concurrency(concurrency)
-        self._queue_timeout = _validated_queue_timeout(queue_timeout)
-        self._max_bytes = _validated_cap(max_bytes)
-        self._clock = _validated_clock(clock)
+        self._base_path = validated_base_path(base_path)
+        self._concurrency = validated_concurrency(concurrency)
+        self._queue_timeout = validated_queue_timeout(queue_timeout)
+        self._max_bytes = validated_cap(max_bytes)
+        self._clock = validated_clock(clock)
         self._uri = f"{self._origin}{self._base_path}{GET_SESSION_PATH}{GET_SESSION_QUERY}"
         self.credential_source = f"{COOKIE_SOURCE_PREFIX}{self._cookie_name}"
         self._cache = NegativeCache(
-            ttl=_validated_negative_ttl(negative_ttl),
-            max_remembered=_validated_max_remembered(max_remembered),
+            ttl=validated_negative_ttl(negative_ttl),
+            max_remembered=validated_max_remembered(max_remembered),
             clock=self._clock,
         )
         self._backoff = BackoffLatch(clock=self._clock)
@@ -682,191 +668,3 @@ def _build_session(
     finally:
         token = ""
         raw = {}
-
-
-def _validated_transport(transport: object) -> Transport:
-    if transport is None:
-        return HttpxTransport()
-    if not isinstance(transport, Transport):
-        raise ConfigurationError(
-            f"RemoteVerifier(transport=...) is a {type(transport).__name__}, which does not"
-            " implement the Transport protocol: it needs async get(url, *, headers, max_bytes)"
-            " and post(...) methods. Pass HttpxTransport(), Httpx2Transport(), or an adapter of"
-            " your own."
-        )
-    for method in ("get", "post"):
-        if not callable(getattr(transport, method)):
-            raise ConfigurationError(
-                f"RemoteVerifier(transport=...) has a {method} that is not callable."
-            )
-    return transport
-
-
-def _validated_optional_keyring(
-    secret: SharedSecret | None, secrets: Sequence[SharedSecret] | None
-) -> tuple[SharedSecret, ...]:
-    if secret is not None and secrets is not None:
-        raise ConfigurationError(
-            "RemoteVerifier takes at most one of secret= or secrets=. Both configure the same"
-            " optional local signature pre-check; passing both leaves it undecided which keyring"
-            " is authoritative."
-        )
-    if secret is None and secrets is None:
-        return ()
-    if secret is not None:
-        entries: tuple[object, ...] = (secret,)
-    else:
-        if isinstance(secrets, (str, bytes, bytearray)) or not isinstance(secrets, Sequence):
-            raise ConfigurationError(
-                "RemoteVerifier(secrets=...) takes a sequence of SharedSecret; got"
-                f" {type(secrets).__name__}. A bare string would be iterated one character at a time."
-            )
-        entries = tuple(cast("Sequence[object]", secrets))
-        if not entries:
-            raise ConfigurationError(
-                "RemoteVerifier(secrets=...) is empty, so no signature could ever be pre-checked."
-                " Pass at least one SharedSecret, or neither secret= nor secrets= to skip the"
-                " local pre-check entirely."
-            )
-    for entry in entries:
-        if not isinstance(entry, SharedSecret):
-            raise ConfigurationError(
-                "RemoteVerifier signs nothing, but it pre-checks with SharedSecret, not"
-                f" {type(entry).__name__}: SharedSecret is what refuses a weak or placeholder"
-                " value at boot and keeps it out of every rendering. Write"
-                " SharedSecret(os.environ['BETTER_AUTH_SECRET'])."
-            )
-    return cast("tuple[SharedSecret, ...]", entries)
-
-
-def _validated_cookie_name(cookie_name: object) -> str:
-    if not isinstance(cookie_name, str) or not cookie_name.strip():
-        raise ConfigurationError(
-            "RemoteVerifier(cookie_name=...) must be a non-empty string, such as"
-            f" 'better-auth.session_token'; got {cookie_name!r}."
-        )
-    if ILLEGAL_IN_A_COOKIE_NAME.intersection(cookie_name):
-        raise ConfigurationError(
-            "RemoteVerifier(cookie_name=...) must be a bare cookie name with no whitespace,"
-            f" ';', '=' or ','; got {cookie_name!r}."
-        )
-    return cookie_name
-
-
-def _validated_prefix(secure_prefix: object) -> str:
-    if not isinstance(secure_prefix, str):
-        raise ConfigurationError(
-            "RemoteVerifier(secure_prefix=...) must be a string, empty to read only the plain"
-            f" cookie name; got {type(secure_prefix).__name__}."
-        )
-    if secure_prefix and ILLEGAL_IN_A_COOKIE_NAME.intersection(secure_prefix):
-        raise ConfigurationError(
-            "RemoteVerifier(secure_prefix=...) must carry no whitespace, ';', '=' or ','; got"
-            f" {secure_prefix!r}."
-        )
-    return secure_prefix
-
-
-def _validated_secure_cookies(secure_cookies: object) -> bool:
-    if not isinstance(secure_cookies, bool):
-        raise ConfigurationError(
-            "RemoteVerifier(secure_cookies=...) must be a bool: True to read only the"
-            " secure-prefixed cookie name, False to read only the plain one; got"
-            f" {type(secure_cookies).__name__}."
-        )
-    return secure_cookies
-
-
-def _validated_base_path(base_path: object) -> str:
-    if not isinstance(base_path, str):
-        raise ConfigurationError(_BASE_PATH_MESSAGE.format(got=type(base_path).__name__))
-    if base_path == "":
-        return base_path
-    malformed = (
-        not base_path.startswith("/")
-        or base_path.endswith("/")
-        or any(char.isspace() or char < "\x20" or char == "\x7f" for char in base_path)
-        or "?" in base_path
-        or "#" in base_path
-        or ".." in base_path
-    )
-    if malformed:
-        raise ConfigurationError(_BASE_PATH_MESSAGE.format(got=base_path))
-    return base_path
-
-
-def _validated_cap(max_bytes: object) -> int:
-    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
-        raise ConfigurationError(
-            "RemoteVerifier(max_bytes=...) must be a positive integer number of bytes; got"
-            f" {max_bytes!r}. It bounds the get-session body this verifier will read."
-        )
-    return max_bytes
-
-
-def _validated_concurrency(concurrency: object) -> int:
-    if (
-        isinstance(concurrency, bool)
-        or not isinstance(concurrency, int)
-        or not MIN_CONCURRENCY <= concurrency <= MAX_CONCURRENCY
-    ):
-        raise ConfigurationError(
-            f"RemoteVerifier(concurrency=...) must be between {MIN_CONCURRENCY} and"
-            f" {MAX_CONCURRENCY} outbound get-session calls; got {concurrency!r}. It bounds how"
-            " much of this process one stalled auth service can occupy, not how fast upstream is"
-            " asked."
-        )
-    return concurrency
-
-
-def _validated_queue_timeout(queue_timeout: object) -> float:
-    if isinstance(queue_timeout, bool) or not isinstance(queue_timeout, (int, float)):
-        raise ConfigurationError(
-            "RemoteVerifier(queue_timeout=...) must be a number of seconds; got"
-            f" {type(queue_timeout).__name__}."
-        )
-    if not math.isfinite(queue_timeout) or queue_timeout < MIN_QUEUE_TIMEOUT:
-        raise ConfigurationError(
-            f"RemoteVerifier(queue_timeout=...) must be at least {MIN_QUEUE_TIMEOUT} seconds; got"
-            f" {queue_timeout!r}. Below that a saturated moment refuses every request that arrives"
-            " during it."
-        )
-    return float(queue_timeout)
-
-
-def _validated_negative_ttl(negative_ttl: object) -> float:
-    if isinstance(negative_ttl, bool) or not isinstance(negative_ttl, (int, float)):
-        raise ConfigurationError(
-            "RemoteVerifier(negative_ttl=...) must be a number of seconds; got"
-            f" {type(negative_ttl).__name__}."
-        )
-    if not math.isfinite(negative_ttl) or not MIN_NEGATIVE_TTL <= negative_ttl <= MAX_NEGATIVE_TTL:
-        raise ConfigurationError(
-            f"RemoteVerifier(negative_ttl=...) must be between {int(MIN_NEGATIVE_TTL)} and"
-            f" {int(MAX_NEGATIVE_TTL)} seconds; 0 disables the cache, which costs one upstream call"
-            f" per forged cookie and is safe, never a bypass. Got {negative_ttl!r}."
-        )
-    return float(negative_ttl)
-
-
-def _validated_max_remembered(max_remembered: object) -> int:
-    if (
-        isinstance(max_remembered, bool)
-        or not isinstance(max_remembered, int)
-        or not MIN_REMEMBERED <= max_remembered <= MAX_REMEMBERED
-    ):
-        raise ConfigurationError(
-            "RemoteVerifier(max_remembered=...) must be a positive number of remembered refusals,"
-            f" at most {MAX_REMEMBERED}; got {max_remembered!r}. A garbage-cookie space is the"
-            " attacker's imagination, so remembering it is bounded."
-        )
-    return max_remembered
-
-
-def _validated_clock(clock: object) -> Callable[[], float]:
-    if not callable(clock):
-        raise ConfigurationError(
-            "RemoteVerifier(clock=...) must be a callable returning monotonic seconds, such as"
-            f" time.monotonic; got {type(clock).__name__}."
-        )
-    return cast("Callable[[], float]", clock)
