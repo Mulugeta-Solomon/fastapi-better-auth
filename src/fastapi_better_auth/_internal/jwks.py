@@ -258,7 +258,7 @@ class JwksClient:
     def _document(self, response: TransportResponse) -> Mapping[str, Any]:
         try:
             parsed: object = json.loads(response.content)
-        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
             raise self._unusable("it is not JSON") from None
         if not isinstance(parsed, dict):
             raise self._unusable("it is not a JSON object")

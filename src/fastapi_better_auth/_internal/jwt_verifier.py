@@ -251,7 +251,7 @@ def _unverified_header(token: str, marker: str) -> Mapping[str, Any]:
     """
     try:
         return jwt.get_unverified_header(token)
-    except (jwt.PyJWTError, ValueError, TypeError) as exc:
+    except (jwt.PyJWTError, ValueError, TypeError, RecursionError) as exc:
         failure = type(exc).__name__
     token = ""
     raise InvalidCredential(reason=f"unreadable token header [{failure}] {marker}") from None
@@ -305,7 +305,7 @@ def _decoded(token: str, key: Jwk, verifier: JwtVerifier, marker: str) -> Mappin
         )
     except jwt.ExpiredSignatureError:
         expired, failure = True, "ExpiredSignatureError"
-    except (jwt.PyJWTError, ValueError, TypeError) as exc:
+    except (jwt.PyJWTError, ValueError, TypeError, RecursionError) as exc:
         expired, failure = False, type(exc).__name__
     token = ""
     if expired:

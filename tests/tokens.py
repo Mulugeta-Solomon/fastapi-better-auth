@@ -23,8 +23,9 @@ import contextlib
 import functools
 import json
 import pathlib
+import sys
 import time
-from collections.abc import Generator, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Generator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -188,6 +189,56 @@ def forged(
     head = b64url(json.dumps(dict(header)).encode())
     body = b64url(json.dumps(dict(payload)).encode())
     return f"{head}.{body}.{signature}"
+
+
+NESTING_START = sys.getrecursionlimit() * 4
+"""Where the search for a parser-defeating depth begins.
+
+Scaled off the interpreter rather than written down, because the depth that exhausts a JSON
+scanner is an interpreter property. It is only a *start*: on 3.12+ the C-level recursion
+ceiling is set separately from `sys.setrecursionlimit`, and the token cap bounds the search
+from the other side, so what the probes actually use is whatever fits - see `deepest_under`.
+"""
+
+
+def nested_arrays(depth: int) -> bytes:
+    """`depth` nested empty JSON arrays: valid JSON that costs the scanner a frame per level."""
+    return ("[" * depth + "]" * depth).encode()
+
+
+def deepest_under(build: Callable[[int], str], cap: int) -> str:
+    """The deepest nesting `build` can express while the result still fits `cap` bytes.
+
+    A probe built past the cap is refused for its *length* before any parser sees it, so it
+    would pass every test below while proving nothing. Bisected, so the search is a dozen
+    builds rather than a thousand.
+    """
+    low, high = 1, NESTING_START
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(build(middle)) > cap:
+            high = middle - 1
+        else:
+            low = middle
+    return build(low)
+
+
+def deep_header_token(depth: int) -> str:
+    """A three-segment token whose *header* segment is `depth` nested arrays."""
+    return f"{b64url(nested_arrays(depth))}.{b64url(b'{}')}.{b64url(b'sig')}"
+
+
+def deep_payload_token(signer: Signer, depth: int) -> str:
+    """A three-segment token whose *payload* is `depth` nested arrays, signed for real.
+
+    The signature has to be genuine: PyJWT parses a payload only once the signature has
+    verified, so an unsigned probe is refused long before it reaches that parser.
+    """
+    head = b64url(json.dumps({"alg": signer.algorithm, "kid": signer.kid}).encode())
+    body = b64url(nested_arrays(depth))
+    algorithm = jwt.get_algorithm_by_name(signer.algorithm)
+    signature = algorithm.sign(f"{head}.{body}".encode(), algorithm.prepare_key(signer.private))
+    return f"{head}.{body}.{b64url(signature)}"
 
 
 def unsigned(payload: Mapping[str, Any]) -> str:

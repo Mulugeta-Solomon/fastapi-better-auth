@@ -13,6 +13,7 @@ obligations already have a real socket pointed at them in `tests/test_transports
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import anyio
@@ -35,12 +36,22 @@ from fastapi_better_auth._internal.jwks import (
     MIN_CACHE_TTL,
     JwksClient,
 )
-from tests.tokens import ORIGIN, Clock, ed25519_signer, key_set, rsa_signer
+from tests.tokens import (
+    NESTING_START,
+    ORIGIN,
+    Clock,
+    ed25519_signer,
+    key_set,
+    nested_arrays,
+    rsa_signer,
+)
 from tests.transports import NotATransport, Reply, ScriptedTransport, json_reply
 
 SIGNER = ed25519_signer("cached-1")
 ROTATED = ed25519_signer("cached-2")
 KEY_SET = key_set(SIGNER)
+DEEP_DOCUMENT = nested_arrays(min(NESTING_START, MAX_JWKS_BYTES // 2))
+"""A key-set body nested deep enough to exhaust the JSON scanner, and still under the cap."""
 
 
 def client(
@@ -207,6 +218,26 @@ async def test_a_session_error_from_the_transport_is_not_swallowed() -> None:
 )
 async def test_a_malformed_key_set_is_unavailable(document: bytes) -> None:
     keys, _transport = client(Reply(content=document))
+
+    with pytest.raises(AuthServiceUnavailable):
+        await keys.key_for(SIGNER.kid)
+
+
+def test_the_nesting_probe_really_defeats_the_json_parser() -> None:
+    """Prove the instrument before the observation. A body past `MAX_JWKS_BYTES` never reaches
+    the parser at all, so a probe built past it would pass the test below while proving
+    nothing; a body the scanner survives would do the same from the other side."""
+    assert len(DEEP_DOCUMENT) <= MAX_JWKS_BYTES
+    with pytest.raises(RecursionError):
+        json.loads(DEEP_DOCUMENT)
+
+
+@pytest.mark.anyio
+async def test_a_deeply_nested_key_set_is_unusable_rather_than_an_escape() -> None:
+    """SA-4's sibling. `RecursionError` is a `RuntimeError`, so it sat outside the except
+    tuple around the parse and escaped `key_for` as itself - the one answer this client is
+    built never to give, since every other unparseable body is an `AuthServiceUnavailable`."""
+    keys, _transport = client(Reply(content=DEEP_DOCUMENT))
 
     with pytest.raises(AuthServiceUnavailable):
         await keys.key_for(SIGNER.kid)

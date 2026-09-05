@@ -15,6 +15,7 @@ the cheap answer and the one that gives an attacker no way to make this process 
 
 from __future__ import annotations
 
+import functools
 import inspect
 import sys
 import time
@@ -37,7 +38,7 @@ from fastapi_better_auth import (
     Verifier,
 )
 from fastapi_better_auth._internal.jwks import SUPPORTED_ALGORITHMS
-from fastapi_better_auth._internal.jwt_verifier import JwtVerifier
+from fastapi_better_auth._internal.jwt_verifier import MAX_TOKEN_BYTES, JwtVerifier
 from fastapi_better_auth._internal.reasons import fingerprint
 from tests.fakes import connection
 from tests.tokens import (
@@ -52,6 +53,9 @@ from tests.tokens import (
     SUBJECT,
     b64url,
     claims,
+    deep_header_token,
+    deep_payload_token,
+    deepest_under,
     ec_signer,
     ed25519_signer,
     forged,
@@ -59,6 +63,7 @@ from tests.tokens import (
     hmac_signed,
     inside_the_golden_validity,
     key_set,
+    payload_of,
     rsa_signer,
     signed_raw,
     tampered,
@@ -844,6 +849,53 @@ async def test_a_token_that_is_valid_but_far_too_large_is_refused_without_a_fetc
 
     assert isinstance(error, InvalidCredential)
     assert transport.calls == 0
+
+
+# --- a token the JSON parser cannot survive -----------------------------------------------
+
+DEEP_HEADER = deepest_under(deep_header_token, MAX_TOKEN_BYTES)
+DEEP_PAYLOAD = deepest_under(functools.partial(deep_payload_token, SIGNER), MAX_TOKEN_BYTES)
+
+
+def test_the_nesting_probes_really_defeat_the_json_parser() -> None:
+    """Prove the instrument before the observation: two ceilings squeeze this probe.
+
+    `MAX_TOKEN_BYTES` caps how deep a token may be before the size check refuses it unread,
+    and the interpreter caps how deep its JSON scanner will go - separately from
+    `sys.setrecursionlimit` on 3.12+. A failure here is not a reason to delete the guards
+    below; it is the news that the size cap has grown to subsume the hazard.
+    """
+    assert len(DEEP_HEADER) <= MAX_TOKEN_BYTES
+    assert len(DEEP_PAYLOAD) <= MAX_TOKEN_BYTES
+    with pytest.raises(RecursionError):
+        jwt.get_unverified_header(DEEP_HEADER)
+    with pytest.raises(RecursionError):
+        payload_of(DEEP_PAYLOAD)
+
+
+@pytest.mark.anyio
+async def test_a_deeply_nested_header_is_a_malformed_token_and_never_an_escape() -> None:
+    """SA-4. `RecursionError` is a `RuntimeError`, so it sat outside this library's except
+    tuple and escaped `verify` entirely - past the `token = ""` scrub, and out to the
+    dispatcher, which contains it as the uniform 401 *and logs the whole traceback for it*.
+    An unauthenticated 8 KiB request that costs an ERROR record is a log-amplification lever.
+    """
+    error, transport = await refused(DEEP_HEADER)
+
+    assert isinstance(error, InvalidCredential)
+    assert transport.calls == 0
+    assert leaks(error, DEEP_HEADER) == ()
+
+
+@pytest.mark.anyio
+async def test_a_deeply_nested_payload_is_a_malformed_token_and_never_an_escape() -> None:
+    """The decode half of the same escape. A payload is parsed only after the signature has
+    verified, so this probe is signed by a key the key set really publishes: defence in depth
+    rather than an open door, and the identical escape if upstream ever mints one."""
+    error, _transport = await refused(DEEP_PAYLOAD)
+
+    assert isinstance(error, InvalidCredential)
+    assert leaks(error, DEEP_PAYLOAD) == ()
 
 
 @pytest.mark.anyio

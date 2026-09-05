@@ -9,17 +9,30 @@ taxonomy, that a forged token, an expired one and an unreachable key set are ind
 
 from __future__ import annotations
 
+import logging
 import time
 
 import pytest
 
 from fastapi_better_auth import BetterAuth, ConfigurationError, JwtVerifier, User
+from fastapi_better_auth._internal.jwt_verifier import MAX_TOKEN_BYTES
 from tests.fakes import client, session_app
-from tests.tokens import LIFETIME, ORIGIN, SUBJECT, claims, ed25519_signer, key_set
+from tests.tokens import (
+    LIFETIME,
+    ORIGIN,
+    SUBJECT,
+    claims,
+    deep_header_token,
+    deepest_under,
+    ed25519_signer,
+    key_set,
+)
 from tests.transports import ScriptedTransport, json_reply
 
 SIGNER = ed25519_signer("wire-1")
 KEY_SET = key_set(SIGNER)
+DEEP_HEADER = deepest_under(deep_header_token, MAX_TOKEN_BYTES)
+"""A token whose JOSE header defeats the JSON scanner and still fits under the size cap."""
 
 
 def bridge(*answers: object) -> tuple[BetterAuth, ScriptedTransport]:
@@ -132,3 +145,23 @@ def test_the_user_model_the_application_asked_for_is_the_one_it_gets(
 
     assert response.status_code == 200
     assert response.json() == {"id": SUBJECT, "model": "Staff"}
+
+
+def test_a_token_that_defeats_the_json_parser_logs_no_traceback(
+    client_backend: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """SA-4, measured where it actually cost something. The wire answer was already the
+    uniform 401 - `core._contained` caught the `RecursionError` that escaped the verifier -
+    but containment logs, so every one of these unauthenticated ~8 KiB requests bought an
+    ERROR record carrying a full traceback. That is a log-amplification lever an attacker
+    pulls for free, and the reason a malformed token has to be refused *as* a malformed token.
+    """
+    auth, transport = bridge()
+
+    with caplog.at_level(logging.ERROR), client(session_app(auth), client_backend) as driver:
+        response = driver.get("/required", headers=bearer(DEEP_HEADER))
+
+    assert response.status_code == 401
+    assert response.content == b'{"detail":"Not authenticated"}'
+    assert caplog.records == []
+    assert transport.calls == 0
