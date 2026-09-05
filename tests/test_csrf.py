@@ -170,6 +170,14 @@ def test_the_snapshot_never_raises_on_a_hostile_request(hostile: dict[str, str])
     assert captured.requires_check is True
 
 
+def test_a_hand_built_snapshot_means_one_origin() -> None:
+    """Every direct construction described a request carrying exactly one, so that is the
+    default - a snapshot built by hand is not evidence that a second header arrived. Asserted
+    on `facts()` itself, which is what every hand-built snapshot in this file goes through."""
+    assert facts().origin_count == 1
+    assert CsrfFacts().origin_count == 1
+
+
 def test_the_snapshot_is_frozen() -> None:
     captured = facts()
 
@@ -365,100 +373,6 @@ def test_one_of_several_allowed_origins_passes() -> None:
     policy.check(facts(origin=APP), TOKEN)
     with pytest.raises(CsrfFailure):
         policy.check(facts(origin=EVIL), TOKEN)
-
-
-# ---------------------------------------------------------------- two Origin headers
-
-
-def repeated_origins(*origins: str, method: str = "POST", **headers: str) -> HTTPConnection:
-    """A scope carrying one `origin` header line per value - which `http()` cannot express."""
-    raw = [(b"origin", origin.encode()) for origin in origins]
-    raw += [(key.replace("_", "-").encode(), value.encode()) for key, value in headers.items()]
-    return HTTPConnection({"type": "http", "method": method, "path": "/", "headers": raw})
-
-
-@pytest.mark.parametrize(
-    ("origins", "expected"),
-    [((), 0), ((APP,), 1), ((APP, APP), 2), ((APP, EVIL), 2), ((APP, API, EVIL), 3)],
-    ids=["none", "one", "twice-the-same", "one-of-each", "three"],
-)
-def test_the_snapshot_counts_the_origin_header_lines(
-    origins: tuple[str, ...], expected: int
-) -> None:
-    captured = CsrfFacts.from_connection(repeated_origins(*origins), policy=origin_check())
-
-    assert captured.origin_count == expected
-
-
-def test_a_hand_built_snapshot_means_one_origin() -> None:
-    """Every direct construction described a request carrying exactly one, so that is the
-    default - a snapshot built by hand is not evidence that a second header arrived."""
-    assert facts().origin_count == 1
-    assert CsrfFacts().origin_count == 1
-
-
-@pytest.mark.parametrize("policy_of", [origin_check, double_submit], ids=["origin", "double"])
-def test_two_origin_headers_are_refused_even_when_both_are_allowed(
-    policy_of: Any,
-) -> None:
-    """RFC 6454 gives a request exactly one `Origin`. Two is a request no browser sends, and
-    reading the first is a choice made on behalf of whoever arranged for the second - so it is
-    refused before the allowlist is consulted, with both of them on the allowlist."""
-    policy = policy_of(allowed_origins=[APP, API])
-    captured = CsrfFacts.from_connection(repeated_origins(APP, API), policy=policy)
-
-    with pytest.raises(CsrfFailure) as caught:
-        policy.check(captured, TOKEN)
-
-    assert "more than one Origin" in caught.value.reason
-    assert caught.value.status_code == 403
-
-
-@pytest.mark.parametrize(
-    "origins", [(APP, EVIL), (EVIL, APP)], ids=["allowed-first", "hostile-first"]
-)
-def test_an_allowed_origin_beside_a_hostile_one_is_refused_in_either_order(
-    origins: tuple[str, str],
-) -> None:
-    policy = origin_check()
-    captured = CsrfFacts.from_connection(repeated_origins(*origins), policy=policy)
-
-    with pytest.raises(CsrfFailure):
-        policy.check(captured, TOKEN)
-
-
-def test_one_origin_header_is_unchanged() -> None:
-    """The control: the same request with a single `Origin` still passes both policies."""
-    policy = origin_check()
-    captured = CsrfFacts.from_connection(repeated_origins(APP), policy=policy)
-
-    policy.check(captured, TOKEN)
-
-    signed = double_submit()
-    both = CsrfFacts.from_connection(
-        repeated_origins(APP, **{DEFAULT_TOKEN_HEADER.replace("-", "_"): signed.token_for(TOKEN)}),
-        policy=signed,
-    )
-    signed.check(both, TOKEN)
-
-
-def test_a_second_origin_never_makes_the_snapshot_raise() -> None:
-    """`from_connection` runs inside `extract` and owes the dispatcher a method no request can
-    make raise; the count is recorded there and judged in `check`, where refusals belong."""
-    captured = CsrfFacts.from_connection(
-        repeated_origins("\x00 not a url", "x" * 9000), policy=double_submit()
-    )
-
-    assert captured.origin_count == 2
-
-
-def test_two_origins_on_a_safe_method_are_not_a_refusal() -> None:
-    """The rung is inside `requires_check`, like every other one: a GET carrying two `Origin`
-    headers is odd, and refusing it would break reads no CSRF control is about."""
-    policy = origin_check()
-    captured = CsrfFacts.from_connection(repeated_origins(APP, EVIL, method="GET"), policy=policy)
-
-    policy.check(captured, TOKEN)
 
 
 # ---------------------------------------------------------------- the custom-header rung

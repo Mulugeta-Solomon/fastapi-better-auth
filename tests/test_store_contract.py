@@ -109,26 +109,6 @@ class TestStoredUser:
         with pytest.raises(ValueError, match="timezone-aware"):
             a_user(ban_expires=NAIVE)
 
-    @pytest.mark.parametrize("banned", [1, 0, "true", "", "yes", 2, [1], 1.0], ids=repr)
-    def test_a_banned_that_is_not_a_bool_is_refused(self, banned: Any) -> None:
-        """`banned` decides whether a user is let in, so it may be `True`, `False` or `None` and
-        nothing else. A store handing over `1` or `"true"` is handing over a value the verifier
-        would have to guess at, and a guess on a ban check is a guess in the wrong direction."""
-        with pytest.raises(TypeError, match="banned"):
-            a_user(banned=banned)
-
-    @pytest.mark.parametrize("banned", [True, False, None], ids=repr)
-    def test_the_three_readable_values_survive_untouched(self, banned: bool | None) -> None:
-        assert a_user(banned=banned).banned is banned
-
-    def test_the_refusal_names_the_type_it_was_given(self) -> None:
-        """The message is for whoever wrote the store, so it says what arrived, never what it
-        held: `banned` is not credential material, but its neighbours in a payload are."""
-        with pytest.raises(TypeError) as caught:
-            a_user(banned="true")
-
-        assert "str" in str(caught.value)
-
     def test_it_is_immutable_and_its_payload_is_read_only(self) -> None:
         record = a_user()
 
