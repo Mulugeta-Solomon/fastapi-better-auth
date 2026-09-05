@@ -871,6 +871,38 @@ class TestZeroOutboundGates:
         assert v.remembered == 0
 
     @pytest.mark.anyio
+    async def test_max_remembered_bounds_the_cache_through_the_constructor(self) -> None:
+        # The `max_remembered` knob reaches the cache: distinct forgeries past the bound evict the
+        # oldest, so `remembered` never exceeds it (a mutation dropping the knob leaves this RED).
+        transport = RecordingTransport(Reply(b"null"))
+        v = verifier(transport, max_remembered=2)
+
+        for i in range(5):
+            with pytest.raises(InvalidCredential):
+                await run(v, with_cookie(f"forged-{i}.signature-{i}"))
+
+        assert v.remembered == 2, "max_remembered=2 caps the cache at two remembered verdicts"
+
+    @pytest.mark.anyio
+    async def test_the_injected_clock_expires_a_cached_verdict(self) -> None:
+        # The verifier's own `clock` drives the cache TTL, not just the backoff latch: past the TTL
+        # the same forged cookie costs a second call (a mutation dropping the clock leaves this RED).
+        clock = Clock()
+        transport = RecordingTransport(Reply(b"null"))
+        v = verifier(transport, negative_ttl=30.0, clock=clock)
+
+        with pytest.raises(InvalidCredential):
+            await run(v, garbage())
+        with pytest.raises(InvalidCredential):
+            await run(v, garbage())
+        assert transport.calls == 1, "within the TTL the cache serves the verdict, zero outbound"
+
+        clock.advance(31.0)
+        with pytest.raises(InvalidCredential):
+            await run(v, garbage())
+        assert transport.calls == 2, "past the TTL the cached verdict expired and cost a fresh call"
+
+    @pytest.mark.anyio
     async def test_a_latched_instance_makes_zero_outbound(self) -> None:
         clock = Clock()
         transport = RecordingTransport(Reply(b"", status=429))
@@ -1035,3 +1067,29 @@ class TestRefusalFramesNewGates:
         assert isinstance(error, ConfigurationError)
         assert holding(error, TOKEN, ignore=[connection, transport]) == []
         assert holding(error, COOKIE_VALUE, ignore=[connection, transport]) == []
+
+    @pytest.mark.anyio
+    async def test_a_saturated_limiter_refusal_holds_no_credential(self) -> None:
+        # The limiter refuses BEFORE the fetch, but only once the cookie has been resolved and
+        # rung-checked; the refusal must still leave no frame holding the credential.
+        gate = anyio.Event()
+        held = RecordingTransport(Reply(b"null"), gate=gate)
+        built = verifier(held, concurrency=1, queue_timeout=0.1)
+        connection = with_cookie()
+        errors: list[BaseException] = []
+
+        async def hold_the_only_slot() -> None:
+            with contextlib.suppress(BaseException):
+                await run(built, with_cookie())
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(hold_the_only_slot)
+            await anyio.sleep(0.01)
+            errors.append(await refused(built, connection))
+            gate.set()
+
+        error = errors[0]
+        assert isinstance(error, AuthServiceUnavailable)
+        assert "saturated" in error.reason
+        assert holding(error, TOKEN, ignore=[connection, held]) == []
+        assert holding(error, COOKIE_VALUE, ignore=[connection, held]) == []
