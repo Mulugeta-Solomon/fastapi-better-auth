@@ -23,6 +23,7 @@ import pytest
 
 from fastapi_better_auth import (
     AuthServiceUnavailable,
+    BetterAuthError,
     ConfigurationError,
     ContentEncodingRejected,
     ResponseTooLarge,
@@ -527,6 +528,64 @@ async def test_concurrent_misses_coalesce_behind_one_fetch() -> None:
     assert transport.calls == 1
     assert len(found) == 2
     assert all(entry is not None for entry in found)
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_fetch_does_not_burn_the_refetch_window() -> None:
+    """SA-8. The window was stamped *before* the await, so a caller whose own deadline expired
+    mid-fetch spent the whole ten seconds on behalf of everyone behind it: nobody fetched, and
+    every lookup in that window answered `AuthServiceUnavailable` off a cold cache.
+
+    A caller's deadline is not an attempt anybody made. The stamp moved to completion - a
+    fetch that returned, and one that failed, are both attempts; a cancelled one is not.
+
+    Cancelled on a *signal* rather than on a stopwatch: the scope is cut only once the
+    transport has recorded the call, so the probe cannot pass by having never fetched at all.
+    """
+    clock = Clock()
+    gate = anyio.Event()
+    keys, transport = client(json_reply(KEY_SET), clock=clock, gate=gate)
+    scopes: list[anyio.CancelScope] = []
+
+    async def look_up() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await keys.key_for(SIGNER.kid)
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(look_up)
+        with anyio.fail_after(2):
+            while transport.calls < 1 or not scopes:
+                await anyio.lowlevel.checkpoint()
+        scopes[0].cancel()
+
+    assert transport.calls == 1, "the fetch never started; this probe proves nothing"
+    assert keys._may_fetch() is True  # pyright: ignore[reportPrivateUsage]
+
+    gate.set()
+    assert await keys.key_for(SIGNER.kid) is not None
+    assert transport.calls == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "failure",
+    [TimeoutError("upstream down"), ConfigurationError("the injected client was never opened")],
+    ids=["unavailable", "misconfigured"],
+)
+async def test_a_fetch_that_finished_badly_is_still_an_attempt(failure: BaseException) -> None:
+    """The other side of the same rule, and the reason it is not simply "stamp on success":
+    a failing upstream must not become one fetch per request. Both of these *finished*."""
+    clock = Clock()
+    keys, transport = client(failure, clock=clock)
+
+    with pytest.raises((SessionError, BetterAuthError)):
+        await keys.key_for(SIGNER.kid)
+    assert keys._may_fetch() is False  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises((SessionError, BetterAuthError)):
+        await keys.key_for(SIGNER.kid)
+    assert transport.calls == 1
 
 
 # --- the unknown kid ------------------------------------------------------------------
