@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import os
 import sys
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from typing import Any, NoReturn, TypeVar, cast
 
 if sys.version_info >= (3, 11):  # pragma: no cover - one branch per interpreter
@@ -27,7 +28,7 @@ from .errors import (
 )
 from .models import Session, User
 from .openapi import declaring, schemes_for
-from .verifiers import Verifier
+from .verifiers import PreparedVerifier, Verifier
 
 logger = logging.getLogger("fastapi_better_auth")
 
@@ -189,6 +190,43 @@ class BetterAuth:
     def verifiers(self) -> tuple[Verifier, ...]:
         """The verifiers, in declared extraction order. A snapshot taken at construction."""
         return self._verifiers
+
+    async def startup(self) -> None:
+        """Run every verifier's optional `prepare()`, in declared order.
+
+        A verifier that implements `PreparedVerifier` - `RemoteVerifier` does, to run its
+        get-session probe once - has its startup work done here; one that does not is skipped, so
+        this is safe to call whatever the modes are. Sequential rather than a task group: a
+        `ConfigurationError` from one verifier must reach the operator as itself, not wrapped in an
+        `ExceptionGroup` they then have to unwrap, and there are at most a handful of verifiers.
+        Idempotent, because every `prepare()` is.
+
+        Call it from a lifespan handler, or use `lifespan` directly:
+
+            app = FastAPI(lifespan=auth.lifespan)
+
+        Raises:
+            ConfigurationError: If a verifier's `prepare()` decides the deployment cannot serve -
+                for `RemoteVerifier`, a get-session server that cannot be reached at boot or that
+                does not honour the 200-null contract. It propagates out of the lifespan and stops
+                the server from taking traffic.
+        """
+        for verifier in self._verifiers:
+            if isinstance(verifier, PreparedVerifier):
+                await verifier.prepare()
+
+    @contextlib.asynccontextmanager
+    async def lifespan(self, app: Any) -> AsyncGenerator[None]:
+        """The ASGI lifespan that runs `startup()` on the way in and nothing on the way out.
+
+            app = FastAPI(lifespan=auth.lifespan)
+
+        `app` is accepted and ignored - it is the object FastAPI passes its lifespan, and this one
+        needs nothing from it. A verifier's `startup()` refusal propagates as an `ASGI lifespan
+        startup failed` and the server does not begin serving.
+        """
+        await self.startup()
+        yield
 
     def current_session(
         self,

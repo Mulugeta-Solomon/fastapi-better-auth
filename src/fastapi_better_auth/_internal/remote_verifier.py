@@ -9,34 +9,43 @@ unauthenticated request) and the `{session, user}` shape of an authenticated one
 The pipeline order is the design, and every step through the fetch is pinned:
 
     isinstance -> resolve named cookie -> rung 1 (structural) -> CSRF -> rung 2 (keyring, only
-    when a secret is configured) -> GET get-session -> outcome (Q3) -> token compare -> expiry ->
-    ban -> parse_user
+    when a secret is configured) -> negative cache -> 429 latch -> _ready() (probe) -> limiter
+    acquire (bounded) -> GET get-session -> outcome (Q3) -> token compare -> expiry -> ban ->
+    parse_user
 
 CSRF runs before the fetch and before rung 2 so a cross-site attacker cannot tell a 403 from a 401
 and use the difference as an oracle. Rung 1 runs before CSRF only because a `SignedDoubleSubmit`
-policy binds the CSRF token to the session token, which rung 1 is what extracts.
+policy binds the CSRF token to the session token, which rung 1 is what extracts. Every step through
+the 429 latch makes ZERO outbound calls by construction, so a cache hit, a latched instance, and
+every pre-fetch refusal are all answered without touching the network.
 
-**This is the WP14 core: no cache, no limiter, no 429 latch, no probe, no startup, and none of their
-knobs** - a knob the code ignores would be a lie. The fetch here happens unconditionally once the
-local gates pass; the cache/latch/readiness/limiter gates land in WP15, and `RemoteVerifier` is not
-exported until they do. The outbound request is built once at construction and never from anything on
-an incoming request (D-010): the URI is `self._uri`, and the headers are a closed set of exactly
-`cookie` and `accept` - never the inbound `Authorization`, `Host`, `Origin`, `X-Forwarded-*` or any
-other header. The header dict holds a live credential and is scrubbed in `finally` (D-094), and every
-transport failure is raised OUTSIDE the `except` with `from None`, because the underlying exception's
-`.request` carries the forwarded cookie.
+The four gates before the fetch each buy one property. The **negative cache** collapses a
+forged-cookie flood to one upstream call per window. The **429 latch** stops hammering a bucket
+upstream said we exhausted. **`_ready()`** runs the boot probe once and fails closed until it passes
+- it sits after CSRF and every zero-outbound gate because the probe is itself outbound. The
+**limiter** bounds how much of this process one stalled auth service can occupy. The outbound
+request is built once at construction and never from anything on an incoming request (D-010): the
+URI is `self._uri`, and the headers are a closed set of exactly `cookie` and `accept` - never the
+inbound `Authorization`, `Host`, `Origin`, `X-Forwarded-*` or any other header. The header dict
+holds a live credential and is scrubbed in `finally` (D-094), and every transport failure is raised
+OUTSIDE the `except` with `from None`, because the underlying exception's `.request` carries the
+forwarded cookie.
 
-Internal. Not exported: `RemoteVerifier` becomes public API in WP15, after the hardening exists.
+Internal module, public class: `RemoteVerifier` is exported from the package root (WP15), and
+`prepare()` makes it a `PreparedVerifier` an operator wires into startup.
 """
 
 from __future__ import annotations
 
 import hmac
+import math
+import time
 import urllib.parse
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any, TypeVar, cast
 
+import anyio
 from pydantic import SecretStr
 from starlette.requests import HTTPConnection
 
@@ -66,9 +75,20 @@ from .errors import (
 )
 from .httpx_transports import HttpxTransport
 from .models import Session, User
+from .negative_cache import (
+    MAX_NEGATIVE_TTL,
+    MAX_REMEMBERED,
+    MAX_REMEMBERED_MISSES,
+    MIN_NEGATIVE_TTL,
+    MIN_REMEMBERED,
+    NEGATIVE_TTL,
+    NegativeCache,
+)
 from .parsing import parse_user
 from .reasons import fingerprint
-from .remote_response import session_document_from
+from .remote_backoff import BackoffLatch
+from .remote_probe import run_probe
+from .remote_response import is_cacheable_null, null_outcome, session_document_from
 from .shared_secret import SharedSecret
 from .signing import verify_signature
 from .stores.records import StoredSession, StoredUser
@@ -91,6 +111,13 @@ GET_SESSION_PATH = "/get-session"
 GET_SESSION_QUERY = "?disableCookieCache=true&disableRefresh=true"
 MAX_SESSION_BYTES = 65536
 MAX_TOKEN_BYTES = 4096
+
+MAX_OUTBOUND_CONCURRENCY = 8
+MIN_CONCURRENCY = 1
+MAX_CONCURRENCY = 256
+QUEUE_TIMEOUT = 2.0
+MIN_QUEUE_TIMEOUT = 0.1
+PROBE_RETRY_INTERVAL = 10.0
 
 _BASE_PATH_MESSAGE = (
     "RemoteVerifier(base_path=...) must be the path Better Auth is mounted at, starting with '/'"
@@ -168,14 +195,27 @@ class RemoteVerifier:
         secure_cookies: Whether the single accepted name is the `__Secure-`-prefixed one. `True` by
             default, matching Better Auth's production default; never both names.
         base_path: The path Better Auth is mounted at, `'/api/auth'` by default, `''` for the root.
+        concurrency: How many get-session calls may be in flight at once, 8 by default. A
+            blast-radius and connection-pool bound, not the rate control - it keeps one stalled
+            auth service from parking every worker task, and is not how fast upstream is asked.
+        queue_timeout: Seconds to wait for an outbound slot before refusing, 2.0 by default. Covers
+            the acquire only; the whole exchange is bounded by `queue_timeout` plus the transport's
+            own deadline.
+        negative_ttl: Seconds a `200 + null` verdict is remembered so a forged-cookie flood costs
+            one upstream call per window, 30.0 by default. `0.0` disables the cache - safe, never a
+            bypass.
+        max_remembered: The most forged-cookie verdicts held at once, 1024 by default.
         max_bytes: The largest get-session body this verifier will read, 64 KiB by default.
+        clock: A monotonic clock, injected so the cache TTL, the backoff latch and the probe-retry
+            window are testable without sleeping.
 
     Raises:
         ConfigurationError: For any unusable configuration, at construction: a `base_url` that is
             not an origin, a `csrf` that is `None` or not a `CsrfPolicy`, a `transport` that is not
             one, both of `secret`/`secrets`, a non-`SharedSecret` entry, a blank or illegal
-            `cookie_name`/`secure_prefix`, a non-bool `secure_cookies`, a malformed `base_path`, or
-            a non-positive `max_bytes`.
+            `cookie_name`/`secure_prefix`, a non-bool `secure_cookies`, a malformed `base_path`, a
+            `concurrency`/`queue_timeout`/`negative_ttl`/`max_remembered`/`max_bytes` out of range,
+            or a non-callable `clock`.
     """
 
     def __init__(
@@ -190,7 +230,12 @@ class RemoteVerifier:
         secure_prefix: str = DEFAULT_SECURE_PREFIX,
         secure_cookies: bool = True,
         base_path: str = DEFAULT_BASE_PATH,
+        concurrency: int = MAX_OUTBOUND_CONCURRENCY,
+        queue_timeout: float = QUEUE_TIMEOUT,
+        negative_ttl: float = NEGATIVE_TTL,
+        max_remembered: int = MAX_REMEMBERED_MISSES,
         max_bytes: int = MAX_SESSION_BYTES,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._origin = normalize_base_url(base_url)
         self._csrf = validated_policy(csrf, where="RemoteVerifier(csrf=...)")
@@ -206,9 +251,26 @@ class RemoteVerifier:
         )
         self._acceptable = acceptable_names(self._base)
         self._base_path = _validated_base_path(base_path)
+        self._concurrency = _validated_concurrency(concurrency)
+        self._queue_timeout = _validated_queue_timeout(queue_timeout)
         self._max_bytes = _validated_cap(max_bytes)
+        self._clock = _validated_clock(clock)
         self._uri = f"{self._origin}{self._base_path}{GET_SESSION_PATH}{GET_SESSION_QUERY}"
         self.credential_source = f"{COOKIE_SOURCE_PREFIX}{self._cookie_name}"
+        self._cache = NegativeCache(
+            ttl=_validated_negative_ttl(negative_ttl),
+            max_remembered=_validated_max_remembered(max_remembered),
+            clock=self._clock,
+        )
+        self._backoff = BackoffLatch(clock=self._clock)
+        # anyio.CapacityLimiter binds to the running backend at construction and raises
+        # AsyncLibraryNotFoundError if built outside a loop (D-198), so it is built lazily on
+        # first use; the count is stored here.
+        self._limiter_instance: anyio.CapacityLimiter | None = None
+        self._probe_lock = anyio.Lock()
+        self._probed_ok = False
+        self._contract_failure: str | None = None
+        self._probe_attempted_at: float | None = None
 
     @property
     def origin(self) -> str:
@@ -244,6 +306,59 @@ class RemoteVerifier:
     def secrets(self) -> tuple[SharedSecret, ...]:
         """The optional local pre-check keyring; empty when none is configured."""
         return self._secrets
+
+    @property
+    def remembered(self) -> int:
+        """How many forged-cookie `200 + null` verdicts the negative cache currently holds."""
+        return self._cache.remembered
+
+    async def prepare(self) -> None:
+        """Run the get-session readiness probe once, at startup, and fail closed if it cannot pass.
+
+        Wire it through a lifespan handler - `FastAPI(lifespan=auth.lifespan)`, or
+        `await auth.startup()` - so a deployment whose Better Auth server cannot honour the
+        200-null contract, or cannot be reached at boot, stops the application from starting
+        instead of refusing its first authenticated request. Idempotent.
+
+        Two failure classes are handled differently. A **contract** failure - a non-200, a
+        non-JSON or non-null body, a session document from a bare request - is a permanent fact
+        about the deployment: it is remembered, and every later `prepare()` and `verify()`
+        re-raises it. A **reachability** failure at startup - a timeout, a refused connection - is
+        raised as a `ConfigurationError` too, because an auth service you cannot reach at boot is a
+        deployment that should not take traffic; but it is *not* remembered, so wiring the probe
+        lazily (never calling `prepare()`) instead lets the first request retry it.
+
+        Raises:
+            ConfigurationError: A contract failure (remembered), or an unreachable server at boot.
+        """
+        try:
+            await self._ready()
+        except AuthServiceUnavailable as unreachable:
+            raise ConfigurationError(
+                f"RemoteVerifier could not reach get-session at {self._uri} during startup:"
+                f" {unreachable.reason}. An auth service unreachable at boot is a deployment that"
+                " should not take traffic. Fix reachability, or omit startup()/lifespan to let the"
+                " probe run lazily on the first request instead."
+            ) from None
+
+    async def probe(self) -> None:
+        """Run the get-session readiness probe once, now, without memoizing the outcome.
+
+        One bare GET (no cookie) proves the deployment answers `200` with a literal `null` body -
+        the 200-null contract Mode C's whole outcome mapping rests on - and is also the dead-jar
+        detector: a session document from a bare request means the transport is replaying a
+        retained cookie. A second, advisory-only request checks whether the bearer plugin is in the
+        permissive `requireSignature: false` posture and logs one warning if so; it never refuses.
+
+        This is the raw one-shot probe. `prepare()` is the memoized, fail-closed version an
+        operator wires into startup.
+
+        Raises:
+            ConfigurationError: A contract failure - a non-200, a non-JSON or non-null body, or a
+                session document from a bare request. The reason names the URI.
+            AuthServiceUnavailable: A reachability failure - the server could not be reached.
+        """
+        await run_probe(self._transport, uri=self._uri, max_bytes=self._max_bytes)
 
     def extract(self, connection: HTTPConnection) -> RemoteCredential | None:
         """Return this verifier's cookie material and CSRF snapshot, or `None` if it is absent.
@@ -298,16 +413,24 @@ class RemoteVerifier:
             marker = fingerprint(token)
             enforce_policy(self._csrf, credential.facts, token)
             verified = self._rung_two(material, marker)
+            if self._cache.holds(material):
+                raise null_outcome(verified, marker)
+            if self._backoff.latched():
+                raise AuthServiceUnavailable(
+                    reason=f"get-session is backing off after a recent rate-limit (429) [{marker}]"
+                )
+            await self._ready()
             outbound = self._outbound(name, material)
             response = await self._fetched(outbound, marker)
-            record = session_document_from(
-                response, uri=self._uri, marker=marker, signature_verified=verified
-            )
+            self._backoff.observe(response)
+            record = self._document(response, material, marker, verified)
             return self._session(record, token, marker, user_model)
         finally:
             # `credential` is a parameter, and a parameter is a frame local like any other; and
             # `record`/`response` carry the forwarded token when `_session` refuses AFTER the fetch
-            # (expired, banned) - this frame holds all of it (D-094, D-180, D-210).
+            # (expired, banned) - this frame holds all of it (D-094, D-180, D-210). The WP15 gates
+            # (cache/latch/limiter/ready) each refuse through this frame too, so `material`/`token`
+            # are dropped here on every one of their paths.
             credential = None
             material = name = token = ""
             record = response = None
@@ -335,38 +458,131 @@ class RemoteVerifier:
         """The closed outbound header set: the cookie under the name the browser sent, and accept."""
         return {"cookie": f"{name}={value}", "accept": ACCEPT_JSON}
 
+    async def _ready(self) -> None:
+        """The readiness gate: fail-closed-until-passed, at pipeline step 8 (after every zero-
+        outbound gate, because the probe is itself outbound).
+
+        A confirmed probe returns at once. A remembered contract failure re-raises permanently. An
+        unconfirmed verifier probes under the lock, throttled to one attempt per
+        `PROBE_RETRY_INTERVAL`; between attempts every request is `AuthServiceUnavailable` - never
+        fail-open. The lock collapses a first-request burst into one probe.
+        """
+        if self._probed_ok:
+            return
+        if self._contract_failure is not None:
+            raise ConfigurationError(self._contract_failure)
+        async with self._probe_lock:
+            if self._probed_ok:
+                return
+            if self._contract_failure is not None:
+                raise ConfigurationError(self._contract_failure)
+            if not self._may_probe():
+                raise AuthServiceUnavailable(
+                    reason="get-session readiness has not been confirmed; the boot probe is retrying"
+                )
+            await self._attempt_probe()
+
+    def _may_probe(self) -> bool:
+        """One probe per window, whoever asks - so a request flood cannot become a probe flood."""
+        if self._probe_attempted_at is None:
+            return True
+        return self._clock() - self._probe_attempted_at >= PROBE_RETRY_INTERVAL
+
+    async def _attempt_probe(self) -> None:
+        """One probe attempt under the lock. Contract failures are remembered permanently; a
+        cancelled attempt rolls back its stamp so it does not spend the retry window (D-196)."""
+        previous = self._probe_attempted_at
+        self._probe_attempted_at = self._clock()
+        try:
+            await run_probe(self._transport, uri=self._uri, max_bytes=self._max_bytes)
+        except ConfigurationError as contract:
+            self._contract_failure = str(contract)
+            raise
+        except anyio.get_cancelled_exc_class():
+            self._probe_attempted_at = previous
+            raise
+        self._probed_ok = True
+
+    def _limiter(self) -> anyio.CapacityLimiter:
+        """The outbound concurrency limiter, built lazily inside the loop (D-198)."""
+        limiter = self._limiter_instance
+        if limiter is None:
+            limiter = anyio.CapacityLimiter(self._concurrency)
+            self._limiter_instance = limiter
+        return limiter
+
     async def _fetched(self, outbound: dict[str, str], marker: str) -> TransportResponse:
-        """Fetch get-session, translating every failure so no credential rides out on the chain.
+        """Acquire an outbound slot (bounded by `queue_timeout`), then fetch get-session.
+
+        The slot is held for the whole exchange and released on every path; the header dict is
+        scrubbed in `finally` whether the acquire, the fetch or the read raised (D-094).
+        """
+        limiter = self._limiter()
+        try:
+            await self._acquire(limiter)
+            try:
+                return await self._get(outbound)
+            finally:
+                limiter.release()
+        finally:
+            outbound.clear()
+
+    async def _acquire(self, limiter: anyio.CapacityLimiter) -> None:
+        """Wait for a slot, bounded by `queue_timeout`. Saturation is a refusal with a reason
+        DISTINCT from the transport timeout's, and the `fail_after` scope covers the acquire only."""
+        try:
+            with anyio.fail_after(self._queue_timeout):
+                await limiter.acquire()
+        except TimeoutError:
+            raise AuthServiceUnavailable(
+                reason=f"get-session outbound queue saturated after {self._queue_timeout}s"
+            ) from None
+
+    async def _get(self, outbound: dict[str, str]) -> TransportResponse:
+        """The transport GET, with every failure translated so no credential rides out on the chain.
 
         Every transport failure is raised OUTSIDE the `except` with `from None`: the underlying
         exception's `.request` carries the forwarded cookie, so chaining it would put a live
-        credential on `__cause__` and into every error reporter (WP10 A1). The header dict is
-        scrubbed in `finally` (D-094).
+        credential on `__cause__` and into every error reporter (WP10 A1).
         """
         try:
-            try:
-                return await self._transport.get(
-                    self._uri, headers=outbound, max_bytes=self._max_bytes
-                )
-            except (BetterAuthError, SessionError):
-                raise
-            except TimeoutError:
-                failure = AuthServiceUnavailable(reason=f"get-session timed out [{self._uri}]")
-            except ResponseTooLarge:
-                failure = AuthServiceUnavailable(
-                    reason=f"get-session body exceeded the {self._max_bytes}-byte cap"
-                )
-            except ContentEncodingRejected:
-                failure = AuthServiceUnavailable(
-                    reason="get-session applied a content encoding after identity was requested"
-                )
-            except Exception as exc:  # noqa: BLE001 - TransportFailure or a third-party transport error
-                failure = AuthServiceUnavailable(
-                    reason=f"get-session fetch failed [{type(exc).__name__}] {self._uri}"
-                )
-            raise failure from None
+            return await self._transport.get(self._uri, headers=outbound, max_bytes=self._max_bytes)
+        except (BetterAuthError, SessionError):
+            raise
+        except TimeoutError:
+            failure = AuthServiceUnavailable(reason=f"get-session timed out [{self._uri}]")
+        except ResponseTooLarge:
+            failure = AuthServiceUnavailable(
+                reason=f"get-session body exceeded the {self._max_bytes}-byte cap"
+            )
+        except ContentEncodingRejected:
+            failure = AuthServiceUnavailable(
+                reason="get-session applied a content encoding after identity was requested"
+            )
+        except Exception as exc:  # noqa: BLE001 - TransportFailure or a third-party transport error
+            failure = AuthServiceUnavailable(
+                reason=f"get-session fetch failed [{type(exc).__name__}] {self._uri}"
+            )
+        raise failure from None
+
+    def _document(
+        self, response: TransportResponse, material: str, marker: str, verified: bool
+    ) -> StoredSession:
+        """Map the response to a record, caching the one cacheable outcome on the way through.
+
+        Only a `200 + null` is remembered, and only when that is what this response actually is -
+        `is_cacheable_null` re-confirms it, so a token mismatch or an unreadable document (also an
+        `InvalidCredential`/`SessionRevoked` family, but not 200-null) is never cached. `material`
+        is scrubbed in `finally`: this frame holds it, and the null refusal unwinds through it.
+        """
+        try:
+            if is_cacheable_null(response):
+                self._cache.remember(material)
+            return session_document_from(
+                response, uri=self._uri, marker=marker, signature_verified=verified
+            )
         finally:
-            outbound.clear()
+            material = ""
 
     def _session(
         self, record: StoredSession, token: str, marker: str, user_model: type[UserModelT]
@@ -586,3 +802,71 @@ def _validated_cap(max_bytes: object) -> int:
             f" {max_bytes!r}. It bounds the get-session body this verifier will read."
         )
     return max_bytes
+
+
+def _validated_concurrency(concurrency: object) -> int:
+    if (
+        isinstance(concurrency, bool)
+        or not isinstance(concurrency, int)
+        or not MIN_CONCURRENCY <= concurrency <= MAX_CONCURRENCY
+    ):
+        raise ConfigurationError(
+            f"RemoteVerifier(concurrency=...) must be between {MIN_CONCURRENCY} and"
+            f" {MAX_CONCURRENCY} outbound get-session calls; got {concurrency!r}. It bounds how"
+            " much of this process one stalled auth service can occupy, not how fast upstream is"
+            " asked."
+        )
+    return concurrency
+
+
+def _validated_queue_timeout(queue_timeout: object) -> float:
+    if isinstance(queue_timeout, bool) or not isinstance(queue_timeout, (int, float)):
+        raise ConfigurationError(
+            "RemoteVerifier(queue_timeout=...) must be a number of seconds; got"
+            f" {type(queue_timeout).__name__}."
+        )
+    if not math.isfinite(queue_timeout) or queue_timeout < MIN_QUEUE_TIMEOUT:
+        raise ConfigurationError(
+            f"RemoteVerifier(queue_timeout=...) must be at least {MIN_QUEUE_TIMEOUT} seconds; got"
+            f" {queue_timeout!r}. Below that a saturated moment refuses every request that arrives"
+            " during it."
+        )
+    return float(queue_timeout)
+
+
+def _validated_negative_ttl(negative_ttl: object) -> float:
+    if isinstance(negative_ttl, bool) or not isinstance(negative_ttl, (int, float)):
+        raise ConfigurationError(
+            "RemoteVerifier(negative_ttl=...) must be a number of seconds; got"
+            f" {type(negative_ttl).__name__}."
+        )
+    if not math.isfinite(negative_ttl) or not MIN_NEGATIVE_TTL <= negative_ttl <= MAX_NEGATIVE_TTL:
+        raise ConfigurationError(
+            f"RemoteVerifier(negative_ttl=...) must be between {int(MIN_NEGATIVE_TTL)} and"
+            f" {int(MAX_NEGATIVE_TTL)} seconds; 0 disables the cache, which costs one upstream call"
+            f" per forged cookie and is safe, never a bypass. Got {negative_ttl!r}."
+        )
+    return float(negative_ttl)
+
+
+def _validated_max_remembered(max_remembered: object) -> int:
+    if (
+        isinstance(max_remembered, bool)
+        or not isinstance(max_remembered, int)
+        or not MIN_REMEMBERED <= max_remembered <= MAX_REMEMBERED
+    ):
+        raise ConfigurationError(
+            "RemoteVerifier(max_remembered=...) must be a positive number of remembered refusals,"
+            f" at most {MAX_REMEMBERED}; got {max_remembered!r}. A garbage-cookie space is the"
+            " attacker's imagination, so remembering it is bounded."
+        )
+    return max_remembered
+
+
+def _validated_clock(clock: object) -> Callable[[], float]:
+    if not callable(clock):
+        raise ConfigurationError(
+            "RemoteVerifier(clock=...) must be a callable returning monotonic seconds, such as"
+            f" time.monotonic; got {type(clock).__name__}."
+        )
+    return cast("Callable[[], float]", clock)

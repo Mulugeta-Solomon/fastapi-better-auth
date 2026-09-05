@@ -42,6 +42,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
+import anyio
 import pytest
 from sqlalchemy import Engine
 from sqlalchemy import text as sqla_text
@@ -60,11 +61,15 @@ from fastapi_better_auth import (
     SharedSecret,
     SqlAlchemySessionStore,
     SyncStoreAdapter,
+    TransportResponse,
     User,
 )
+from fastapi_better_auth._internal import remote_probe
 from fastapi_better_auth._internal.jwks import JwksClient
 from fastapi_better_auth._internal.jwt_verifier import JwtVerifier
+from fastapi_better_auth._internal.once import Once
 from fastapi_better_auth._internal.reasons import REDACTED, fingerprint
+from fastapi_better_auth._internal.remote_backoff import BackoffLatch
 from tests.fakes import connection, resolver_of
 from tests.stores import RecordingRedis, async_engine, build_schema, sync_engine
 from tests.tokens import (
@@ -239,6 +244,22 @@ COVERED_BY: Mapping[LogSite, str] = {
             " version (CVE-2026-67337, a 2FA bypass through exactly that cache) and is never parsed"
         ),
     ): "test_a_session_data_observation_logs_no_cookie_value",
+    LogSite(
+        module="remote_backoff",
+        level="warning",
+        template="get-session is rate-limited upstream (429); backing off %ss before the next call",
+    ): "test_a_backoff_latch_warning_carries_no_credential",
+    LogSite(
+        module="remote_probe",
+        level="warning",
+        template=(
+            "get-session accepted a manufactured bearer token and set a session cookie, so the"
+            " bearer plugin is at its default requireSignature: false. A raw session token is then"
+            " a bearer credential, so a token in a log, dump or backup is a credential leak. The"
+            " one-line fix upstream is bearer({ requireSignature: true }). Advisory only: Mode C"
+            " forwards a cookie, never a bearer."
+        ),
+    ): "test_the_advisory_require_signature_warning_carries_no_credential",
 }
 
 
@@ -611,6 +632,61 @@ def test_a_session_data_observation_logs_no_cookie_value(
     observed = next(site for site in COVERED_BY if site.module == "cookie_verifier")
     assert_template_fired(records, observed)
     assert value not in rendered(records)
+
+
+class _CookieSettingTransport:
+    """Answers `null` to the bare probe and a `Set-Cookie` to the advisory bearer request - the
+    permissive `requireSignature: false` shape. The set-cookie value is a sentinel so the scenario
+    can prove it is never read into the line."""
+
+    async def get(
+        self, url: str, *, headers: Mapping[str, str] | None = None, max_bytes: int
+    ) -> TransportResponse:
+        present = headers is not None and "authorization" in headers
+        extra = (
+            {"set-cookie": "better-auth.session_token=CLEARED-SENTINEL; Max-Age=0"}
+            if present
+            else {}
+        )
+        return TransportResponse(
+            status_code=200, headers={"content-type": "application/json", **extra}, content=b"null"
+        )
+
+    async def post(self, *args: Any, **kwargs: Any) -> TransportResponse:
+        raise AssertionError("get-session is a GET; a POST here is a bug")  # pragma: no cover
+
+
+def test_a_backoff_latch_warning_carries_no_credential(
+    records: list[logging.LogRecord],
+) -> None:
+    """The 429 latch warns once when it trips, and the line names only the backoff seconds it read
+    - it is built from an integer, so there is nothing a credential could ride in on."""
+    latch = BackoffLatch(clock=time.monotonic)
+
+    latch.observe(TransportResponse(status_code=429, headers={"x-retry-after": "12"}, content=b""))
+
+    assert_template_fired(records, _site("get-session is rate-limited"))
+    assert STORE_TOKEN not in rendered(records)
+
+
+def test_the_advisory_require_signature_warning_carries_no_credential(
+    records: list[logging.LogRecord], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The advisory bearer probe warns once when the permissive posture sets a cookie. The
+    manufactured token it sent and the set-cookie value it saw are never read into the line -
+    only its presence was consulted, per the `TransportResponse` rule."""
+    monkeypatch.setattr(remote_probe, "_advised", Once())
+
+    async def drive() -> None:
+        await remote_probe.run_probe(
+            _CookieSettingTransport(), uri=f"{ORIGIN}/api/auth/get-session", max_bytes=65536
+        )
+
+    anyio.run(drive)
+
+    site = next(s for s in COVERED_BY if s.module == "remote_probe")
+    assert_template_fired(records, site)
+    assert "CLEARED-SENTINEL" not in rendered(records), "the set-cookie value reached the line"
 
 
 class TestQueryErrorHygiene:

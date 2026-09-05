@@ -124,6 +124,24 @@ def test_two_verifiers_publish_two_schemes_as_alternatives() -> None:
     assert security(auth, "/required") == [{BEARER_NAME: []}, {COOKIE_NAME: []}]
 
 
+def test_two_schemes_are_declared_as_or_not_and() -> None:
+    """Ruling 11: the structural property that distinguishes OR from AND, pinned in the unit lane
+    alongside the exact equality above. OR is a list of single-key requirement objects
+    (`[{A: []}, {B: []}]`); AND would fold them into one (`[{A: [], B: []}]`). A `declaring()` that
+    merged every scheme into one Security requirement passes the flatten-into-a-set-of-names test
+    the e2e lane used to rely on, and fails only this - so this is the assertion that catches it."""
+    auth = BetterAuth(
+        verifiers=[
+            FakeVerifier(HEADER, source=BEARER_SOURCE),
+            FakeVerifier(HEADER_B, source=COOKIE_SOURCE),
+        ]
+    )
+    declared = security(auth, "/required")
+
+    assert len(declared) == 2
+    assert all(len(requirement) == 1 for requirement in declared), "an AND fold merged the schemes"
+
+
 def test_a_chain_of_schemes_still_serves_a_request(client_backend: str) -> None:
     """A set of schemes whose size is only known at construction is declared as a chain of
     dependencies. Building it is not running it: this drives a real request through one."""

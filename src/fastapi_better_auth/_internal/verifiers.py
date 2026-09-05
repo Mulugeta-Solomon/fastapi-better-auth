@@ -141,3 +141,33 @@ class Verifier(Protocol):
                 not be honoured.
         """
         ...
+
+
+@runtime_checkable
+class PreparedVerifier(Protocol):
+    """A verifier with startup work an operator may run once, from a lifespan handler.
+
+    Optional, and separate from `Verifier` on purpose. `Verifier` is a `runtime_checkable`
+    protocol, so adding a member to it would change `isinstance` for every existing and
+    third-party verifier; a verifier that does not implement this one is exactly as valid as
+    before, and `BetterAuth.startup()` simply skips it.
+
+    Implement it when a mode has work worth doing at boot rather than on the first request that
+    needs it - reaching a network dependency, discovering a schema. `RemoteVerifier` implements
+    it to run its reachability-and-contract probe once, so a deployment whose Better Auth server
+    cannot honour the get-session contract fails to *start* instead of refusing its first
+    authenticated request.
+
+        auth = BetterAuth(verifiers=[RemoteVerifier(base_url=..., csrf=...)])
+        app = FastAPI(lifespan=auth.lifespan)
+
+    `prepare()` must be idempotent: `startup()` may be called more than once, and a verifier that
+    is also reached lazily runs the same work on first use. It raises `ConfigurationError` for a
+    fault that makes the deployment unservable, so it propagates out of the lifespan and stops the
+    server from taking traffic.
+    """
+
+    async def prepare(self) -> None:
+        """Run this verifier's startup work once. Idempotent; raises `ConfigurationError` on a
+        fault that should stop the application from starting."""
+        ...

@@ -72,7 +72,7 @@ def session_document_from(
         )
     parsed = _decoded(response, uri)
     if parsed is None:
-        raise _null_outcome(signature_verified, marker)
+        raise null_outcome(signature_verified, marker)
     if not isinstance(parsed, dict):
         raise AuthServiceUnavailable(
             reason=f"get-session at {uri} is unusable: it is not a JSON object"
@@ -84,6 +84,23 @@ def session_document_from(
             reason=f"get-session at {uri} answered a document this bridge cannot read [{marker}]"
         )
     return record
+
+
+def is_cacheable_null(response: TransportResponse) -> bool:
+    """Whether this is the one cacheable outcome: `200`, JSON, body literally `null`.
+
+    The negative cache remembers exactly this and nothing else. It is read against the response
+    already fetched, so a refusal that came from a token mismatch, an expiry, a ban or an
+    unreadable document - none of which are 200-null - is never remembered.
+    """
+    if response.status_code != 200:
+        return False
+    if _media_type(response) not in JSON_MEDIA_TYPES:
+        return False
+    try:
+        return json.loads(response.content) is None
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
+        return False
 
 
 def retry_after_seconds(headers: Mapping[str, str]) -> int:
@@ -145,7 +162,12 @@ def _decoded(response: TransportResponse, uri: str) -> Any:
     return parsed
 
 
-def _null_outcome(signature_verified: bool, marker: str) -> InvalidCredential | SessionRevoked:
+def null_outcome(signature_verified: bool, marker: str) -> InvalidCredential | SessionRevoked:
+    """The refusal a `200 + null` maps to, reused by a live fetch and by a negative-cache hit.
+
+    A verified signature means the session existed and is gone (`SessionRevoked`, Mode A parity);
+    an unverified one means the cookie's existence was never established (`InvalidCredential`).
+    """
     if signature_verified:
         return SessionRevoked(reason=f"upstream reports the signed session is gone [{marker}]")
     return InvalidCredential(reason=f"upstream reports no session for this cookie [{marker}]")
