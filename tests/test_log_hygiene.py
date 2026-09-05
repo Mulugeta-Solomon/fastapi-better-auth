@@ -593,13 +593,11 @@ async def test_a_schema_drift_warning_carries_only_operator_owned_names(
 
 
 def test_a_session_data_observation_logs_no_cookie_value(
-    records: list[logging.LogRecord], monkeypatch: pytest.MonkeyPatch
+    records: list[logging.LogRecord],
 ) -> None:
     """The one line the cookie verifier emits. Seeing the out-of-scope `session_data` cookie warns
-    once, naming the CVE; the cookie is never parsed, so its value never reaches the line."""
-    from fastapi_better_auth._internal import cookie_verifier as cv
-
-    monkeypatch.setattr(cv._SESSION_DATA_ONCE, "_fired", False, raising=False)  # pyright: ignore[reportPrivateUsage]
+    once, naming the CVE; the cookie is never parsed, so its value never reaches the line. The
+    latch is per-verifier (D-197), so this freshly built verifier starts unfired."""
     value = "sd_9f3ab21c9f3ab21c9f3ab21c"
     verifier = CookieVerifier(
         secret=SharedSecret(LEAKY_SECRET),
