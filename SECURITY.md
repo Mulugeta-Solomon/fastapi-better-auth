@@ -87,7 +87,9 @@ header at all, because Better Auth never emits one and no extension is supported
   and Mode C alike — the document still says `banned: false` and stays that way until the session
   ends. The admin plugin's own ban route deletes the user's sessions, which every mode sees at once;
   that is the path to use. On a SQL topology the record is read live and a database-direct ban is
-  caught. Verified live against better-auth 1.7.1 in both topologies.
+  caught. Verified live against better-auth 1.7.1 in both topologies for Mode C
+  (`tests/e2e/test_remote_live.py`); Mode A reads the same stored document through its stores and has
+  not been driven through a database-direct ban live.
 - **Mode C forwards one cookie and nothing else.** The outbound request is built at construction —
   a fixed URI, and exactly two headers, `cookie` and `accept`. The inbound `Authorization`, `Origin`,
   `Host` and `X-Forwarded-*` headers are never forwarded, and this is not tidiness: the `bearer`
@@ -129,7 +131,8 @@ carry into production without noticing.
   "production"`). This library's negative cache, optional local pre-filter, concurrency limiter and
   `429` backoff latch all reduce how often the bucket is reached and **none of them raises it**; a
   library that could raise it would be a library that could disable your rate limiting. The fix is
-  upstream configuration — exempt or raise the rule for `/get-session`, or run Mode A or Mode B,
+  upstream configuration — exempt or raise the rule for `/get-session` (exempting removes the limit
+  for every caller of that route, browsers included, not only this bridge), or run Mode A or Mode B,
   which make no upstream call per request. README.md carries the exact config and the source
   citations. Note also that upstream answers a refusal with `X-Retry-After`, not `Retry-After`;
   a monitor watching for the standard header will not see these.

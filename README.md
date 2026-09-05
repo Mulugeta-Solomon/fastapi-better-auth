@@ -25,7 +25,7 @@ still see once a session goes away.
 | **Cost per request** | one session-store read | none — verified offline | one HTTPS call upstream, unless the local pre-filter or the negative cache answers first |
 | **What it couples to** | the shared secret, the same session store, and Better Auth's internal formats (cookie HMAC + store layout) | reachability of `/api/auth/jwks`, and nothing else | network reach to your Better Auth server, its `200`-with-`null` contract, and its `{session, user}` body shape — plus the signed-cookie envelope *only* if you configure a secret |
 | **CSRF** | required, no default | not applicable — a bearer credential is not sent ambiently | required, no default |
-| **Expiry** | refused here, because upstream's `findSession` does not check `expiresAt` | refused: `exp`, and a ceiling on the `exp - iat` upstream would never have minted | refused here, for the same reason |
+| **Expiry** | refused here, because upstream's `findSession` does not check `expiresAt` | refused: `exp`, and a ceiling on the `exp - iat` upstream would never have minted | refused upstream — the `get-session` route checks `expiresAt` and answers `null` (`dist/api/routes/session.mjs:148`) — and re-checked here |
 | **Sign-out** | the very next request is `401` | invisible until the token expires | the very next request is `401` |
 | **Bans** | refused here — upstream's `get-session` never reads `banned` either | invisible until the token expires | refused here, from the record upstream returns |
 | **Algorithm confusion** | not applicable | refused: a pinned algorithm allowlist, and an unknown `kid` is a refusal rather than a search | not applicable |
@@ -35,7 +35,8 @@ still see once a session goes away.
 **Two caveats behind the "Bans" row.** A ban is enforced *by this library*, from the user record it
 already has, because upstream's `get-session` route never reads `banned` — the admin plugin enforces
 bans when a session is **created** (`dist/plugins/admin/admin.mjs:33-49`) and deletes the user's
-sessions when the ban goes through its own route (`dist/plugins/admin/routes.mjs:305`). So a ban
+sessions when the ban goes through its own route (`ban-user`, `dist/plugins/admin/routes.mjs:508`,
+sessions deleted at `:540`; `update-user` with `banned: true` does the same at `:305`). So a ban
 written straight into the database is still caught here, in Mode A on SQL and in Mode C. It is
 **not** caught when Better Auth runs with `secondaryStorage` and the ban is written straight to the
 database: the session document in Redis was written before the ban and still says `banned: false`,
@@ -463,7 +464,7 @@ The mechanism, read out of better-auth 1.7.1's own build:
 - The key is `` `${ip}|${path}` `` (`@better-auth/core/dist/utils/ip.mjs:226-228`, built at
   `dist/api/rate-limiter/index.mjs:245`).
 - The only client-IP header read by default is `x-forwarded-for`
-  (`@better-auth/core/dist/utils/ip.mjs:194`, walked at `:204`), and when no address can be derived
+  (`@better-auth/core/dist/utils/ip.mjs:194`, walked at `:205`), and when no address can be derived
   the key falls back to the shared sentinel `no-trusted-ip` (`dist/api/rate-limiter/index.mjs:233`,
   used at `:245`). A server-to-server call forwards no such header, so that sentinel is the bucket
   your whole deployment lands in — one bucket per path, for everybody.
@@ -480,7 +481,10 @@ IP allowlist:
 rateLimit: { customRules: { "/get-session": false } }
 ```
 
-(`dist/api/rate-limiter/index.mjs:259-276`; `if (resolved === false) return null` at `:274`.)
+(`dist/api/rate-limiter/index.mjs:259-276`; `if (resolved === false) return null` at `:274`.) Know
+what that buys: it removes the limit for **every** caller of `/get-session` on your Node server — a
+browser hitting the route directly included — not only this bridge's server-to-server traffic. If
+`/get-session` should keep a ceiling, use Fix 2.
 
 **Fix 2 — or raise it for that one route**, if you would rather keep a ceiling:
 
@@ -554,7 +558,7 @@ Multi-tenant authorization is deferred as an API to a later release. The rule is
 every mode, because it is about the session document rather than about how the session was verified.
 
 **The organization id comes from the request — its path or its body — and membership is checked with
-your own query. Never from `session.raw["session"]["activeOrganizationId"]`.**
+your own query. Never from `session.raw["activeOrganizationId"]`.**
 
 That value is written by `POST /organization/set-active`, a route the *client* calls
 (`dist/plugins/organization/routes/crud-org.mjs:379`). Upstream does check membership before it
