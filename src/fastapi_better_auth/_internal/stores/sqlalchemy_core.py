@@ -280,11 +280,9 @@ def user_from(
     if identifier is None:
         unusable("user", "its id is null or blank", subject)
         return None
-    # A by-id lookup delegated equality to `WHERE id = :subject`, i.e. the DB collation - so a
-    # case/accent/pad-insensitive collation folds a different id onto this row. `check_identity`
-    # re-checks the returned id against the one asked for, constant-time, the symmetric guard
-    # `session_from` already applies to the token (D-191). The session-join path leaves it off:
-    # there the user is bound by the FK join, not by `subject` (which is the session token).
+    # `check_identity` re-checks the returned id against `subject` (constant-time): a collation
+    # -folding `WHERE id = :subject` can return a different row. The session-join path leaves it
+    # off - there the user is FK-bound and `subject` is the token, not an id (D-191).
     if check_identity and not hmac.compare_digest(
         identifier.encode("utf-8"), subject.encode("utf-8")
     ):
