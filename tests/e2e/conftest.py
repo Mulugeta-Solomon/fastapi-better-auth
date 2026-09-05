@@ -30,8 +30,8 @@ PASSWORD = "conformance-password-123"
 COMPOSE_FILE = pathlib.Path(__file__).resolve().parents[2] / "harness" / "docker-compose.yml"
 
 # The throttled service's /get-session rule, mirrored from RATE_LIMIT_GET_SESSION_MAX in
-# harness/docker-compose.yml. Upstream keys the bucket on the last request it saw, so a window
-# only clears after that many seconds of silence.
+# harness/docker-compose.yml. Upstream keys the bucket on the last request it ALLOWED (a refused
+# one leaves it untouched), so a window only clears after that many seconds without one.
 THROTTLE_WINDOW_SECONDS = 10
 THROTTLE_MAX = 3
 

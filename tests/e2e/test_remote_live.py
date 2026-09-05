@@ -33,6 +33,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import secrets
 import urllib.parse
 from typing import Any, cast
@@ -87,6 +88,7 @@ try:
         StoredUser,
     )
     from fastapi_better_auth._internal.cookie_verifier import CookieVerifier
+    from fastapi_better_auth._internal.remote_response import DEFAULT_BACKOFF
 
     from .counting import CountingTransport
 except ImportError:
@@ -102,6 +104,18 @@ BEARER_SCHEME = "BetterAuthBearer"
 CSRF_REASON = "a GET carries no CSRF risk; the rung is unit-tested"
 PROBE_CALLS = 2
 """What `prepare()` costs: the bare null-contract request, and the advisory bearer one."""
+DOCUMENT_BYTES = 64 * 1024
+RETRY_AFTER_RANGE = range(THROTTLE_WINDOW_SECONDS - 1, THROTTLE_WINDOW_SECONDS + 1)
+"""What a live 429's `X-Retry-After` can read: upstream computes ceil(window - time since the
+last ALLOWED request), so a slow runner reads one less than a fast one. Never the default."""
+assert DEFAULT_BACKOFF not in RETRY_AFTER_RANGE, "the range would hide a parser that read no header"
+
+
+def backing_off(reason: str) -> int:
+    """The seconds a 429 refusal reason says it is backing off for."""
+    found = re.search(r"backing off (\d+)s", reason)
+    assert found is not None, reason
+    return int(found.group(1))
 
 
 @pytest.fixture
@@ -541,30 +555,45 @@ class TestProbe:
         assert "base_path=" in str(refusal.value)
 
     @pytest.mark.anyio
-    async def test_the_transport_never_replays_the_cookie_it_just_forwarded(
-        self, harness: str
-    ) -> None:
-        """The dead-jar rule, live. An `httpx` client keeps a cookie jar by default, and upstream
-        really does emit `Set-Cookie` on some get-session answers - so a transport that persisted
-        them would answer this bare request as a logged-in user. The probe's own dead-jar rung
-        would then raise and name the transport; that it does not is the proof.
+    async def test_the_transport_never_keeps_a_cookie_upstream_sets(self, harness: str) -> None:
+        """The dead-jar rule, live, against a response that really carries a session cookie.
 
-        One transport instance across all three calls, because a fresh one would prove nothing.
+        The verifier's own requests never receive one - `disableRefresh=true` is pinned - so a
+        leg that forwards a cookie and then asks bare proves nothing: a live jar had nothing to
+        keep, and the leg stayed green with the dead-jar policy deleted. Here the session is aged
+        past `updateAge`, so a plain get-session through the SAME transport makes upstream refresh
+        it and re-set the cookie, and that `Set-Cookie` is asserted present. A live jar would store
+        it and answer the bare request that follows as the seed user; the probe's own dead-jar rung
+        would then raise. Postgres topology, because the row is what ages.
         """
         cookie = sign_in(harness, SEED_EMAIL, SEED_PASSWORD)
+        token = raw_token(cookie)
 
         async with HttpxTransport() as transport:
             verifier = build(harness, transport)
             app = session_app(BetterAuth(verifiers=[verifier]))
             authorized = await drive(app, headers=cookie_header(cookie))
+            # expiresIn 7 d and updateAge 1 d upstream: a refresh is due once expiresAt <= now + 6 d.
+            harness_sql(
+                f"""UPDATE session SET "expiresAt" = now() + interval '5 days'"""
+                f""" WHERE token = '{token}'"""
+            )
+            refreshed = await transport.get(
+                f"{harness}/api/auth/get-session",
+                headers={"accept": "application/json", "cookie": f"{SESSION_COOKIE}={cookie}"},
+                max_bytes=DOCUMENT_BYTES,
+            )
             bare = await transport.get(
                 f"{harness}/api/auth/get-session",
                 headers={"accept": "application/json"},
-                max_bytes=4096,
+                max_bytes=DOCUMENT_BYTES,
             )
             await verifier.probe()
 
         assert authorized.status_code == 200, authorized.text
+        assert refreshed.status_code == 200
+        assert json.loads(refreshed.content) is not None, "the aged session should still verify"
+        assert "set-cookie" in refreshed.headers, "no refresh: the jar was never offered a cookie"
         assert json.loads(bare.content) is None, "a bare request was answered as somebody"
         sign_out(harness, cookie)
 
@@ -580,8 +609,8 @@ class TestRateLimited:
     `backing off 5s`.
 
     Two window-length waits bracket the probe, so the leg starts from a bucket whose state it
-    knows. Upstream keys the bucket on the last request it saw, so a window only clears after that
-    many seconds of silence.
+    knows. Upstream keys the bucket on the last request it allowed (a refused one leaves it
+    untouched), so a window only clears after that many seconds without an allowed request.
     """
 
     async def refuse(self, verifier: RemoteVerifier) -> BaseException:
@@ -620,12 +649,12 @@ class TestRateLimited:
 
         assert isinstance(limited, AuthServiceUnavailable)
         assert "rate-limited upstream (429)" in limited.reason
-        # The live proof of the parse: upstream names the wait in X-Retry-After, and the reason
-        # carries that number rather than the no-header default of 5.
+        # The live proof of the parse: upstream names the wait in X-Retry-After only, and the
+        # reason carries that header's number rather than the no-header default.
         assert raw.status_code == 429
-        assert raw.headers["x-retry-after"] == str(THROTTLE_WINDOW_SECONDS)
         assert raw.headers.get("retry-after") is None, "upstream sends only the X- spelling"
-        assert f"backing off {THROTTLE_WINDOW_SECONDS}s" in limited.reason
+        assert int(raw.headers["x-retry-after"]) in RETRY_AFTER_RANGE
+        assert backing_off(limited.reason) in RETRY_AFTER_RANGE
 
         assert isinstance(latched, AuthServiceUnavailable)
         assert "backing off after a recent rate-limit (429)" in latched.reason
