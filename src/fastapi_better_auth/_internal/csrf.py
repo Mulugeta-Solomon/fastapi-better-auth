@@ -17,6 +17,7 @@ from .shared_secret import SharedSecret
 from .urls import normalize_base_url
 
 CROSS_SITE = "cross-site"
+CSRF_DOMAIN_LABEL = b"fba-csrf-v1:"
 DEFAULT_TOKEN_HEADER = "x-csrf-token"
 HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}")
 MIN_DISABLED_REASON = 16
@@ -331,9 +332,9 @@ class SignedDoubleSubmit:
     **The token is bound to the session, which is the whole point.** A classic double-submit
     cookie proves only that whoever sent the header could also set a cookie - and a sibling
     subdomain can set a cookie on the parent domain, so it proves nothing against exactly the
-    attacker this policy is for. `HMAC(secret, session_token)` cannot be produced without the
-    server's secret and does not transfer between sessions: a value planted for one session
-    fails for every other.
+    attacker this policy is for. A domain-separated `HMAC(secret, "fba-csrf-v1:" + session_token)`
+    cannot be produced without the server's secret and does not transfer between sessions: a value
+    planted for one session fails for every other.
 
     Hand the token to your front end from a route of your own and have it send the header back:
 
@@ -380,8 +381,10 @@ class SignedDoubleSubmit:
     def token_for(self, session_token: str) -> str:
         """The CSRF token for one session: 64 lowercase hex characters, stable and bound.
 
-        `HMAC-SHA256(secret, session_token)`. Hand it to your front end - in a JSON body, in a
-        readable cookie, in a `<meta>` tag - and have every unsafe request echo it back in the
+        `HMAC-SHA256(secret, "fba-csrf-v1:" + session_token)` - domain-separated from the cookie
+        signature over the same secret, so the two are never the same bytes. Hand it to your front
+        end - in a JSON body, in a readable cookie, in a `<meta>` tag - and have every unsafe
+        request echo it back in the
         configured header. It is not a secret in the way the session token is: knowing it does
         not authenticate anything, and it is useless against any other session.
 
@@ -527,13 +530,16 @@ def _reject_forged_token(
 
 
 def _digest(secret: SharedSecret, session_token: object) -> str:
+    # The message is domain-separated with a label so the CSRF token cannot equal any other
+    # HMAC this secret produces - the session cookie's own signature is HMAC(secret, token)
+    # over the same key, and the library owns both sides, so the two must not collide (D-190).
     try:
         if not isinstance(session_token, str):
             kind = type(session_token).__name__
             raise TypeError(f"token_for() takes the session token as a str; got {kind}.")
         return hmac.new(
             secret.get_secret_value().encode("utf-8"),
-            session_token.encode("utf-8"),
+            CSRF_DOMAIN_LABEL + session_token.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
     finally:
