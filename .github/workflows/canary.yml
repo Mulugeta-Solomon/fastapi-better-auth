@@ -58,14 +58,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Start harness (better-auth@${{ matrix.version }})
-        run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml --profile redis up --build -d --wait
+        run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled up --build -d --wait
       - name: Sync (dev group)
         run: uv sync
       - name: Conformance lane
         run: uv run pytest -m e2e -q
       - name: Harness logs
         if: failure()
-        run: docker compose -f harness/docker-compose.yml --profile redis logs
+        run: docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled logs
       - name: Open issue on failure
         if: failure() || cancelled()
         env:
@@ -99,7 +99,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Start harness (better-auth@${{ matrix.version }})
-        run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml --profile redis up --build -d --wait
+        run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled up --build -d --wait
       # The store drivers are installed by name rather than through the wheel's own
       # [sqlalchemy] / [redis] extras: those extras do not exist on releases before 0.2.0, and
       # this leg installs whatever is currently on PyPI. The store conformance module skips
@@ -121,7 +121,7 @@ jobs:
           "$WHEEL_VENV/bin/python" -m pytest tests/e2e -m e2e -q
       - name: Harness logs
         if: failure()
-        run: docker compose -f harness/docker-compose.yml --profile redis logs
+        run: docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled logs
       - name: Open issue on failure
         if: failure() || cancelled()
         env:
