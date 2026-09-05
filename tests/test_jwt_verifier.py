@@ -38,6 +38,7 @@ from fastapi_better_auth import (
 )
 from fastapi_better_auth._internal.jwks import SUPPORTED_ALGORITHMS
 from fastapi_better_auth._internal.jwt_verifier import JwtVerifier
+from fastapi_better_auth._internal.reasons import fingerprint
 from tests.fakes import connection
 from tests.tokens import (
     ABSENT,
@@ -484,6 +485,83 @@ async def test_a_signature_made_with_an_allowed_but_different_algorithm_is_refus
     error, _transport = await refused(token, json_reply(KEY_SET), algorithms=("EdDSA", "RS256"))
 
     assert isinstance(error, InvalidCredential)
+
+
+# --- critical header extensions -----------------------------------------------------------
+
+
+def _with_crit(value: Any, **extras: Any) -> str:
+    """A real signature over a header carrying exactly this `crit`, and nothing rewritten.
+
+    `signed_raw` rather than `Signer.sign`, because `jwt.encode` refuses to mint several of
+    these shapes - and an attacker's toolchain is under no such obligation.
+    """
+    header: dict[str, Any] = {"alg": "EdDSA", "kid": SIGNER.kid, "crit": value, **extras}
+    return signed_raw(SIGNER, header, claims())
+
+
+@pytest.mark.anyio
+async def test_a_token_declaring_a_critical_extension_is_refused_without_a_fetch() -> None:
+    """RFC 7515 4.1.11: a `crit` header names extensions the recipient MUST understand, or
+    reject the token. Better Auth emits none, and this library implements none.
+
+    `b64` is the one extension PyJWT itself understands (RFC 7797, an unencoded payload), so
+    it is the shape the dependency lets straight through however new it is: before this
+    refusal existed, this exact token verified into a live `Session` at the cost of one key-set
+    fetch. Leaving it to the library would also mean this verifier's answer depends on which
+    PyJWT is installed - which is what the CVE-2026-32597 floor already had to fix once.
+    """
+    token = _with_crit(["b64"], b64=True)
+
+    error, transport = await refused(token)
+
+    assert isinstance(error, InvalidCredential)
+    assert transport.calls == 0
+    assert "critical" in error.reason
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("value", "extras"),
+    [
+        (["b64"], {"b64": True}),
+        (["urn:example:x"], {"urn:example:x": True}),
+        ([], {}),
+        ("b64", {"b64": True}),
+        (7, {}),
+        (None, {}),
+        ({"urn:example:x": True}, {}),
+    ],
+    ids=["b64", "unknown", "empty-list", "a-string", "a-number", "null", "an-object"],
+)
+async def test_any_crit_header_at_all_is_a_declaration_this_library_refuses(
+    value: Any, extras: dict[str, Any]
+) -> None:
+    """An empty list is still a declaration, and a `crit` that is not a list is a malformed
+    one; neither is a header a verifier understands, so both are refusals, and none of them
+    costs a fetch.
+
+    Only the first shape is this library's own answer today - `jwt.get_unverified_header`
+    validates the rest itself on the floored version and refuses them as an unreadable header,
+    which is the same verdict from the layer below. That is why the *reason* is asserted in
+    `test_a_token_declaring_a_critical_extension_is_refused_without_a_fetch` rather than here:
+    pinning our wording on a refusal the dependency currently owns would pin the dependency.
+    """
+    error, transport = await refused(_with_crit(value, **extras))
+
+    assert isinstance(error, InvalidCredential)
+    assert transport.calls == 0
+
+
+@pytest.mark.anyio
+async def test_the_crit_refusal_names_the_token_only_by_fingerprint() -> None:
+    """D-018/D-100 for the new reason: the marker an operator correlates on, and no token."""
+    token = _with_crit(["b64"], b64=True)
+
+    error, _transport = await refused(token)
+
+    assert fingerprint(token) in error.reason
+    assert leaks(error, token) == ()
 
 
 # --- the kid --------------------------------------------------------------------------

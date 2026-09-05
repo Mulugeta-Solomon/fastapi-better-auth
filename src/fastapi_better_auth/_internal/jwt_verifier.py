@@ -196,6 +196,7 @@ class JwtVerifier:
         try:
             marker = _checked_shape(token)
             header = _unverified_header(token, marker)
+            _no_critical_extensions(header, marker)
             kid = _usable_kid(header, marker)
             algorithm = _allowed_algorithm(header, self._algorithms, marker)
             key = await self._key_for(kid, algorithm, marker)
@@ -254,6 +255,20 @@ def _unverified_header(token: str, marker: str) -> Mapping[str, Any]:
         failure = type(exc).__name__
     token = ""
     raise InvalidCredential(reason=f"unreadable token header [{failure}] {marker}") from None
+
+
+def _no_critical_extensions(header: Mapping[str, Any], marker: str) -> None:
+    """RFC 7515 4.1.11: `crit` names extensions a recipient must understand, or refuse.
+
+    Upstream emits none and this library implements none, so any declaration is a refusal -
+    an empty list and a non-list included, because both are still a declaration. Left to the
+    JWT library the answer would depend on which version is installed: `b64` (RFC 7797) is
+    understood there and would be honoured, and older versions honoured every extension name.
+    """
+    if "crit" in header:
+        raise InvalidCredential(
+            reason=f"token declares critical header extensions; none are supported {marker}"
+        )
 
 
 def _usable_kid(header: Mapping[str, Any], marker: str) -> str:
