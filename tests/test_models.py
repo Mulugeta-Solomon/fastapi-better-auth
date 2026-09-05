@@ -299,6 +299,34 @@ def test_raw_preserves_fields_the_models_do_not_promote() -> None:
     assert session.raw["userAgent"] == "curl/8.7.1"
 
 
+def test_raw_repr_masks_the_session_token_but_keeps_it_reachable() -> None:
+    """D-194: cookie mode puts the raw token under `raw['token']` in cleartext, defeating the
+    SecretStr masking on `Session.token` the moment `repr(session.raw)` is rendered (into a log or
+    a debug 500). The repr masks that one value; the value stays reachable by key."""
+    the_token = "SBYZ1bzGdkhXcLuqsW70JjhvmIY4PU3B"
+    payload: dict[str, Any] = {"token": the_token, "userId": "u1", "ipAddress": "203.0.113.7"}
+    session = Session[User](user=base_user(), expires_at=None, raw=payload)
+
+    rendered = repr(session.raw)
+    assert the_token not in rendered
+    assert "<redacted>" in rendered
+    assert "203.0.113.7" in rendered, "only the token is masked, not the rest of the payload"
+
+    assert session.raw["token"] == the_token, "the value stays reachable by key"
+    assert len(session.raw) == 3
+    assert set(session.raw) == {"token", "userId", "ipAddress"}
+
+
+def test_raw_repr_is_clean_when_there_is_no_token() -> None:
+    """A JWT-mode payload carries no `token` field, so nothing is masked and the repr is faithful."""
+    payload: dict[str, Any] = {"sub": "u1", "iss": "https://auth.example.com"}
+    session = Session[User](user=base_user(), expires_at=None, raw=payload)
+
+    rendered = repr(session.raw)
+    assert "<redacted>" not in rendered
+    assert "u1" in rendered
+
+
 # --- equality and hashing (D8) ----------------------------------------------------
 
 
