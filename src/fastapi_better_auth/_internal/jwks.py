@@ -226,10 +226,12 @@ class JwksClient:
             response = await self._transport.get(self._uri, max_bytes=self._max_bytes)
         except (BetterAuthError, SessionError):
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - `from None`: a Transport's error may carry the request
+            # The type name is already in the reason; `from None` keeps a third-party
+            # Transport's exception (which may carry what it failed on) off the chain.
             raise AuthServiceUnavailable(
                 reason=f"jwks fetch failed [{type(exc).__name__}] {self._uri}"
-            ) from exc
+            ) from None
         return self._parsed(response)
 
     def _parsed(self, response: TransportResponse) -> Mapping[str, Jwk]:
@@ -257,9 +259,16 @@ class JwksClient:
             raise self._unusable(f"it is served as {safe_label(media)}, not JSON")
 
     def _document(self, response: TransportResponse) -> Mapping[str, Any]:
+        # The refusal is raised OUTSIDE the except so `__context__` does not chain the
+        # `JSONDecodeError` out - its `.doc` is the raw body (the house pattern, D-181).
+        parsed: object = None
         try:
-            parsed: object = json.loads(response.content)
+            parsed = json.loads(response.content)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
+            unparseable = True
+        else:
+            unparseable = False
+        if unparseable:
             raise self._unusable("it is not JSON") from None
         if not isinstance(parsed, dict):
             raise self._unusable("it is not a JSON object")

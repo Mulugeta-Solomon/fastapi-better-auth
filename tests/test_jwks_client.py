@@ -256,6 +256,25 @@ async def test_a_malformed_key_set_is_unavailable(document: bytes) -> None:
 
 
 @pytest.mark.anyio
+async def test_an_unparseable_body_carries_no_context_out_of_the_parse() -> None:
+    """F3 (fix round 2). `_document` raised its refusal INSIDE the active `except`, so the
+    `AuthServiceUnavailable`'s `__context__` still pointed at the `JSONDecodeError` - whose
+    `.doc` is the raw body verbatim. Raising it OUTSIDE the except, the house pattern
+    `_unverified_header` already uses, severs that: a reporter walking `__context__` finds
+    nothing of the body. Not a credential here, but the JWKS body is upstream-controlled and
+    the pattern exists so the containment does not have to be decided case by case."""
+    keys, _transport = client(
+        Reply(content=b"not json at all {{{", content_type="application/json")
+    )
+
+    with pytest.raises(AuthServiceUnavailable) as caught:
+        await keys.key_for(SIGNER.kid)
+
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.anyio
 async def test_a_key_set_the_json_parser_gives_up_on_is_unusable(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
