@@ -305,10 +305,12 @@ class RemoteVerifier:
             )
             return self._session(record, token, marker, user_model)
         finally:
-            # `credential` is a parameter, and a parameter is a frame local like any other: it
-            # carries the whole cookie value (D-094, D-180).
+            # `credential` is a parameter, and a parameter is a frame local like any other; and
+            # `record`/`response` carry the forwarded token when `_session` refuses AFTER the fetch
+            # (expired, banned) - this frame holds all of it (D-094, D-180, D-210).
             credential = None
             material = name = token = ""
+            record = response = None
             outbound.clear()
 
     def _rung_two(self, material: str, marker: str) -> bool:

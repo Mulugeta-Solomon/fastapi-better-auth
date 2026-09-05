@@ -571,6 +571,56 @@ class TestChaining:
         assert holding(error, TOKEN, ignore=[connection, transport]) == []
 
 
+# ---------------------------------------------------------------- frame hygiene, POST-fetch refusals
+
+
+class TestRefusalFramesPostFetch:
+    """A refusal raised AFTER the fetch (`expired`, `banned`) unwinds through `verify`, whose frame
+    binds `record`/`response` - both carrying the forwarded token, since the upstream document names
+    the session that WAS presented (D-210). The pre-fetch chaining test cannot see this: no document
+    is ever built there. Each row asserts no frame of the raised error holds the token or the whole
+    cookie value.
+    """
+
+    PAST = "2000-01-01T00:00:00.000Z"
+
+    @pytest.mark.anyio
+    async def test_an_expired_refusal_holds_no_credential(self) -> None:
+        transport = ScriptedTransport(json_reply(document(expires=self.PAST)))
+        built = verifier(transport)
+        connection = with_cookie()
+
+        error = await refused(built, connection)
+
+        assert isinstance(error, SessionExpired)
+        assert holding(error, TOKEN, ignore=[connection, transport]) == []
+        assert holding(error, COOKIE_VALUE, ignore=[connection, transport]) == []
+
+    @pytest.mark.anyio
+    async def test_a_banned_refusal_holds_no_credential(self) -> None:
+        transport = ScriptedTransport(json_reply(document(banned=True)))
+        built = verifier(transport)
+        connection = with_cookie()
+
+        error = await refused(built, connection)
+
+        assert isinstance(error, SessionRevoked)
+        assert holding(error, TOKEN, ignore=[connection, transport]) == []
+        assert holding(error, COOKIE_VALUE, ignore=[connection, transport]) == []
+
+    @pytest.mark.anyio
+    async def test_a_token_mismatch_refusal_holds_no_credential(self) -> None:
+        transport = ScriptedTransport(json_reply(document(token="a-different-token-entirely")))
+        built = verifier(transport)
+        connection = with_cookie()
+
+        error = await refused(built, connection)
+
+        assert isinstance(error, InvalidCredential)
+        assert holding(error, TOKEN, ignore=[connection, transport]) == []
+        assert holding(error, COOKIE_VALUE, ignore=[connection, transport]) == []
+
+
 # ---------------------------------------------------------------- composition (A + C collision)
 
 
