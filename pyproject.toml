@@ -73,7 +73,12 @@ Issues = "https://github.com/Mulugeta-Solomon/fastapi-better-auth/issues"
 
 [tool.pytest.ini_options]
 addopts = "-m 'not e2e'"
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # starlette 1.6.0's testclient imports anyio.abc.BlockingPortal, deprecated in anyio 4.15;
+    # scoped to that module so nothing of ours is exempt. Drop once the starlette floor has the fix.
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning:starlette.testclient",
+]
 markers = [
     "e2e: conformance tests against the live harness (harness/docker-compose.yml); run with -m e2e",
 ]
