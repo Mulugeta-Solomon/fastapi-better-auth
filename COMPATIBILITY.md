@@ -10,15 +10,15 @@ The server this library bridges to. The conformance suite runs against real Bett
 of the behaviours this library documents are *server postures* rather than server versions, and a
 posture asserted in only one direction is not asserted at all.
 
-| better-auth | Lane | When |
-|---|---|---|
-| 1.7.1 | conformance, gating | every pull request, and every push to `main` |
-| 1.7.1 with `secondaryStorage` (Redis) | conformance, gating | every pull request, and every push to `main` |
-| 1.7.1 with `bearer({ requireSignature: true })` | conformance (strict posture), gating | every pull request, and every push to `main` |
-| 1.7.1 with `rateLimit: { enabled: true, customRules: { "/get-session": { window: 10, max: 3 } } }` | conformance (throttled posture), gating | every pull request, and every push to `main` |
-| 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes |
-| 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes |
-| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes |
+| better-auth | Lane | When | Last green on the published wheel |
+|---|---|---|---|
+| 1.7.1 | conformance, gating | every pull request, and every push to `main` | — (HEAD only) |
+| 1.7.1 with `secondaryStorage` (Redis) | conformance, gating | every pull request, and every push to `main` | — (HEAD only) |
+| 1.7.1 with `bearer({ requireSignature: true })` | conformance (strict posture), gating | every pull request, and every push to `main` | — (HEAD only) |
+| 1.7.1 with `rateLimit: { enabled: true, customRules: { "/get-session": { window: 10, max: 3 } } }` | conformance (throttled posture), gating | every pull request, and every push to `main` | — (HEAD only) |
+| 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.3.0 on 2026-09-07 (run 34089159699) |
+| 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.3.0 on 2026-09-07 (run 34089159699) |
+| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.3.0 on 2026-09-07 (run 34089159699), `latest` = 1.7.3 that day |
 
 The strict posture is what makes "`bearer({ requireSignature: true })` is the fix" a tested claim
 rather than a reading of the source: the default-permissive server and the strict one are driven
@@ -38,6 +38,11 @@ Better Auth publishes no wire-format stability contract. Cookie signing, session
 the JWT plugin's claims are internal details, and they have moved across minor releases. That is
 the whole reason the canary is weekly rather than a promise in this file: a break should reach an
 issue here before it reaches your deployment.
+
+The last column is written by hand from the post-release canary, never from a promise: the wheel
+installed from PyPI is guard-verified to be the version named, and every posture above runs
+against it. The 2026-09-07 run was the first in which the Mode C live lane executed on a published
+wheel rather than on HEAD.
 
 ## Python
 
