@@ -16,6 +16,7 @@ Asyncio only: asyncpg and redis-py drive the event loop directly, so there is no
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -59,6 +60,14 @@ try:
 except ImportError:
     pytest.skip(
         "this build of fastapi-better-auth-bridge publishes no cookie mode",
+        allow_module_level=True,
+    )
+
+if "secure_cookies" not in inspect.signature(CookieVerifier.__init__).parameters:
+    # Added after 0.2.0 (the audit's cookie-name hardening). A wheel whose CookieVerifier predates
+    # it cannot run this module; the honest answer is the same skip as a missing name, not a TypeError.
+    pytest.skip(
+        "this build of fastapi-better-auth-bridge predates secure_cookies (added after 0.2.0)",
         allow_module_level=True,
     )
 

@@ -92,7 +92,7 @@ The floor-resolution lane is what found it.
   hole, which is a patch release with an advisory.
 - **Mode A (cookie + shared session store)** reads Better Auth's *internal* formats: the signed
   cookie's HMAC construction and the session store's own layout. It is **tested against
-  better-auth 1.7.1** — the version the conformance lane pins — verified on **2026-08-29**, and an
+  better-auth 1.7.1** — the version the conformance lane pins — verified on **2026-09-07**, and an
   upstream change to either the cookie signing or the store layout may force a change here inside a
   minor release. That coupling is stated rather than hidden: Mode C (remote `get-session`) is the
   path with less of it, because it asks the server instead of reading its internals. The stores read
@@ -101,7 +101,7 @@ The floor-resolution lane is what found it.
   raw session token, with no namespace), and the JSON that key holds (`{session, user}`).
 - **Mode C (remote get-session)** couples to *less*, and the honest word for it is "less", never
   "format-independent". It is **tested against better-auth 1.7.1**, verified live on
-  **2026-09-05** across all four harness postures. Its dependencies are exactly these four, and
+  **2026-09-07** across all four harness postures. Its dependencies are exactly these four, and
   each is asserted in the conformance lane:
   1. **The 200-null contract** — `GET /api/auth/get-session` answers `200` with a body of literally
      `null` for a request that carries no valid session, rather than a `401`. The boot probe asserts
