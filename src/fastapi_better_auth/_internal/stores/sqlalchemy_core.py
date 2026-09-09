@@ -114,7 +114,11 @@ ONE_STRING = (
     "{parameter} must be a sequence of column names, not a single string: {value!r} would be"
     " iterated one character at a time. Pass [{value!r}] to name one column."
 )
-BLANK_COLUMN = "{parameter} must hold non-empty column names; got {value!r}."
+BYTES_NOT_NAMES = (
+    "{parameter} must hold str column names, not bytes; got {value!r}. Iterating bytes yields"
+    " integers rather than characters, so a name has to arrive decoded."
+)
+BLANK_COLUMN = "{parameter} must hold non-empty str column names; got {value!r}."
 REPEATED_COLUMN = "{parameter} names {value!r} more than once."
 WRONG_ENGINE = "engine must be a SQLAlchemy {expected}; got {actual}. {advice}"
 ASYNC_ADVICE = (
@@ -162,12 +166,21 @@ def validated_columns(parameter: str, value: object) -> tuple[str, ...] | None:
 
     A bare string is the mistake worth its own message: `Sequence[str]` accepts one, and iterating
     it yields single characters, so the failure would otherwise surface as a discovery error about
-    a column called `t`. A set is refused because order is what puts a deployment's own columns
-    after the ones this library knows, and a set has none to give.
+    a column called `t`. `bytes` gets a second: iterating it yields integers rather than
+    characters, and the one thing the string message says to do - pass `[value]` - is refused
+    again by the item check below.
+
+    A `set` is refused because the parameter is declared `Sequence[str]` and a set is not one; a
+    type-contract violation is better refused where it is written than silently accepted. It also
+    costs two refusals their meaning: `UNKNOWN_COLUMN` joins the names it was given, so one wrong
+    list would read differently run to run, and `REPEATED_COLUMN` could never fire at all - a set
+    collapses the duplicate it exists to report.
     """
     if value is None:
         return None
-    if isinstance(value, (str, bytes)):
+    if isinstance(value, bytes):
+        raise ConfigurationError(BYTES_NOT_NAMES.format(parameter=parameter, value=value))
+    if isinstance(value, str):
         raise ConfigurationError(ONE_STRING.format(parameter=parameter, value=value))
     if not isinstance(value, Sequence):
         raise ConfigurationError(

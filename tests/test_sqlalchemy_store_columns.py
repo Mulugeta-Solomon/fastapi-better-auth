@@ -302,6 +302,16 @@ class TestConstruction:
             build(**seeded({"user_columns": "tenantId"}))
 
     @pytest.mark.anyio
+    async def test_bytes_are_refused_as_bytes_and_not_as_a_string(
+        self, build: StoreFixture
+    ) -> None:
+        """`bytes` reaches the same guard as `str`, but the string message does not describe it:
+        iterating bytes yields integers, and `[b"tenantId"]` - what that message tells you to pass
+        - is refused again one check later for not holding `str` names."""
+        with pytest.raises(ConfigurationError, match="not bytes"):
+            build(**seeded({"user_columns": b"tenantId"}))
+
+    @pytest.mark.anyio
     @pytest.mark.parametrize("blank", ["", "   "], ids=["empty", "spaces"])
     async def test_a_blank_name_is_refused(self, build: StoreFixture, blank: str) -> None:
         with pytest.raises(ConfigurationError):
@@ -320,8 +330,19 @@ class TestConstruction:
             build(**seeded({"user_columns": ["tenantId", 3]}))
 
     @pytest.mark.anyio
+    async def test_a_bytes_item_is_refused_for_not_being_a_string(
+        self, build: StoreFixture
+    ) -> None:
+        """`b"deviceId"` is not blank, so the item refusal has to say what is actually wrong with
+        it: the names have to be `str`."""
+        with pytest.raises(ConfigurationError, match="non-empty str column names"):
+            build(**seeded({"session_columns": [b"deviceId"]}))
+
+    @pytest.mark.anyio
     async def test_an_unordered_collection_is_refused(self, build: StoreFixture) -> None:
-        """A `set` has no order, and order is what puts a deployment's own columns after the ones
-        this library knows. The annotation says `Sequence` and the check enforces it."""
+        """The annotation says `Sequence[str]` and a set is not one - a type-contract violation is
+        better refused where it is written than silently accepted. It would also cost two refusals
+        their meaning: `UNKNOWN_COLUMN` joins the names it was given, so one wrong list would read
+        differently run to run, and `REPEATED_COLUMN` could never fire at all."""
         with pytest.raises(ConfigurationError, match="sequence"):
             build(**seeded({"user_columns": {"tenantId"}}))
