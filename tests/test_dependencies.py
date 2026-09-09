@@ -37,7 +37,7 @@ HEADER = "x-cred-a"
 HEADER_B = "x-cred-b"
 
 
-class AdminUser(User):
+class Member(User):
     """A deployment's own model, carried through the dependency unchanged."""
 
     role: str | None = None
@@ -67,7 +67,7 @@ def test_the_default_user_model_memoizes_with_the_explicit_one() -> None:
 def test_a_different_user_model_yields_a_different_callable() -> None:
     _verifier, auth = one_verifier()
 
-    assert auth.current_session(user_model=AdminUser) is not auth.current_session(user_model=User)
+    assert auth.current_session(user_model=Member) is not auth.current_session(user_model=User)
 
 
 def test_required_and_optional_are_different_callables() -> None:
@@ -89,7 +89,7 @@ def test_both_factories_anchor_on_one_shared_resolver() -> None:
 def test_a_different_user_model_gets_its_own_resolver() -> None:
     _verifier, auth = one_verifier()
 
-    assert resolver_of(auth.current_session(user_model=AdminUser)) is not resolver_of(
+    assert resolver_of(auth.current_session(user_model=Member)) is not resolver_of(
         auth.current_session(user_model=User)
     )
 
@@ -120,17 +120,15 @@ def test_two_apps_never_share_a_cache() -> None:
 
 def test_each_factory_is_typed_as_the_user_model_it_was_asked_for() -> None:
     """Checked by pyright, not at runtime, and that is the point: a route body must see
-    `Session[AdminUser]` without a cast, and `Session[Any]` would pass every assignment
+    `Session[Member]` without a cast, and `Session[Any]` would pass every assignment
     test while silently deleting the guarantee."""
     _verifier, auth = one_verifier()
 
-    assert_type(
-        auth.current_session(user_model=AdminUser), Callable[..., Awaitable[Session[AdminUser]]]
-    )
+    assert_type(auth.current_session(user_model=Member), Callable[..., Awaitable[Session[Member]]])
     assert_type(auth.current_session(), Callable[..., Awaitable[Session[User]]])
     assert_type(
-        auth.optional_session(user_model=AdminUser),
-        Callable[..., Awaitable["Session[AdminUser] | None"]],
+        auth.optional_session(user_model=Member),
+        Callable[..., Awaitable["Session[Member] | None"]],
     )
     assert_type(auth.optional_session(), Callable[..., Awaitable["Session[User] | None"]])
 
@@ -273,11 +271,11 @@ def test_the_missing_credential_reason_names_the_verifiers_that_were_asked() -> 
 def test_a_subclass_user_model_survives_the_round_trip(client_backend: str) -> None:
     verifier = FakeVerifier(HEADER, payload={"id": "u1", "role": "admin"})
     auth = BetterAuth(verifiers=[verifier])
-    with client(session_app(auth, user_model=AdminUser), client_backend) as http:
+    with client(session_app(auth, user_model=Member), client_backend) as http:
         response = http.get("/required", headers={HEADER: GOOD_CREDENTIAL})
 
     assert response.status_code == 200
-    assert response.json() == {"id": "u1", "model": "AdminUser"}
+    assert response.json() == {"id": "u1", "model": "Member"}
 
 
 # --- websockets are connections too ----------------------------------------------------

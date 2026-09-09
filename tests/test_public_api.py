@@ -11,6 +11,7 @@ import fastapi_better_auth
 
 EXPECTED = (
     "BEARER_CHALLENGE",
+    "AdminUser",
     "AmbiguousCredentials",
     "AuthServiceUnavailable",
     "BetterAuth",

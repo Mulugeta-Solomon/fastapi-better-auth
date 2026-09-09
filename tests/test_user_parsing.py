@@ -9,21 +9,25 @@ input out of it.
 
 from __future__ import annotations
 
+import logging
 import traceback
 from typing import Any
 
 import pytest
-from pydantic import ConfigDict, Field, ValidationError, field_validator
+from pydantic import ConfigDict, Field, ValidationError, create_model, field_validator
 
-from fastapi_better_auth import InvalidCredential, User, parse_user
+from fastapi_better_auth import AdminUser, InvalidCredential, User, parse_user
+from fastapi_better_auth._internal import parsing
+from fastapi_better_auth._internal.once import OnceByKey
 
+LIBRARY_LOGGER = "fastapi_better_auth"
 LEAKY_MARKER = "mallory-9f3ab21c"
 PLAIN_MARKER = "mallory9f3ab21c"
 OVERLONG_EMAIL = f"{'x' * 400}@example.com"
 OVERLONG_IMAGE = f"https://cdn.example.com/{LEAKY_MARKER}/{'x' * 5000}"
 
 
-class AdminUser(User):
+class RequiredRole(User):
     """A deployment's own user model, with a field the upstream payload must carry."""
 
     role: str
@@ -76,9 +80,9 @@ def test_a_valid_payload_produces_the_model_that_was_asked_for() -> None:
 
 
 def test_a_subclass_is_returned_as_the_subclass() -> None:
-    user = parse_user(AdminUser, {"id": "u1", "role": "admin"})
+    user = parse_user(RequiredRole, {"id": "u1", "role": "admin"})
 
-    assert isinstance(user, AdminUser)
+    assert isinstance(user, RequiredRole)
     assert user.role == "admin"
 
 
@@ -97,15 +101,15 @@ def test_no_validation_error_ever_escapes(payload: Any) -> None:
 
 def test_a_missing_subclass_field_is_contained_too() -> None:
     with pytest.raises(InvalidCredential):
-        parse_user(AdminUser, {"id": "u1"})
+        parse_user(RequiredRole, {"id": "u1"})
 
 
 def test_the_reason_names_the_model_and_the_field_that_failed() -> None:
     with pytest.raises(InvalidCredential) as caught:
-        parse_user(AdminUser, {"id": "u1"})
+        parse_user(RequiredRole, {"id": "u1"})
 
     reason = caught.value.reason
-    assert "AdminUser" in reason
+    assert "RequiredRole" in reason
     assert "role" in reason
 
 
@@ -288,3 +292,134 @@ def test_the_contained_error_still_renders_the_uniform_401() -> None:
 
     assert caught.value.status_code == 401
     assert caught.value.detail == "Not authenticated"
+
+
+# --- the additionalFields advisory (#43) ------------------------------------------
+#
+# A *required* subclass field is the strict mode: it fails closed on the first request. What it
+# cannot do is say *why* on the wire, because the wire is a uniform 401 for everything. The
+# warning below is the second channel - the deployment telling on itself in its own logs.
+
+
+def scoped_model(name: str = "Scoped") -> type[User]:
+    """A brand-new subclass every call, so the per-model warning latch starts unfired.
+
+    Written as a factory rather than a module-level class because "once per process per model"
+    is exactly what these tests measure: two tests sharing one class would make the second one
+    pass because the first had already fired.
+    """
+    return create_model(name, __base__=User, jurisdiction_scope=(str, ...))
+
+
+def parse_missing(model: type[User]) -> InvalidCredential:
+    with pytest.raises(InvalidCredential) as caught:
+        parse_user(model, {"id": "u1", "jurisdiction": "KE"})
+    return caught.value
+
+
+def advisories(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+    return [record for record in records if record.name == LIBRARY_LOGGER]
+
+
+def test_a_required_field_the_wire_does_not_carry_is_a_401_naming_the_wire_key() -> None:
+    """The one thing a reader has to be able to copy out of a log and take to the Node side:
+    the *alias*, `jurisdictionScope`, not the Python name `jurisdiction_scope`."""
+    refusal = parse_missing(scoped_model())
+
+    assert refusal.reason == "Scoped payload rejected (1): jurisdictionScope: [missing]"
+    assert refusal.status_code == 401
+
+
+def test_a_missing_field_warns_once_per_process_per_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    model = scoped_model()
+
+    with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER):
+        parse_missing(model)
+        parse_missing(model)
+        parse_missing(model)
+
+    assert len(advisories(caplog.records)) == 1
+
+
+def test_a_second_model_gets_its_own_advisory(caplog: pytest.LogCaptureFixture) -> None:
+    """Per model, not per process: two deployments' models on one process must both be told."""
+    with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER):
+        parse_missing(scoped_model("First"))
+        parse_missing(scoped_model("Second"))
+
+    written = " ".join(record.getMessage() for record in advisories(caplog.records))
+    assert len(advisories(caplog.records)) == 2
+    assert "First" in written
+    assert "Second" in written
+
+
+def test_the_advisory_names_the_model_and_the_wire_key(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER):
+        parse_missing(scoped_model())
+
+    record = advisories(caplog.records)[0]
+
+    assert record.levelno == logging.WARNING
+    assert "Scoped" in record.getMessage()
+    assert "jurisdictionScope" in record.getMessage()
+    assert "additionalFields" in record.getMessage()
+
+
+def test_the_advisory_carries_no_value_from_the_payload(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The same discipline as `reason` (D-046, D-059): the diagnosis, never the data."""
+    model = create_model("Scoped", __base__=User, jurisdiction_scope=(str, ...))
+
+    with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER), pytest.raises(InvalidCredential):
+        parse_user(model, {"id": LEAKY_MARKER, "jurisdiction": LEAKY_MARKER})
+
+    written = " ".join(record.getMessage() for record in advisories(caplog.records))
+    assert advisories(caplog.records), "nothing was logged; this scenario proves nothing"
+    assert LEAKY_MARKER not in written
+
+
+def test_a_field_name_a_log_line_could_not_survive_is_redacted_here_too(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`loc` for a `missing` error is the model's own alias, so this is belt and braces - but
+    the sanitizer runs on both channels or on neither. The hostile spelling is the field's
+    validation alias: a field *named* that way has no `__init__` signature on the oldest
+    supported pydantic, and the alias is what a `missing` error reports anyway."""
+    model = create_model(
+        "Injected", __base__=User, injected=(str, Field(validation_alias="new\nline"))
+    )
+
+    with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER), pytest.raises(InvalidCredential):
+        parse_user(model, {"id": "u1"})
+
+    written = " ".join(record.getMessage() for record in advisories(caplog.records))
+    assert "<redacted>" in written
+    assert "new\nline" not in written
+
+
+def test_a_refusal_that_is_not_about_a_missing_field_is_silent(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `banned: "true"` is a wire-shape problem, not a name mismatch. Warning on it would
+    make the advisory fire for every malformed payload and stop meaning anything.
+
+    The latch is replaced so this is a genuine observation: `AdminUser` is a module-level class
+    another test may already have fired the per-model latch for, and a silence that only means
+    "already warned" would let an advisory-on-every-error mutation pass."""
+    monkeypatch.setattr(parsing, "_advised", OnceByKey())
+    with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER), pytest.raises(InvalidCredential):
+        parse_user(AdminUser, {"id": "u1", "banned": "true"})
+
+    assert advisories(caplog.records) == []
+
+
+def test_a_payload_that_parses_is_silent(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER):
+        parse_user(scoped_model(), {"id": "u1", "jurisdictionScope": "KE"})
+
+    assert advisories(caplog.records) == []

@@ -16,7 +16,7 @@ import pytest
 from pydantic import SecretStr, ValidationError
 from typing_extensions import assert_type
 
-from fastapi_better_auth import Session, User
+from fastapi_better_auth import AdminUser, Session, User
 
 VECTOR_DIR = pathlib.Path(__file__).parent / "vectors"
 JWT_DOC: dict[str, Any] = json.loads((VECTOR_DIR / "jwt_v1.json").read_text())
@@ -35,8 +35,8 @@ GET_SESSION_USER: dict[str, Any] = {
 CAPTURED_AT = datetime(2026, 8, 20, 15, 34, 2, 764000, tzinfo=timezone.utc)
 
 
-class AdminUser(User):
-    """A user subclass carrying server-controlled admin-plugin fields."""
+class Member(User):
+    """A deployment's own user subclass - the shape the `User` docstring shows."""
 
     role: str | None = None
     ban_expires: datetime | None = None
@@ -115,7 +115,7 @@ def test_aliases_are_validation_only() -> None:
 
 
 def test_a_subclass_keeps_the_camelcase_alias_generator() -> None:
-    user = AdminUser.model_validate(
+    user = Member.model_validate(
         {**GET_SESSION_USER, "role": "admin", "banExpires": "2026-09-01T00:00:00Z"}
     )
 
@@ -193,14 +193,113 @@ def test_an_epoch_session_expiry_is_aware() -> None:
     assert session.expires_at.tzinfo is not None
 
 
+# --- AdminUser: the four fields the admin() plugin adds ---------------------------
+#
+# Upstream declares all four `input: false` (server-controlled, never settable at sign-up):
+# better-auth/dist/plugins/admin/schema.mjs, identical at 1.7.1 and 1.7.3.
+
+ADMIN_WIRE: dict[str, Any] = {
+    **GET_SESSION_USER,
+    "role": "admin",
+    "banned": False,
+    "banReason": None,
+    "banExpires": None,
+}
+"""The `user` object of a live `get-session` with `admin()` mounted (harness, 2026-09-09)."""
+
+
+def test_admin_user_parses_the_four_plugin_fields_from_camelcase() -> None:
+    user = AdminUser.model_validate(
+        {**ADMIN_WIRE, "banned": True, "banReason": "spam", "banExpires": "2026-09-01T00:00:00Z"}
+    )
+
+    assert user.role == "admin"
+    assert user.banned is True
+    assert user.ban_reason == "spam"
+    assert user.ban_expires == datetime(2026, 9, 1, tzinfo=timezone.utc)
+    assert user.email == "seed@example.com"
+
+
+def test_admin_user_accepts_the_python_names_too() -> None:
+    user = AdminUser(id="u1", banned=False, ban_reason="none", role="member")
+
+    assert user.banned is False
+    assert user.ban_reason == "none"
+    assert user.role == "member"
+
+
+@pytest.mark.parametrize("field", ["role", "banned", "ban_reason", "ban_expires"])
+def test_a_payload_without_the_plugin_reads_none_not_safe(field: str) -> None:
+    """No `admin()` upstream means no columns at all - `None` is *unknown*, never *unbanned*."""
+    user = AdminUser.model_validate(GET_SESSION_USER)
+
+    assert getattr(user, field) is None
+
+
+@pytest.mark.parametrize("banned", ["true", "false", 1, 0, "yes", []], ids=repr)
+def test_a_banned_that_is_not_a_real_bool_is_refused(banned: Any) -> None:
+    """`StrictBool`: a ban flag is never guessed at, and a guess here is a guess in the
+    direction of letting a banned user through (D-182)."""
+    with pytest.raises(ValidationError):
+        AdminUser.model_validate({**ADMIN_WIRE, "banned": banned})
+
+
+@pytest.mark.parametrize("banned", [True, False])
+def test_a_real_bool_banned_is_accepted(banned: bool) -> None:
+    assert AdminUser.model_validate({**ADMIN_WIRE, "banned": banned}).banned is banned
+
+
+def test_a_naive_ban_expiry_is_read_as_utc() -> None:
+    """Same rule as the other upstream timestamps: assume UTC rather than reject (A4)."""
+    user = AdminUser.model_validate({**ADMIN_WIRE, "banExpires": "2026-08-20T15:34:02.764"})
+
+    assert user.ban_expires == CAPTURED_AT
+    assert user.ban_expires is not None and user.ban_expires.tzinfo is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "wire", "limit"), [("role", "role", 255), ("ban_reason", "banReason", 1000)]
+)
+def test_the_admin_string_fields_are_bounded(field: str, wire: str, limit: int) -> None:
+    parsed = AdminUser.model_validate({**ADMIN_WIRE, wire: "x" * limit})
+    assert getattr(parsed, field) == "x" * limit
+
+    with pytest.raises(ValidationError):
+        AdminUser.model_validate({**ADMIN_WIRE, wire: "x" * (limit + 1)})
+
+
+def test_admin_user_dumps_snake_case_like_every_other_user() -> None:
+    dumped = AdminUser.model_validate(ADMIN_WIRE).model_dump(by_alias=True)
+
+    assert "ban_reason" in dumped
+    assert "banReason" not in dumped
+    assert [key for key in dumped if any(char.isupper() for char in key)] == []
+
+
+def test_admin_user_is_frozen_like_its_base() -> None:
+    user = AdminUser.model_validate(ADMIN_WIRE)
+
+    with pytest.raises(ValidationError):
+        user.banned = True
+
+
+def test_admin_user_says_it_is_a_view_and_not_a_decision() -> None:
+    """The docstring is the product: a reader must not mistake `banned` for enforcement."""
+    doc = AdminUser.__doc__ or ""
+
+    assert "admin()" in doc
+    assert "unknown" in doc
+    assert "input: false" in doc
+
+
 # --- Session shape ----------------------------------------------------------------
 
 
 def test_session_carries_the_subclass_through() -> None:
-    user = AdminUser.model_validate({**GET_SESSION_USER, "role": "admin"})
-    session = Session[AdminUser](user=user, expires_at=None, raw=dict(GET_SESSION_USER))
+    user = Member.model_validate({**GET_SESSION_USER, "role": "admin"})
+    session = Session[Member](user=user, expires_at=None, raw=dict(GET_SESSION_USER))
 
-    assert_type(session.user, AdminUser)
+    assert_type(session.user, Member)
     assert session.user.role == "admin"
     assert session.expires_at is None
     assert session.token is None
@@ -208,9 +307,7 @@ def test_session_carries_the_subclass_through() -> None:
 
 def test_a_subclass_session_satisfies_a_base_session_parameter() -> None:
     """D4: without covariance every shared helper would need a cast."""
-    session = Session[AdminUser](
-        user=AdminUser.model_validate(GET_SESSION_USER), expires_at=None, raw={}
-    )
+    session = Session[Member](user=Member.model_validate(GET_SESSION_USER), expires_at=None, raw={})
 
     assert accepts_a_base_session(session) == GET_SESSION_USER["id"]
 
@@ -241,6 +338,37 @@ def test_an_explicit_none_expiry_is_accepted_as_a_deliberate_statement() -> None
 def test_the_raw_payload_is_also_required() -> None:
     with pytest.raises(ValidationError):
         Session[User](user=base_user(), expires_at=None)  # pyright: ignore[reportCallIssue]
+
+
+# --- impersonated_by: provenance, never permission --------------------------------
+
+
+def test_impersonated_by_defaults_to_none() -> None:
+    """A verifier that maps nothing, and every deployment without `admin()`, read `None`."""
+    session = Session[User](user=base_user(), expires_at=None, raw={})
+
+    assert session.impersonated_by is None
+
+
+def test_impersonated_by_carries_the_admin_id_it_was_given() -> None:
+    session = Session[User](user=base_user(), expires_at=None, impersonated_by="admin-1", raw={})
+
+    assert session.impersonated_by == "admin-1"
+
+
+def test_impersonated_by_is_frozen() -> None:
+    session = Session[User](user=base_user(), expires_at=None, raw={})
+
+    with pytest.raises(ValidationError):
+        session.impersonated_by = "admin-1"
+
+
+def test_the_session_docstring_calls_impersonation_provenance() -> None:
+    """A reader who takes this for a permission has been misled by us, not by upstream."""
+    doc = Session.__doc__ or ""
+
+    assert "impersonated_by" in doc
+    assert "provenance" in doc
 
 
 def test_models_are_frozen() -> None:
