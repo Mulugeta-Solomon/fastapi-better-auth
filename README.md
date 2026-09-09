@@ -396,6 +396,67 @@ the raw-token key Better Auth's `secondaryStorage` writes. **A store reads; it n
 `touch`, no `EXPIRE`-on-read — because a write here would extend or resurrect a session this side was
 only asked to verify.
 
+### Is it the same secret? Fingerprint both sides at boot
+
+A secret with the right *shape* and the wrong *value* is accepted at construction and then fails one
+request at a time, as a constant-time comparison miss inside the verifier — the same uniform `401` a
+forged cookie earns, and by default not logged at all. Two deployment configs, two secret stores, one
+stale copy, and the symptom is "nobody can sign in" with nothing anywhere saying why.
+
+`SharedSecret.fingerprint` closes that, and it costs one line on each side. It is `tok_fp=` followed
+by the first eight hex characters of SHA-256 over the secret's UTF-8 bytes: stable for a given value,
+safe to log, and not reversible into the secret.
+
+```python
+import contextlib
+import logging
+from collections.abc import AsyncIterator
+
+from fastapi import FastAPI
+
+from fastapi_better_auth import VERIFIED_BETTER_AUTH, SharedSecret
+
+logger = logging.getLogger("myapp")
+
+# A literal only so this page runs — in production, SharedSecret(os.environ["BETTER_AUTH_SECRET"]).
+secret = SharedSecret("replace-this-with-your-own-32-plus-character-secret")
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    logger.info("better-auth secret %s", secret.fingerprint)
+    logger.info("better-auth verified against %s", VERIFIED_BETTER_AUTH)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+```
+
+Hand that same `secret` object to your `CookieVerifier` (or `RemoteVerifier`): one value, one
+fingerprint, nothing to keep in step. Then print the matching string from your Better Auth server's
+own startup — the identical construction, so the two are comparable by eye:
+
+```ts
+import { createHash } from "node:crypto";
+
+console.log(
+  "better-auth secret tok_fp=" +
+    createHash("sha256").update(process.env.BETTER_AUTH_SECRET, "utf8").digest("hex").slice(0, 8),
+);
+```
+
+The two lines are written to match, prefix and all, so when the secrets match the boot logs read
+identically. **Two different strings is the whole check** — and you have it at deploy time rather
+than in a support ticket an hour later. That the two constructions really do agree, on ASCII and on
+non-ASCII secrets alike, is pinned by `tests/test_shared_secret.py`; neither line gives anything
+back but the label.
+
+**One more line worth logging there.** `VERIFIED_BETTER_AUTH` is the tuple of Better Auth versions
+this release's conformance lane is actually run against — log it beside the Better Auth version your
+own deployment pins, and an upstream bump this library has not been driven against shows up in a boot
+log and in code review instead of in an incident. It is advisory and can only be: Mode A reads a
+database or a Redis key and never the server, so nothing here can ask what is really running.
+
 ### What Mode A refuses, and when
 
 | Check | Behaviour |
@@ -425,17 +486,153 @@ the security requirement appears on the operation. Two honest limits:
 
 ### Deploying across two origins
 
-The common shape is a front end on `app.example.com` and this API on `api.example.com`. For the
-browser to send the cookie cross-origin you configure Better Auth to set it `SameSite=None; Secure`
-in its `__Secure-` prefixed form — which `CookieVerifier` reads by default.
+The common shape is a front end on `app.example.com` and this API on `api.example.com`. Three things
+have to line up before one request works, and only the last of them is this library's:
 
-`SameSite=None` is exactly where CSRF stops being optional. `OriginCheck` is the floor; but a *bare*
-double-submit cookie proves only that the sender could set a cookie, and a sibling subdomain can set
-one on the shared parent domain — so on a shared parent domain reach for `SignedDoubleSubmit`, whose
-token is `HMAC(secret, session_token)`, bound to the session and useless to a sibling. A **non-browser**
-client (mobile, server-to-server) has no `Origin` for `OriginCheck` to trust and belongs on **Mode B**
-(bearer) instead: compose both verifiers and each request picks its own by which credential it
-carries. All of this applies unchanged to Mode C, which reads the same cookie.
+1. **Better Auth sets the session cookie `SameSite=None; Secure`**, in its `__Secure-` prefixed form
+   — which `CookieVerifier` reads by default. Upstream's own default is `sameSite: "lax"`
+   (`better-auth@1.7.1` `dist/cookies/index.mjs:35`), overridden by
+   `advanced.defaultCookieAttributes`, which is spread over those defaults at `:39`. Without
+   `SameSite=None` the browser never attaches the cookie to a cross-origin request at all, and there
+   is nothing on this side to verify.
+2. **FastAPI answers with CORS credentials allowed, from an explicit origin list.** A wildcard is
+   not an option here: a browser refuses a credentialed response whose `Access-Control-Allow-Origin`
+   is `*`, so name the front end you actually serve.
+3. **The cookie mode's CSRF policy allows that same origin.** `SameSite=None` is exactly where CSRF
+   stops being optional, which is why `csrf=` has no default.
+
+Points 2 and 3 are both on this side, and both are in this application:
+
+```python
+from typing import Annotated
+
+from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from fastapi_better_auth import (
+    BetterAuth,
+    CookieVerifier,
+    OriginCheck,
+    Session,
+    SessionStore,
+    SharedSecret,
+    StoredSession,
+    StoredUser,
+    User,
+)
+
+FRONT_END = "https://app.example.com"
+
+
+class DictSessionStore:
+    """The two reads a `SessionStore` is. Empty here; in production, the real store above."""
+
+    def __init__(self) -> None:
+        self.sessions: dict[str, StoredSession] = {}
+        self.users: dict[str, StoredUser] = {}
+
+    async def fetch_session_by_token(self, token: str) -> StoredSession | None:
+        return self.sessions.get(token)
+
+    async def fetch_user_by_id(self, user_id: str) -> StoredUser | None:
+        return self.users.get(user_id)
+
+
+store: SessionStore = DictSessionStore()
+
+auth = BetterAuth(
+    verifiers=[
+        CookieVerifier(
+            # A literal only so this page runs — in production,
+            # SharedSecret(os.environ["BETTER_AUTH_SECRET"]).
+            secret=SharedSecret("replace-this-with-your-own-32-plus-character-secret"),
+            store=store,
+            csrf=OriginCheck(allowed_origins=[FRONT_END]),
+        )
+    ]
+)
+CurrentSession = Annotated[Session[User], Depends(auth.current_session())]
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONT_END],
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["content-type"],
+)
+
+
+@app.post("/comments")
+async def comment(session: CurrentSession) -> dict[str, str]:
+    return {"author": session.user.id}
+```
+
+The browser has to opt in as well, once, wherever your front end calls this API:
+`fetch("https://api.example.com/comments", {method: "POST", credentials: "include"})`. Without
+`credentials: "include"` no cookie is attached and every request arrives anonymous.
+
+**CORS is not the CSRF control, and the two allowlists are not the same control over one list.** A
+cross-site form `POST` is not preflighted: it reaches your route whatever `allow_origins` says,
+carrying the `SameSite=None` cookie with it, and CORS withholds only the *response* from the
+attacker's page. What refuses the request itself is the CSRF policy. Keep the two lists in step —
+and never treat either as standing in for the other.
+
+`OriginCheck` is the floor; but a *bare* double-submit cookie proves only that the sender could set
+a cookie, and a sibling subdomain can set one on the shared parent domain — so on a shared parent
+domain reach for `SignedDoubleSubmit`, whose token is `HMAC(secret, session_token)`, bound to the
+session and useless to a sibling. A **non-browser** client (mobile, server-to-server) has no
+`Origin` for `OriginCheck` to trust and belongs on **Mode B** (bearer) instead: compose both
+verifiers and each request picks its own by which credential it carries. All of this applies
+unchanged to Mode C, which reads the same cookie.
+
+**More than one front end is expected, not exceptional.** `allowed_origins` is a sequence and
+nothing says it holds one entry —
+`OriginCheck(allowed_origins=["https://app.example.com", "https://admin.example.com"])` is a
+two-front-end deployment, and `SignedDoubleSubmit` takes the same argument. Every entry must be an
+origin a page is genuinely served from, **including this API's own origin** when a page served from
+here posts back to it: a same-origin `POST` still carries `Origin`, and an allowlist that omits it
+refuses every one of those requests. An empty list, a bare string, and two spellings of one origin
+are each refused at construction rather than at 3 a.m.
+
+**The other route is upstream: `crossSubDomainCookies`.** Better Auth has a switch that makes the
+session cookie *same-site* for both hosts instead of cross-site:
+`advanced.crossSubDomainCookies`, whose shape is `enabled`, `additionalCookies` and
+`domain` (`@better-auth/core@1.7.1` `dist/types/init-options.d.mts:314-330`). With it on, the cookie
+carries a `Domain=` attribute (`better-auth@1.7.1` `dist/cookies/index.mjs:38`), and a cookie scoped
+to `example.com` is sent to `app.example.com` and `api.example.com` alike.
+
+**Read what the code does with `domain`, not what the option's doc comment says it does.** The
+comment says "By default, the domain will be the root domain from the base URL"
+(`init-options.d.mts:326-327`). The code performs no shortening of any kind: `Domain=` becomes the
+`domain` you configured, or else the **hostname** of your `baseURL` —
+`options.advanced?.crossSubDomainCookies?.domain || (baseURLString ? new URL(baseURLString).hostname : void 0)`
+(`better-auth@1.7.1` `dist/cookies/index.mjs:24-25`). So a `baseURL` of
+`https://api.example.com` with `enabled: true` and no `domain` yields `Domain=api.example.com` — a
+cookie that still never reaches the sibling it was turned on for. **If you enable it, set `domain`
+explicitly.**
+
+Reach for it when the two hosts are siblings under a domain **you own** and one same-site cookie is
+simpler than a cross-site one. Stay on the plain `SameSite=None` path above when they are not
+siblings at all (`example.com` and `example-api.net`), when either host sits on a platform domain
+you do not control (below), or when you would rather not widen the cookie's scope: `Domain=example.com`
+sends it to every subdomain that exists today and every one that ever will, which is a larger blast
+radius than the pair of origins you meant to connect.
+
+> **A platform domain cannot do this.** A `Domain=` attribute may not name a public suffix. RFC 6265
+> §5.3 step 5 is exact about it: a user agent configured to reject public suffixes **ignores the
+> cookie entirely**, unless the attribute is identical to the request host, in which case the cookie
+> is narrowed to that one host. Either way it never reaches a sibling. The Public Suffix List
+> ([publicsuffix.org](https://publicsuffix.org/list/public_suffix_list.dat), fetched 2026-09-09,
+> 16 477 lines) contains `fly.dev` (line 13647), `herokuapp.com` (14020), `up.railway.app` (15425),
+> `onrender.com` (15457) and `vercel.app` (16245). So
+> `yourapp-web.up.railway.app` and `yourapp-api.up.railway.app` **cannot** share a cookie, and
+> neither can two `*.vercel.app` deployments — the browser drops the `Set-Cookie` and nothing in
+> either log says why. No configuration on either side changes it. The fallback that does work there
+> is the plain cross-origin path above: `SameSite=None; Secure`, CORS with credentials, and
+> `OriginCheck`. Put a domain you own in front of both hosts and `crossSubDomainCookies` is back on
+> the table.
 
 ## Quickstart (Mode C — remote get-session)
 
