@@ -9,6 +9,12 @@ drifts from better-auth's.
 Every database here is file-backed, never `:memory:`. SQLAlchemy gives a memory SQLite a
 connection-scoped database, so a second connection - or a worker thread, which is exactly what
 `SyncStoreAdapter` uses - sees an empty one.
+
+`StoreFixture` seeds one of those databases and opens a store of the flavour under test over it.
+Both SQL suites - `test_sqlalchemy_store.py` and `test_sqlalchemy_store_columns.py` - read this one
+copy and keep their own five-line pytest fixture around it, the shape `remote_fixtures.py` uses.
+Two copies of it would be two chances for the async and sync legs to stop agreeing, which is the
+same reason every case runs through both `FLAVOURS`.
 """
 
 from __future__ import annotations
@@ -22,6 +28,8 @@ from typing import Any
 
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+from fastapi_better_auth import SqlAlchemySessionStore, SyncStoreAdapter
 
 NOW = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
 EXPIRES_AT = NOW + timedelta(days=7)
@@ -224,6 +232,61 @@ class StatementLog:
         return frozenset(
             line.split(maxsplit=1)[0].upper() for line in self.statements if line.split()
         )
+
+    @property
+    def selects(self) -> list[str]:
+        """The SELECTs alone: schema discovery emits PRAGMA/reflection traffic around them."""
+        return [line for line in self.statements if line.lstrip().upper().startswith("SELECT")]
+
+
+FLAVOURS = ("async", "sync")
+"""The two SQL adapters. Every case they share runs through both, or the half that drifts is
+exactly the one nobody looked at."""
+
+
+class StoreFixture:
+    """Seed a database, then open a store of the flavour under test over the same file.
+
+    One suite would keep this as a local fixture; two read one copy rather than two that could
+    drift - the same reason `remote_fixtures.py` exists. Each call seeds its own file, so a test
+    may build several, and `aclose()` disposes every engine it opened.
+
+    `store_options` is how a case configures the store rather than the schema: the two table
+    names are read from the schema keywords so a renamed table is seeded and pointed at in one
+    call, and anything else (`user_columns=`, `session_columns=`) is passed straight through.
+    """
+
+    def __init__(self, tmp_path: pathlib.Path, flavour: str) -> None:
+        self._tmp_path = tmp_path
+        self._flavour = flavour
+        self.engines: list[Engine | AsyncEngine] = []
+
+    def __call__(
+        self, store_options: Mapping[str, Any] | None = None, **schema: Any
+    ) -> tuple[SqlAlchemySessionStore | SyncStoreAdapter, StatementLog]:
+        options = {key: schema[key] for key in ("session_table", "user_table") if key in schema}
+        options.update(store_options or {})
+        path = self._tmp_path / f"harness{len(self.engines)}.sqlite"
+        build_schema(path, **schema)
+        log = StatementLog()
+        engine: Engine | AsyncEngine
+        store: SqlAlchemySessionStore | SyncStoreAdapter
+        if self._flavour == "async":
+            engine = async_engine(path)
+            store = SqlAlchemySessionStore(engine=engine, **options)
+        else:
+            engine = sync_engine(path)
+            store = SyncStoreAdapter(engine=engine, **options)
+        log.attach(engine)
+        self.engines.append(engine)
+        return store, log
+
+    async def aclose(self) -> None:
+        for engine in self.engines:
+            if isinstance(engine, AsyncEngine):
+                await engine.dispose()
+            else:
+                engine.dispose()
 
 
 class RecordingRedis:

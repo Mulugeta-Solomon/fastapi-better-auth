@@ -59,11 +59,22 @@ class _CoreStore(ABC):
     """
 
     def __init__(
-        self, *, adapter: str, session_table: str, user_table: str, schema: str | None
+        self,
+        *,
+        adapter: str,
+        session_table: str,
+        user_table: str,
+        schema: str | None,
+        session_columns: Sequence[str] | None,
+        user_columns: Sequence[str] | None,
     ) -> None:
         self._sql = _core(adapter)
         self._schema = schema
         self._names = self._sql.validated_names(session_table, user_table)
+        self._allowed = (
+            self._sql.validated_columns("session_columns", session_columns),
+            self._sql.validated_columns("user_columns", user_columns),
+        )
         self._lock = anyio.Lock()
         self._plan: Plan | None = None
 
@@ -110,9 +121,17 @@ class _CoreStore(ABC):
         if plan is not None:
             return plan
         session, user = self._names
+        session_allowed, user_allowed = self._allowed
         async with self._lock:
             if self._plan is None:
-                self._plan = self._sql.plan_for(session, user, self._schema, await self._columns())
+                self._plan = self._sql.plan_for(
+                    session,
+                    user,
+                    self._schema,
+                    await self._columns(),
+                    session_allowed=session_allowed,
+                    user_allowed=user_allowed,
+                )
             return self._plan
 
     def _reflected(self, connection: Connection) -> dict[str, tuple[str, ...] | None]:
@@ -165,10 +184,20 @@ class SqlAlchemySessionStore(_CoreStore):
     UTC, which is what Better Auth wrote. A column holding local time would be misread by
     exactly its offset.
 
-    **Every column of the two tables is read**, including a deployment's own `additionalFields`,
-    so they reach the record's `payload` the same way they reach the Redis store's. That payload
-    is handed to `parse_user`, so do not store a secret on the `user` or `session` table that a
-    verified request should not see - a column added there is readable through the record.
+    **Every column of the two tables is read by default**, including a deployment's own
+    `additionalFields`, so they reach the record's `payload` the same way they reach the Redis
+    store's. That payload is handed to `parse_user`, so do not store a secret on the `user` or
+    `session` table that a verified request should not see - a column added there is readable
+    through the record.
+
+    **Where the tables are not yours to shape**, `user_columns=` and `session_columns=` name the
+    extra columns that may travel, and nothing else is selected. They are opt-in and change no
+    default. What they never restrict is Better Auth's own set: the required columns are how a
+    session is found at all, and the optional and admin ones carry `banned`, `banExpires` and
+    `impersonatedBy` - a ban is this library's business, not the deployment's. A name the live
+    table does not have is a `ConfigurationError` at discovery, beside the missing-column one.
+    `RedisSessionStore` has no equivalent: it reads one stored JSON document, and a document has
+    no SELECT to narrow.
 
     Args:
         engine: An `AsyncEngine`. Always injected, never built here: the pool, the TLS
@@ -177,11 +206,18 @@ class SqlAlchemySessionStore(_CoreStore):
         session_table: The session table's name, for a deployment that renamed it upstream.
         user_table: The user table's name.
         schema: The database schema both tables live in, or `None` for the connection's default.
+        session_columns: The extra session columns that may be selected, or `None` (the default)
+            for every column. Better Auth's own columns are always selected; a single string is
+            refused rather than iterated one character at a time.
+        user_columns: The same for the user table - the columns beyond Better Auth's own that a
+            verified request's `session.user` may carry.
 
     Raises:
         ConfigurationError: If `sqlalchemy` is not installed, if `engine` is not an
-            `AsyncEngine`, if either table name is blank or the two are the same, or - from
-            `connect()` or the first lookup - if the schema cannot answer a lookup at all.
+            `AsyncEngine`, if either table name is blank or the two are the same, if either
+            allow-list is not a sequence of distinct non-blank names, or - from `connect()` or
+            the first lookup - if the schema cannot answer a lookup at all or an allow-list
+            names a column the table does not have.
     """
 
     def __init__(
@@ -191,12 +227,16 @@ class SqlAlchemySessionStore(_CoreStore):
         session_table: str = "session",
         user_table: str = "user",
         schema: str | None = None,
+        session_columns: Sequence[str] | None = None,
+        user_columns: Sequence[str] | None = None,
     ) -> None:
         super().__init__(
             adapter="SqlAlchemySessionStore",
             session_table=session_table,
             user_table=user_table,
             schema=schema,
+            session_columns=session_columns,
+            user_columns=user_columns,
         )
         self._engine = self._sql.validated_async_engine(engine)
 
@@ -237,7 +277,8 @@ class SyncStoreAdapter(_CoreStore):
 
     Every rule `SqlAlchemySessionStore` publishes holds here unchanged: read-only, one statement
     for the session and its user, the schema discovered once, admin columns surfaced where they
-    exist, naive timestamps read as UTC.
+    exist, naive timestamps read as UTC, and the same opt-in `user_columns` / `session_columns`
+    allow-lists over the extra columns a deployment's own tables carry.
 
     **Concurrent lookups are bounded by this adapter, not by the process-wide thread pool.** Each
     lookup runs its DBAPI call on a worker thread that checks out one pooled connection; without a
@@ -254,14 +295,19 @@ class SyncStoreAdapter(_CoreStore):
         session_table: The session table's name.
         user_table: The user table's name.
         schema: The database schema both tables live in, or `None`.
+        session_columns: The extra session columns that may be selected, or `None` (the default)
+            for every column. Better Auth's own columns are always selected.
+        user_columns: The same for the user table.
         max_concurrency: The most lookups that may run on worker threads at once. `None` (the
             default) sizes the bound to the engine's connection pool where that is introspectable,
             and otherwise to a conservative default; pass a positive int to set it explicitly.
 
     Raises:
         ConfigurationError: If `sqlalchemy` is not installed, if `engine` is an `AsyncEngine` or
-            not an `Engine` at all, if either table name is blank or the two are the same, or if
-            `max_concurrency` is not a positive int.
+            not an `Engine` at all, if either table name is blank or the two are the same, if
+            either allow-list is not a sequence of distinct non-blank names, if `max_concurrency`
+            is not a positive int, or - at discovery - if an allow-list names a column the table
+            does not have.
     """
 
     def __init__(
@@ -271,6 +317,8 @@ class SyncStoreAdapter(_CoreStore):
         session_table: str = "session",
         user_table: str = "user",
         schema: str | None = None,
+        session_columns: Sequence[str] | None = None,
+        user_columns: Sequence[str] | None = None,
         max_concurrency: int | None = None,
     ) -> None:
         super().__init__(
@@ -278,6 +326,8 @@ class SyncStoreAdapter(_CoreStore):
             session_table=session_table,
             user_table=user_table,
             schema=schema,
+            session_columns=session_columns,
+            user_columns=user_columns,
         )
         self._engine = self._sql.validated_sync_engine(engine)
         self._limiter_tokens = _limiter_tokens(

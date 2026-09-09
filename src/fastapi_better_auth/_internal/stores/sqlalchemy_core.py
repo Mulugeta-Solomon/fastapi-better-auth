@@ -23,7 +23,7 @@ from __future__ import annotations
 import hmac
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import (
     Boolean,
@@ -100,8 +100,22 @@ MISSING_REQUIRED = (
     " cannot be found without them, so every request would fail at the database instead of"
     " here. Run the Better Auth migration, or point the store at the table that has them."
 )
+UNKNOWN_COLUMN = (
+    "table {table} has no column {columns}, which the allow-list passed for it names. Every name"
+    " on an allow-list has to exist on the table it belongs to - check the spelling against the"
+    " live schema, or take the name off the list."
+)
 BLANK_NAME = "{parameter} must be a non-empty table name; got {value!r}."
 SAME_NAME = "session_table and user_table are both {value!r}; they name two different tables."
+NOT_A_SEQUENCE = (
+    "{parameter} must be a sequence of column names, or None to read every column; got {actual}."
+)
+ONE_STRING = (
+    "{parameter} must be a sequence of column names, not a single string: {value!r} would be"
+    " iterated one character at a time. Pass [{value!r}] to name one column."
+)
+BLANK_COLUMN = "{parameter} must hold non-empty column names; got {value!r}."
+REPEATED_COLUMN = "{parameter} names {value!r} more than once."
 WRONG_ENGINE = "engine must be a SQLAlchemy {expected}; got {actual}. {advice}"
 ASYNC_ADVICE = (
     "Build one with create_async_engine(...) and an async driver (postgresql+asyncpg,"
@@ -143,6 +157,32 @@ def validated_names(session_table: object, user_table: object) -> tuple[str, str
     return session_name, user_name
 
 
+def validated_columns(parameter: str, value: object) -> tuple[str, ...] | None:
+    """An allow-list of extra columns, checked at construction; `None` reads every column.
+
+    A bare string is the mistake worth its own message: `Sequence[str]` accepts one, and iterating
+    it yields single characters, so the failure would otherwise surface as a discovery error about
+    a column called `t`. A set is refused because order is what puts a deployment's own columns
+    after the ones this library knows, and a set has none to give.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        raise ConfigurationError(ONE_STRING.format(parameter=parameter, value=value))
+    if not isinstance(value, Sequence):
+        raise ConfigurationError(
+            NOT_A_SEQUENCE.format(parameter=parameter, actual=type(value).__name__)
+        )
+    names: list[str] = []
+    for name in cast("Sequence[object]", value):
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigurationError(BLANK_COLUMN.format(parameter=parameter, value=name))
+        if name in names:
+            raise ConfigurationError(REPEATED_COLUMN.format(parameter=parameter, value=name))
+        names.append(name)
+    return tuple(names)
+
+
 def _column(name: str) -> Column[Any]:
     """Typed where this library knows the type, and deliberately untyped where it does not.
 
@@ -160,7 +200,15 @@ def _column(name: str) -> Column[Any]:
     return Column(name)
 
 
-def plan_for(session_table: str, user_table: str, schema: str | None, present: Columns) -> Plan:
+def plan_for(
+    session_table: str,
+    user_table: str,
+    schema: str | None,
+    present: Columns,
+    *,
+    session_allowed: tuple[str, ...] | None = None,
+    user_allowed: tuple[str, ...] | None = None,
+) -> Plan:
     """Decide what to select, refusing a schema no lookup could work against.
 
     Three outcomes, and the difference between them is the whole point. An absent *table*, or a
@@ -176,11 +224,27 @@ def plan_for(session_table: str, user_table: str, schema: str | None, present: C
     they reach the Redis store's - which reads the whole stored object and could not drop them
     if it tried. Two adapters behind one Protocol answering different payloads for the same
     session is a difference nobody would see until it mattered.
+
+    An allow-list narrows exactly that tail and nothing else. A shared-database deployment does
+    not always own the `user` table, and a column another service put there reaches the verified
+    session; naming the extras that may travel is how it says so. What an allow-list may never
+    reach is Better Auth's own set - the required columns are how a session is found at all, and
+    `banned` / `banExpires` / `impersonatedBy` are this library's business, so a list that could
+    switch one off would be a way to configure the ban check into silence. A name the table does
+    not have is refused here, beside the missing-required refusal, because a typo that quietly
+    narrowed every payload would look exactly like a column that was never there.
     """
     session_columns = _accepted(
-        session_table, present, SESSION_REQUIRED, SESSION_OPTIONAL, SESSION_ADMIN
+        session_table,
+        present,
+        SESSION_REQUIRED,
+        SESSION_OPTIONAL,
+        SESSION_ADMIN,
+        allowed=session_allowed,
     )
-    user_columns = _accepted(user_table, present, USER_REQUIRED, USER_OPTIONAL, USER_ADMIN)
+    user_columns = _accepted(
+        user_table, present, USER_REQUIRED, USER_OPTIONAL, USER_ADMIN, allowed=user_allowed
+    )
     metadata = MetaData(schema=schema)
     session = Table(session_table, metadata, *(_column(name) for name in session_columns))
     user = Table(user_table, metadata, *(_column(name) for name in user_columns))
@@ -198,6 +262,8 @@ def _accepted(
     required: tuple[str, ...],
     optional: tuple[str, ...],
     admin: tuple[str, ...],
+    *,
+    allowed: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
     columns = present.get(table)
     if columns is None:
@@ -205,11 +271,24 @@ def _accepted(
     absent = tuple(name for name in required if name not in columns)
     if absent:
         raise ConfigurationError(MISSING_REQUIRED.format(table=table, columns=", ".join(absent)))
+    if allowed is not None:
+        unknown = tuple(name for name in allowed if name not in columns)
+        if unknown:
+            raise ConfigurationError(UNKNOWN_COLUMN.format(table=table, columns=", ".join(unknown)))
     drift = tuple(name for name in optional if name not in columns)
     if drift:
         drifted(table, drift)
     known = required + tuple(name for name in optional + admin if name in columns)
-    return known + tuple(name for name in columns if name not in known)
+    return known + _extras(columns, known, allowed)
+
+
+def _extras(
+    columns: tuple[str, ...], known: tuple[str, ...], allowed: tuple[str, ...] | None
+) -> tuple[str, ...]:
+    """The tail: every other column in the database's own order, or only the named ones."""
+    return tuple(
+        name for name in columns if name not in known and (allowed is None or name in allowed)
+    )
 
 
 def _session_statement(

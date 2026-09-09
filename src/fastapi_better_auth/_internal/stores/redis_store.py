@@ -124,6 +124,11 @@ class RedisSessionStore:
     your keyspace (a client built from `url=` also does redis-py's own `HELLO`/`CLIENT SETINFO`
     handshake on connect, which touches no key).
 
+    **There is no column allow-list here.** The two SQL stores take `user_columns=` /
+    `session_columns=` to narrow what a shared `user` table hands a verified request; this one
+    reads one stored JSON document whole, and a document has no SELECT to narrow. What Better Auth
+    puts in `secondaryStorage` is what a record carries.
+
     **A value it cannot read is a miss, with a warning naming a fingerprint of the key.** Not
     JSON, not an object, no session, no user, no usable `expiresAt`, or a stored session naming a
     *different* token than the key it was found under: all of them answer `None`. The last is
