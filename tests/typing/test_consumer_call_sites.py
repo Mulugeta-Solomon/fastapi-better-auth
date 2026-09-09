@@ -30,6 +30,7 @@ from typing_extensions import assert_type
 from fastapi_better_auth import (
     BetterAuth,
     JwtVerifier,
+    Membership,
     Session,
     SharedSecret,
     User,
@@ -57,6 +58,29 @@ MaybeAdmin = Annotated[
 ]
 CurrentUser = Annotated[Session[User], Depends(auth.current_session())]
 MaybeUser = Annotated[Session[User] | None, Depends(auth.optional_session())]
+
+
+class Member(User):
+    """The user model the authorization helpers are parameterized on."""
+
+    role: str | None = None
+
+
+def is_editor(session: Session[Member]) -> bool:
+    return session.user.role == "editor"
+
+
+async def member_of(resource_id: str, session: Session[Member]) -> str | None:
+    return f"{session.user.id}:{resource_id}"
+
+
+Editor = Annotated[
+    Session[Member], Depends(auth.require(is_editor, reason="editor role", user_model=Member))
+]
+Scoped = Annotated[
+    Membership[Member, str],
+    Depends(auth.require_membership("org_id", member_of, reason="org member", user_model=Member)),
+]
 
 
 # --- the session a route body receives -------------------------------------------------
@@ -95,6 +119,28 @@ async def read_default(session: CurrentUser) -> dict[str, str]:
 async def read_default_maybe(session: MaybeUser) -> dict[str, str | None]:
     assert_type(session, Session[User] | None)
     return {"id": None if session is None else session.user.id}
+
+
+async def read_editor(session: Editor) -> dict[str, str]:
+    """`require` hands the route the same session `current_session` would, parameterized on the
+    same user model - so nothing downstream has to re-narrow what it was already given."""
+    assert_type(session, Session[Member])
+    assert_type(session.user, Member)
+    assert_type(session.user.role, str | None)
+    assert_type(session.user, User)  # pyright: ignore[reportAssertTypeFailure]
+    return {"id": session.user.id, "role": session.user.role or ""}
+
+
+async def read_scoped(access: Scoped) -> dict[str, str]:
+    """`require_membership` hands the route the grant its own lookup returned, typed - which is
+    the whole reason the result is a container rather than the session again."""
+    assert_type(access, Membership[Member, str])
+    assert_type(access.session, Session[Member])
+    assert_type(access.session.user, Member)
+    assert_type(access.resource_id, str)
+    assert_type(access.grant, str)
+    assert_type(access.grant, str | None)  # pyright: ignore[reportAssertTypeFailure]
+    return {"id": access.session.user.id, "grant": access.grant}
 
 
 # --- the types around the session -------------------------------------------------------
@@ -137,6 +183,8 @@ app.add_api_route("/admin", read_admin, methods=["GET"])
 app.add_api_route("/admin-maybe", read_admin_maybe, methods=["GET"])
 app.add_api_route("/default", read_default, methods=["GET"])
 app.add_api_route("/default-maybe", read_default_maybe, methods=["GET"])
+app.add_api_route("/editor", read_editor, methods=["GET"])
+app.add_api_route("/orgs/{org_id}/invoices", read_scoped, methods=["GET"])
 
 
 def test_every_asserted_call_site_is_a_route_that_answers() -> None:
@@ -150,6 +198,17 @@ def test_every_asserted_call_site_is_a_route_that_answers() -> None:
     assert admin.json() == {"id": "u1", "role": "admin"}
     assert anonymous.json() == {"id": None}
     assert default.json() == {"id": "u1"}
+
+
+def test_the_authorization_call_sites_are_routes_that_answer() -> None:
+    """`require` refuses the fake's user (its role is `admin`, not `editor`); the membership
+    route answers, so both asserted call sites are reachable rather than merely type-checked."""
+    with client(app) as http:
+        refused = http.get("/editor", headers={HEADER: GOOD_CREDENTIAL})
+        scoped = http.get("/orgs/acme/invoices", headers={HEADER: GOOD_CREDENTIAL})
+
+    assert refused.status_code == 403
+    assert scoped.json() == {"id": "u1", "grant": "u1:acme"}
 
 
 def test_the_surrounding_types_are_exercised_too() -> None:

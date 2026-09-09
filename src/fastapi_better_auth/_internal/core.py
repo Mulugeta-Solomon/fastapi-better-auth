@@ -6,18 +6,14 @@ import contextlib
 import inspect
 import logging
 import os
-import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from typing import Any, NoReturn, TypeVar, cast
-
-if sys.version_info >= (3, 11):  # pragma: no cover - one branch per interpreter
-    from builtins import BaseExceptionGroup
-else:  # pragma: no cover - one branch per interpreter
-    from exceptiongroup import BaseExceptionGroup
 
 from fastapi import Depends
 from starlette.requests import HTTPConnection
 
+from .authz import Membership, membership_dependency, require_dependency
+from .containment import unwrapped
 from .errors import (
     AmbiguousCredentials,
     BetterAuthError,
@@ -33,19 +29,20 @@ from .verifiers import PreparedVerifier, Verifier
 logger = logging.getLogger("fastapi_better_auth")
 
 BASE_URL_ENV = "BETTER_AUTH_URL"
-GROUP_TYPES: tuple[type[BaseException], ...] = (BaseExceptionGroup,)
 
 BARE_FACTORY = (
-    "current_session / optional_session was passed to Depends() without being called. Write"
-    " Depends(auth.current_session()) or Depends(auth.optional_session()) - with the"
-    " parentheses. Passed bare, the factory itself becomes the dependency: FastAPI calls it,"
-    " discards the dependency it returns, and nothing verifies the request. At router level"
-    " that is a silent bypass of every route under the router, so it is refused rather than"
-    " run: while the route is being registered, or on the first request touching it if the"
-    " factory was assigned into app.dependency_overrides."
+    "current_session / optional_session / require / require_membership was passed to Depends()"
+    " without being called. Write Depends(auth.current_session()), Depends(auth.optional_session()),"
+    " Depends(auth.require(...)) or Depends(auth.require_membership(...)) - with the parentheses."
+    " Passed bare, the factory itself becomes the dependency: FastAPI calls it, discards the"
+    " dependency it returns, and nothing verifies or authorizes the request. At router level that"
+    " is a silent bypass of every route under the router, so it is refused rather than run: while"
+    " the route is being registered, or on the first request touching it if the factory was"
+    " assigned into app.dependency_overrides."
 )
 
 UserModelT = TypeVar("UserModelT", bound=User)
+GrantT = TypeVar("GrantT")
 
 Resolver = Callable[[HTTPConnection], Awaitable["Session[Any] | None"]]
 Dependency = Callable[..., Awaitable[Any]]
@@ -335,6 +332,140 @@ class BetterAuth:
             cached = self._optional.setdefault(user_model, self._allow(user_model))
         return cast("Callable[..., Awaitable[Session[UserModelT] | None]]", cached)
 
+    def require(
+        self,
+        predicate: Callable[[Session[UserModelT]], bool],
+        *,
+        reason: str,
+        user_model: type[UserModelT] = User,
+        _guard: _NotADependency = NOT_A_DEPENDENCY,
+    ) -> Callable[..., Awaitable[Session[UserModelT]]]:
+        """Build a dependency that requires a verified session *and* a rule about it.
+
+            Editor = Annotated[
+                Session[Member],
+                Depends(auth.require(is_editor, reason="editor role", user_model=Member)),
+            ]
+
+            @app.get("/drafts")
+            async def drafts(session: Editor) -> list[str]:
+                ...
+
+        Build it once, at module level, beside the `Annotated` aliases - each call makes a new
+        dependency, so building one per request would defeat FastAPI's per-request cache.
+        Composed on `current_session(user_model=...)`, which is memoized, so a route declaring
+        both the session and the gate still verifies exactly once.
+
+        **Authentication first.** An anonymous request is `MissingCredential` and a forged one
+        is `InvalidCredential` - both `401` - and neither reaches `predicate`. Only a request
+        that has proved who it is can be told it may not do something, which is what keeps the
+        `403` from being an oracle for which credentials this deployment accepts.
+
+        **Only `True` passes.** `predicate` is synchronous and its answer is compared with
+        `is True`, so a truthy accident - a database row, a non-empty error string, a coroutine
+        object - refuses instead of admitting. An `async def` predicate is a
+        `ConfigurationError` rather than a permanent, silent `403` for the same reason: its
+        coroutine is always truthy and never `True`.
+
+        **A predicate that raises fails closed.** The traceback is logged and the request is
+        answered `NotAuthorized`, because a `500` is the one request-time answer a client can
+        tell apart from every other. A `SessionError` or a `BetterAuthError` the predicate
+        raised on purpose is re-raised as itself, so a refusal you chose keeps its own shape.
+
+        Args:
+            predicate: A synchronous callable taking the `Session` and answering `True` to
+                allow the request. It never sees the connection: an authorization rule that
+                read a header or a URL would be reading attacker-influenced input.
+            reason: What this rule is, in the operator's own words. It reaches `.reason`, a
+                registered handler and your logs - together with the user id - and never the
+                client. Required and non-blank.
+            user_model: The `User` subclass to parse the upstream payload into; the returned
+                dependency is typed `Session[user_model]`.
+
+        Returns:
+            A dependency callable to pass to `Depends`, resolving to `Session[user_model]`.
+
+        Raises:
+            ConfigurationError: At build time, if `predicate` is not callable, `reason` is
+                blank, or `user_model` is not a `User` subclass; while a route is being
+                registered, if this factory was passed to `Depends` or `Security` without
+                being called; at request time, if `predicate` answers with an awaitable.
+            NotAuthorized: At request time, when the predicate does not answer `True`, or
+                raises anything this library does not honour.
+        """
+        current = self.current_session(user_model=user_model)
+        built = require_dependency(current, predicate, reason)
+        return cast("Callable[..., Awaitable[Session[UserModelT]]]", built)
+
+    def require_membership(
+        self,
+        id_param: str,
+        member: Callable[[str, Session[UserModelT]], Awaitable[GrantT | None]],
+        *,
+        reason: str,
+        user_model: type[UserModelT] = User,
+        _guard: _NotADependency = NOT_A_DEPENDENCY,
+    ) -> Callable[..., Awaitable[Membership[UserModelT, GrantT]]]:
+        """Build a dependency that scopes a verified session to *this request's* resource.
+
+            async def member_of(org_id: str, session: Session[Member]) -> str | None:
+                ...  # your query; None means "not a member"
+
+            OrgMember = Annotated[
+                Membership[Member, str],
+                Depends(
+                    auth.require_membership(
+                        "org_id", member_of, reason="organization member", user_model=Member
+                    )
+                ),
+            ]
+
+            @app.get("/orgs/{org_id}/invoices")
+            async def invoices(access: OrgMember) -> list[str]:
+                ...
+
+        **The resource id comes from the request.** `id_param` becomes a required `str`
+        parameter of this dependency, so FastAPI resolves it from the path when the route
+        declares one by that name - and from the query string when it does not. It never comes
+        from a session field: `activeOrganizationId` records which organization the client last
+        selected, not which one this request is about, and authorizing on it lets any member of
+        any organization read every organization's data.
+
+        **Membership is your query.** This library owns no database, so `member` is a coroutine
+        you write; whatever it returns other than `None` or `False` is the grant - a role, a
+        row, a set of scopes - and it reaches the route on `Membership.grant`, typed.
+
+        Build it once at module level, like `require`. Composed on
+        `current_session(user_model=...)`, so authentication happens first and exactly once.
+
+        Args:
+            id_param: The name FastAPI should bind the resource id to. A Python identifier,
+                and not `session` or `connection`, which this dependency uses itself.
+            member: An `async` callable taking the resource id and the `Session`, answering the
+                grant, or `None` / `False` for no membership. It never sees the connection.
+            reason: What this rule is, in the operator's own words. It reaches `.reason` and
+                your logs - with the user id and the sanitized resource id - and never the
+                client. Required and non-blank.
+            user_model: The `User` subclass to parse the upstream payload into.
+
+        Returns:
+            A dependency callable to pass to `Depends`, resolving to
+            `Membership[user_model, grant]`.
+
+        Raises:
+            ConfigurationError: At build time, if `id_param` is not a usable parameter name,
+                `member` is not callable, `reason` is blank, or `user_model` is not a `User`
+                subclass; while a route is being registered, if this factory was passed to
+                `Depends` or `Security` without being called; at request time, if `member`
+                answers with something that is not awaitable.
+            NotAuthorized: At request time, when the resource id is not a usable identifier,
+                when `member` answers `None` or `False`, or when it raises anything this
+                library does not honour.
+        """
+        current = self.current_session(user_model=user_model)
+        built = membership_dependency(current, id_param, member, reason)
+        return cast("Callable[..., Awaitable[Membership[UserModelT, GrantT]]]", built)
+
     def _require(self, user_model: type[UserModelT]) -> Dependency:
         resolve = self._resolver_for(user_model)
 
@@ -443,17 +574,6 @@ async def _verified(verifier: Verifier, credential: object, user_model: type[Use
         credential = None
 
 
-def _unwrapped(exc: BaseException) -> BaseException:
-    """A task group with one failing child delivers a group whose single leaf is the answer."""
-    leaf = exc
-    while isinstance(leaf, GROUP_TYPES):
-        nested: tuple[BaseException, ...] = getattr(leaf, "exceptions", ())
-        if len(nested) != 1:
-            break
-        leaf = nested[0]
-    return leaf
-
-
 def _resolved(
     exc: Exception,
     verifier: Verifier,
@@ -472,7 +592,7 @@ def _resolved(
     its class, status, headers and `reason` all survive. A group with more than one leaf is
     not one verifier's answer, so it stays contained rather than guessed at.
     """
-    leaf = _unwrapped(exc)
+    leaf = unwrapped(exc)
     if isinstance(leaf, honoured):
         return leaf
     return _contained(leaf, verifier, method)

@@ -22,19 +22,24 @@ from typing import Any
 
 import anyio
 import pytest
+from pydantic import SecretStr
 
 from fastapi_better_auth import (
     AuthServiceUnavailable,
     BetterAuth,
     CookieVerifier,
     CsrfDisabled,
+    NotAuthorized,
     RedisSessionStore,
+    Session,
     SessionError,
     SharedSecret,
     SyncStoreAdapter,
     TransportResponse,
+    User,
 )
 from fastapi_better_auth._internal import remote_probe
+from fastapi_better_auth._internal.authz import permitted
 from fastapi_better_auth._internal.jwks import JwksClient
 from fastapi_better_auth._internal.once import Once
 from fastapi_better_auth._internal.reasons import REDACTED, fingerprint
@@ -118,6 +123,33 @@ async def test_a_verifier_that_leaks_into_its_own_exception_is_not_contained_by_
 
     assert token in rendered(records), "retune this probe: the leak it documents did not happen"
     assert token not in caught.value.reason, "the reason this library built must still be clean"
+
+
+def test_an_escaped_authorization_callback_logs_no_credential(
+    records: list[logging.LogRecord],
+) -> None:
+    """`authz` logs the traceback of a predicate or a membership lookup that raised. The session
+    it was handed carries the raw cookie-mode token, under `Session.token` and again inside
+    `Session.raw`, so that token is what this line must not carry - and the reason it builds
+    names the exception type and nothing the consumer's own message said."""
+    token = SIGNER.sign(claims(issuer=ORIGIN))
+    session: Session[User] = Session(
+        user=User(id=STORED_USER_ID),
+        expires_at=None,
+        token=SecretStr(token),
+        raw={"token": token},
+    )
+
+    def explode(_session: Session[User]) -> bool:
+        raise RuntimeError("the policy table could not be read")
+
+    with pytest.raises(NotAuthorized) as caught:
+        permitted(explode, session)
+
+    assert_template_fired(records, manifest_site("the %s raised"))
+    assert_no_leak(records, token)
+    assert "RuntimeError" in caught.value.reason
+    assert token not in caught.value.reason
 
 
 @pytest.mark.anyio

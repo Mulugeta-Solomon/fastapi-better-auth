@@ -184,6 +184,11 @@ COVERED_BY: Mapping[LogSite, str] = {
         template="%s.%s raised",
     ): "test_a_contained_verifier_escape_logs_no_credential",
     LogSite(
+        module="authz",
+        level="exception",
+        template="the %s raised",
+    ): "test_an_escaped_authorization_callback_logs_no_credential",
+    LogSite(
         module="jwks",
         level="warning",
         template="jwks refresh failed for %s; serving the key set on hand",

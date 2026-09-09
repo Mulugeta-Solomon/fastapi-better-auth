@@ -7,6 +7,7 @@ verified here. Everything importable from this module is public API; everything 
 See https://github.com/Mulugeta-Solomon/fastapi-better-auth for status.
 """
 
+from ._internal.authz import Membership
 from ._internal.cookie_verifier import CookieVerifier
 from ._internal.core import BetterAuth
 from ._internal.csrf import (
@@ -25,6 +26,7 @@ from ._internal.errors import (
     CsrfFailure,
     InvalidCredential,
     MissingCredential,
+    NotAuthorized,
     SessionError,
     SessionExpired,
     SessionRevoked,
@@ -70,7 +72,9 @@ __all__ = [
     "HttpxTransport",
     "InvalidCredential",
     "JwtVerifier",
+    "Membership",
     "MissingCredential",
+    "NotAuthorized",
     "OriginCheck",
     "PreparedVerifier",
     "RedisSessionStore",
