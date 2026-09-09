@@ -225,14 +225,7 @@ def plan_for(
     if it tried. Two adapters behind one Protocol answering different payloads for the same
     session is a difference nobody would see until it mattered.
 
-    An allow-list narrows exactly that tail and nothing else. A shared-database deployment does
-    not always own the `user` table, and a column another service put there reaches the verified
-    session; naming the extras that may travel is how it says so. What an allow-list may never
-    reach is Better Auth's own set - the required columns are how a session is found at all, and
-    `banned` / `banExpires` / `impersonatedBy` are this library's business, so a list that could
-    switch one off would be a way to configure the ban check into silence. A name the table does
-    not have is refused here, beside the missing-required refusal, because a typo that quietly
-    narrowed every payload would look exactly like a column that was never there.
+    An allow-list narrows exactly that tail and nothing else; `_extras` carries that rule.
     """
     session_columns = _accepted(
         session_table,
@@ -285,7 +278,17 @@ def _accepted(
 def _extras(
     columns: tuple[str, ...], known: tuple[str, ...], allowed: tuple[str, ...] | None
 ) -> tuple[str, ...]:
-    """The tail: every other column in the database's own order, or only the named ones."""
+    """The tail: every other column in the database's own order, or only the named ones.
+
+    A shared-database deployment does not always own the `user` table, and a column another
+    service put there reaches the verified session; naming the extras that may travel is how it
+    says so. What an allow-list may never reach is Better Auth's own set - the required columns
+    are how a session is found at all, and `banned` / `banExpires` / `impersonatedBy` are this
+    library's business, so a list that could switch one off would be a way to configure the ban
+    check into silence. A name the table does not have is refused in `_accepted`, beside the
+    missing-required refusal, because a typo that quietly narrowed every payload would look
+    exactly like a column that was never there.
+    """
     return tuple(
         name for name in columns if name not in known and (allowed is None or name in allowed)
     )

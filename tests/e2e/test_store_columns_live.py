@@ -11,7 +11,7 @@ is set on a user this module signed up for itself. Never the seed user: every ot
 An unknown column is silent at discovery (D-156), so no other lane can see the window this holds
 open either way.
 
-A module of its own: `user_columns` is a post-0.3.0 keyword, and a module that names it must skip
+A module of its own: `user_columns` is a post-0.4.0 keyword, and a module that names it must skip
 on the published wheel rather than raise - which is what the guard below and the feature-detect
 after it do (the `test_cookie_live.py` / `test_remote_gate_live.py` pattern, D-256).
 
@@ -50,7 +50,7 @@ except ImportError:
 
 if "user_columns" not in inspect.signature(SqlAlchemySessionStore.__init__).parameters:
     pytest.skip(
-        "this build of fastapi-better-auth-bridge predates user_columns (added after 0.3.0)",
+        "this build of fastapi-better-auth-bridge predates user_columns (added after 0.4.0)",
         allow_module_level=True,
     )
 
