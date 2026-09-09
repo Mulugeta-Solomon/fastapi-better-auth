@@ -252,6 +252,26 @@ def test_the_optional_dependency_needs_its_own_entry(client_backend: str) -> Non
     assert verifier.verify_calls == 1
 
 
+def test_the_optional_route_answers_the_absence_without_verifying(client_backend: str) -> None:
+    """The other half of the optional route: no override, no credential, and a 200 all the same.
+
+    A suite that installs the override on every test never sees this answer, and the route that
+    serves it is the one a consumer copies. Anonymity has to reach the handler as `None` — not as
+    a 401 and not as an exception — having asked the verifiers for a credential exactly once and
+    verified nothing, because there was nothing to verify.
+    """
+    verifier, auth = one_verifier()
+    app = read_optional_session(auth)
+
+    with client(app, client_backend) as http:
+        answer = http.get("/me")
+
+    assert answer.status_code == 200, answer.text
+    assert answer.json() == {"id": None, "role": None}
+    assert verifier.extract_calls == 1
+    assert verifier.verify_calls == 0
+
+
 def test_an_override_for_another_user_model_reaches_nothing(client_backend: str) -> None:
     """Two user models are two memoized dependencies, so the key has to name the right one.
 
