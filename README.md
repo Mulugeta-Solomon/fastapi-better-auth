@@ -870,6 +870,146 @@ lookup — each answered as the uniform refusal rather than a `500`, so the log 
 real exception exists. The `reason` those build names the exception's *type* and not its message.
 None of these lines carries a raw token, a cookie value or a signature.
 
+### Your own error envelope
+
+If your API wraps every response in a house envelope, the same handler that logs `exc.reason` is
+where you reshape the body. Read exactly three things off the exception — `exc.response_status`,
+`exc.response_detail` and `exc.response_headers` — and the envelope inherits the uniformity the
+default body has:
+
+```python
+import logging
+from typing import Annotated, Any
+
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from fastapi_better_auth import BetterAuth, JwtVerifier, Session, SessionError, User
+
+logger = logging.getLogger("myapp.auth")
+
+auth = BetterAuth(verifiers=[JwtVerifier(base_url="https://auth.example.com")])
+CurrentSession = Annotated[Session[User], Depends(auth.current_session())]
+
+app = FastAPI()
+
+
+@app.exception_handler(SessionError)
+async def envelope(request: Request, exc: SessionError) -> JSONResponse:
+    logger.warning("%s: %s", type(exc).__name__, exc.reason)
+    return JSONResponse(
+        status_code=exc.response_status,
+        content={
+            "success": False,
+            "data": None,
+            "error": {"code": exc.response_status, "message": exc.response_detail},
+        },
+        headers=exc.response_headers,
+    )
+
+
+@app.get("/me")
+async def me(session: CurrentSession) -> dict[str, Any]:
+    return {"success": True, "data": {"id": session.user.id}, "error": None}
+```
+
+Those three constants are per *status*, not per class: every 401 this library raises — missing,
+malformed, expired, revoked, unreachable auth service — carries the same `401`, the same
+`"Not authenticated"` and the same `WWW-Authenticate: Bearer`, so a handler that reads only them
+cannot produce two distinguishable answers however many exception classes it is handed. The
+envelope changes the shape of the body, not the number of bodies.
+
+**The anti-pattern: `type(exc).__name__` or `exc.reason` in the response.** Either one hands a
+client the oracle the uniform body exists to remove — one lets an unauthenticated caller sort
+"expired" from "forged" from "no such session", the other adds the identifiers and fingerprints a
+`reason` is allowed to carry. Both belong in the log line above them, which is why that line takes
+the class name and the reason and the response takes neither. The same rule covers branching:
+a handler with an `if isinstance(exc, SessionExpired)` arm is distinguishable even if every branch
+looks innocent on its own.
+
+**Forward `headers=`.** `WWW-Authenticate: Bearer` is the 401's challenge, and dropping it makes a
+correct client stop re-authenticating. `exc.response_headers` is `None` for the `400` and the `403`,
+which `JSONResponse` accepts, so the one spelling is right for every status. There is no helper for
+any of this on purpose: an envelope is your shape, not one this library could usefully template,
+and three constants read off the exception is a handler a reviewer can audit in one sitting.
+
+## Testing
+
+Override `auth.current_session()` — **called**, with the parentheses — and your tests run as
+whatever session you hand back, with no token, no key set and no upstream:
+
+```python
+from datetime import datetime, timedelta, timezone
+from typing import Annotated
+
+from fastapi import Depends, FastAPI
+
+from fastapi_better_auth import BetterAuth, JwtVerifier, Session, User
+
+auth = BetterAuth(verifiers=[JwtVerifier(base_url="https://auth.example.com")])
+CurrentSession = Annotated[Session[User], Depends(auth.current_session())]
+
+app = FastAPI()
+
+
+@app.get("/me")
+async def me(session: CurrentSession) -> User:
+    return session.user
+
+
+async def fake_session() -> Session[User]:
+    """The session the suite runs as. Nothing is verified to produce it."""
+    return Session(
+        user=User(id="u1", email="tester@example.com"),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        raw={"id": "u1"},
+    )
+
+
+def with_fake_session(app: FastAPI, auth: BetterAuth) -> None:
+    # Call this from a fixture, never at import: unoverridden routes must still refuse.
+    app.dependency_overrides[auth.current_session()] = fake_session
+```
+
+The parentheses are the whole of it. `current_session(user_model=...)` is memoized per user model,
+so calling it again hands back the *same* callable your routes already depend on — which is what
+makes it a usable override key. It is also the callable `require(...)` and
+`require_membership(...)` compose on, so overriding it drives the authorization gates too: their
+predicate and their `member` lookup run against your fake session, and only the authentication half
+is bypassed. Two things are *not* reached by that one entry, because they are dependencies of
+their own rather than wrappers an override travels through: a route declaring a different
+`user_model`, and a route declaring `optional_session`. Add an entry per dependency your routes
+actually hold — `auth.optional_session()` alongside `auth.current_session()`, and each with the
+`user_model=` the routes use. Getting it wrong is not a hole: the missed route simply verifies for
+real and answers `401`.
+
+Drive it from a fixture, and clear the map afterwards — `dependency_overrides` lives on the
+application, so an override left behind outlives the test that wanted it:
+
+```text
+import pytest
+from fastapi.testclient import TestClient
+
+from myapp.main import app, auth
+from myapp.testing import with_fake_session
+
+
+@pytest.fixture
+def client():
+    with_fake_session(app, auth)
+    with TestClient(app) as http:
+        yield http
+    app.dependency_overrides.clear()
+```
+
+This is the bare-factory warning from the quickstart seen from the other side. There, forgetting the
+parentheses in `Depends(auth.current_session)` is refused while the route is registered; here,
+forgetting them writes a key nothing depends on, so the override silently does nothing and your
+tests fail against real `401`s. Writing the *value* bare — `dependency_overrides[required] =
+auth.current_session` — is the one planting this library cannot refuse at build time, because the
+map is a plain dict it has no hook into; that one raises a `ConfigurationError` on the first request
+touching the dependency, having verified nothing and served nobody.
+
 ## Do I need to run a Node service?
 
 Better Auth itself always runs in a Node/TypeScript process — sign-up, sign-in, OAuth, 2FA, and
