@@ -23,6 +23,8 @@ from fastapi_better_auth import Session, User
 SECRET_TOKEN = "raw-session-token-9f3ab21ce4"
 RAW_MARKER = "203.0.113.7"
 MASK = "**********"
+IMPERSONATOR = "admin-9f3ab21c"
+"""An admin's user id. Unlike the token it is *not* a credential, so it is published."""
 
 
 def a_session() -> Session[User]:
@@ -30,6 +32,7 @@ def a_session() -> Session[User]:
         user=User.model_validate({"id": "u1", "email": "seed@example.com"}),
         expires_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
         token=SecretStr(SECRET_TOKEN),
+        impersonated_by=IMPERSONATOR,
         raw={"session": {"ipAddress": RAW_MARKER}},
     )
 
@@ -136,6 +139,28 @@ def test_one_response_never_mixes_two_casings() -> None:
     assert "emailVerified" not in user
     camel = [key for key in (*payload, *user) if any(char.isupper() for char in key)]
     assert camel == []
+
+
+@pytest.mark.parametrize("channel", ["model_dump", "model_dump_json"])
+def test_impersonation_provenance_is_published_rather_than_masked(channel: str) -> None:
+    """The exception to the rule above, stated deliberately. `impersonated_by` is a user id, not
+    a credential: nobody can authenticate with it, and a route that must show "acting as" has to
+    be able to read it. So it is dumped like `user.id` and unlike `token`."""
+    session = a_session()
+    rendered = {
+        "model_dump": str(session.model_dump()),
+        "model_dump_json": session.model_dump_json(),
+    }[channel]
+
+    assert IMPERSONATOR in rendered
+
+
+def test_the_new_session_key_reaches_the_route_body_and_the_schema() -> None:
+    body, schema = route_body_and_schema()
+    payload: dict[str, Any] = json.loads(body)
+
+    assert payload["impersonated_by"] == IMPERSONATOR
+    assert "impersonated_by" in session_schema(schema)["properties"]
 
 
 def test_the_response_is_a_real_response_not_an_error() -> None:

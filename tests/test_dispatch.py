@@ -64,7 +64,7 @@ HEADER_B = "x-cred-b"
 HEADER_C = "x-cred-c"
 
 
-class AdminUser(User):
+class Member(User):
     """A deployment's own model, so a verifier that ignores `user_model` is detectable."""
 
     role: str | None = None
@@ -502,7 +502,7 @@ async def test_a_verifier_that_ignores_the_user_model_is_a_configuration_fault()
     auth = BetterAuth(verifiers=[WrongModelVerifier(HEADER_A)])
 
     with pytest.raises(ConfigurationError):
-        await resolve_for(auth, user_model=AdminUser)(connection(**{HEADER_A: GOOD_CREDENTIAL}))
+        await resolve_for(auth, user_model=Member)(connection(**{HEADER_A: GOOD_CREDENTIAL}))
 
 
 def test_a_rogue_verifier_never_grants_anonymous_access() -> None:

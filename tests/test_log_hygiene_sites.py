@@ -22,7 +22,7 @@ from typing import Any
 
 import anyio
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, create_model
 
 from fastapi_better_auth import (
     AuthServiceUnavailable,
@@ -37,6 +37,7 @@ from fastapi_better_auth import (
     SyncStoreAdapter,
     TransportResponse,
     User,
+    parse_user,
 )
 from fastapi_better_auth._internal import remote_probe
 from fastapi_better_auth._internal.authz import permitted
@@ -300,6 +301,22 @@ def test_a_backoff_latch_warning_carries_no_credential(
     assert STORE_TOKEN not in rendered(records)
 
 
+def test_a_missing_field_advisory_carries_no_payload_value(
+    records: list[logging.LogRecord],
+) -> None:
+    """`parse_user`'s one line. It fires on a *declared* field the payload does not carry, so
+    the only thing it may name is the model's own field path - and the payload it was refusing
+    is the whole authenticated user object, ids and plugin data included."""
+    model = create_model("Scoped", __base__=User, jurisdiction_scope=(str, ...))
+
+    with pytest.raises(SessionError):
+        parse_user(model, {"id": STORED_USER_ID, "token": STORE_TOKEN, "jurisdiction": "KE"})
+
+    assert_template_fired(records, manifest_site("%s declares required fields"))
+    assert_no_leak(records, STORE_TOKEN, STORED_USER_ID)
+    assert "jurisdictionScope" in rendered(records), "the operator cannot tell which key"
+
+
 def test_the_advisory_require_signature_warning_carries_no_credential(
     records: list[logging.LogRecord], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -310,7 +327,10 @@ def test_the_advisory_require_signature_warning_carries_no_credential(
 
     async def drive() -> None:
         await remote_probe.run_probe(
-            _CookieSettingTransport(), uri=f"{ORIGIN}/api/auth/get-session", max_bytes=65536
+            _CookieSettingTransport(),
+            uri=f"{ORIGIN}/api/auth/get-session",
+            max_bytes=65536,
+            refuse_unsigned_bearer=False,
         )
 
     anyio.run(drive)

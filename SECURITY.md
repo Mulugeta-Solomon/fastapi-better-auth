@@ -117,11 +117,15 @@ carry into production without noticing.
   line: `bearer({ requireSignature: true })`.** This library cannot fix it. What it does do is
   notice: alongside its boot probe, `RemoteVerifier` sends one request carrying a manufactured
   random token and reads nothing but whether a `set-cookie` header came back — the permissive
-  posture emits one, the strict posture does not — and logs a single warning naming the fix. It is
-  advisory only. It never refuses, never reads that header's value, and never replays a real
-  credential; a verifier that refused to start over a server-side option would be this library
-  overruling an operator, and a runtime probe that replayed a live token to test the posture would
-  be this library forging a request on a user's behalf.
+  posture emits one, the strict posture does not — and logs a single warning naming the fix. By
+  default that is all it does: it never refuses, never reads that header's value, and never replays
+  a real credential; a verifier that refused to start over a server-side option *by default* would
+  be this library overruling an operator, and a runtime probe that replayed a live token to test the
+  posture would be this library forging a request on a user's behalf. A deployment that wants the
+  refusal can ask for it: `RemoteVerifier(refuse_unsigned_bearer=True)` turns that same check into a
+  rung of the boot probe, so `prepare()` raises `ConfigurationError` naming
+  `bearer({ requireSignature: true })` and the application does not start — still reading only
+  whether a `set-cookie` came back, never its value, and never replaying a real credential.
 - **Mode C's verification traffic shares one upstream rate-limit bucket.** Better Auth keys its
   limiter on `` `${ip}|${path}` ``, reads only `x-forwarded-for` by default, and falls back to the
   shared sentinel `no-trusted-ip` when it can derive no address — which is exactly what a

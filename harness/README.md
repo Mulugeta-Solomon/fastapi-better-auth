@@ -17,6 +17,12 @@ The auth container migrates the schema (Better Auth CLI), seeds its users, and s
 legs that need it skip with a reason naming the profile (in CI they fail instead, because a lane
 that silently tested nothing is worse than a red one).
 
+**`auth migrate` on boot is a harness-only pattern.** Nothing else owns this database, so letting
+the Better Auth CLI apply DDL at start-up is safe here and keeps the schema matched to the pinned
+version. In a real deployment the FastAPI side's migration tool owns every table and `auth migrate`
+must never run against that database — see [Who owns the database
+schema](../README.md#who-owns-the-database-schema) for the rule and the reason.
+
 ## Services
 
 | Service | Port | Notes |
@@ -48,6 +54,24 @@ Both are driven by an environment variable `src/auth.mjs` reads, and both defaul
   one under a rate limit. Upstream answers a refused request `429` with **`X-Retry-After`** in
   whole seconds — not the standard `Retry-After` — which is exactly what the live 429 leg pins.
 
+### Secondary storage
+
+`--profile redis` wires `secondaryStorage` with **all five** methods Better Auth's interface
+declares — `get`, `getAndDelete`, `increment(key, ttl)`, `set(key, value, ttl?)`, `delete` — mapped
+to `GET`, `GETDEL`, a `MULTI` of `INCR` + `EXPIRE … NX`, `SET [EX]` and `DEL`
+(`auth-server/src/auth.mjs`). None of the five is optional in the type
+(`@better-auth/core/dist/db/type.d.mts:148-193`), and that file is **byte-identical at 1.7.1 and
+1.7.3** — the interface did not grow, this harness was simply missing two of them.
+
+The two that no conformance lane exercises are still worth having, because this directory is also
+the template a consumer copies. Upstream calls `getAndDelete` on the secondary-storage-only
+verification path, so a single-use value is not read and deleted as two operations
+(`better-auth@1.7.1` `dist/db/internal-adapter.mjs:787-808`), and `increment` only under
+`rateLimit.storage: "secondary-storage"`, where its absence is a hard `BetterAuthError` naming the
+missing method (`dist/api/rate-limiter/index.mjs:198-199`). `EXPIRE … NX` is what makes the
+documented semantics exactly true: the TTL is applied when the counter is created and never
+extended by a later increment, so the window is fixed from first creation.
+
 ## Seeded users
 
 | Email | Password | Role |
@@ -64,6 +88,13 @@ endpoint that grants the *first* admin — every one of them is gated on an exis
 `banExpires` on `user` and `impersonatedBy` on `session`; without it those columns do not exist,
 which is a supported deployment and one the stores are tested against too. Enabling it does not
 touch the session cookie's wire format, so the golden vectors in `tests/vectors/` are unaffected.
+
+> **If you copy this server as a template, mount `bearer({ requireSignature: true })`.** Upstream's
+> default is `false`, and while it is false a raw session token in a log, a dump or a backup is a
+> live `Authorization: Bearer` credential. `:3100` keeps the permissive default on purpose — it is
+> the posture the conformance lane has to measure — and `:3102` is the fix, tested in both
+> directions. A Mode C consumer can refuse to start against the permissive posture with
+> `RemoteVerifier(refuse_unsigned_bearer=True)`.
 
 Better Auth refuses a state-changing POST that carries no `Origin` header
 (`MISSING_OR_NULL_ORIGIN`), and `sign-out` additionally requires a JSON content type — see the

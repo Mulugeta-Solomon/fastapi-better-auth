@@ -225,6 +225,16 @@ COVERED_BY: Mapping[LogSite, str] = {
         template="get-session is rate-limited upstream (429); backing off %ss before the next call",
     ): "test_a_backoff_latch_warning_carries_no_credential",
     LogSite(
+        module="parsing",
+        level="warning",
+        template=(
+            "%s declares required fields the upstream payload did not carry: %s. Every request"
+            " carrying this payload shape is refused as a 401. If these are Better Auth"
+            " additionalFields, the names shown are the wire keys this model expects - check them"
+            " against the ones your Better Auth server actually sends."
+        ),
+    ): "test_a_missing_field_advisory_carries_no_payload_value",
+    LogSite(
         module="remote_probe",
         level="warning",
         template=(

@@ -264,6 +264,104 @@ async def test_the_advisory_probe_is_silent_without_a_set_cookie(
     assert not [r for r in caplog.records if "requireSignature" in r.getMessage()]
 
 
+# ---------------------------------------------------------------- refuse_unsigned_bearer
+
+
+def gated(transport: Any, **kwargs: Any) -> RemoteVerifier:
+    """A verifier with the Mode C bearer gate on: the advisory rung becomes a refusing one."""
+    return verifier(transport, refuse_unsigned_bearer=True, **kwargs)
+
+
+def test_the_gate_is_off_by_default_and_reads_back_what_was_set() -> None:
+    assert verifier(ScriptedTransport(Reply(b"null"))).refuse_unsigned_bearer is False
+    assert gated(ScriptedTransport(Reply(b"null"))).refuse_unsigned_bearer is True
+
+
+@pytest.mark.parametrize("given", ["true", 1, None], ids=["str", "int", "none"])
+def test_a_non_bool_gate_is_refused_at_construction(given: Any) -> None:
+    with pytest.raises(ConfigurationError) as caught:
+        verifier(ScriptedTransport(Reply(b"null")), refuse_unsigned_bearer=given)
+
+    assert "refuse_unsigned_bearer" in str(caught.value)
+
+
+async def test_the_gate_refuses_a_permissive_posture_and_names_the_upstream_fix() -> None:
+    """With the gate on the advisory rung is a rung: a `set-cookie` on the manufactured bearer
+    means `requireSignature: false` upstream, and that is a contract failure, not a warning."""
+    v = gated(SplitTransport(json_reply(document()), set_cookie_on_bearer=True))
+
+    with pytest.raises(ConfigurationError) as caught:
+        await v.probe()
+
+    message = str(caught.value)
+    assert "bearer({ requireSignature: true })" in message
+    assert "refuse_unsigned_bearer" in message
+    # A bool, so a failure never reprs whatever the header carried.
+    leaked = "CLEARED" in message
+    assert not leaked, "the gate reads presence only; the set-cookie value must not reach a message"
+
+
+async def test_the_gate_refuses_instead_of_logging_the_advisory_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = SplitTransport(json_reply(document()), set_cookie_on_bearer=True)
+    with (
+        caplog.at_level(logging.WARNING, logger="fastapi_better_auth"),
+        pytest.raises(ConfigurationError),
+    ):
+        await gated(transport).probe()
+
+    assert not caplog.records, "the gate refuses; it does not also warn"
+
+
+async def test_prepare_remembers_the_gate_refusal_permanently() -> None:
+    """The gate's refusal is a contract failure like every other: remembered, so every later
+    prepare() and verify() re-raises it without a further outbound call."""
+    transport = SplitTransport(json_reply(document()), set_cookie_on_bearer=True)
+    v = gated(transport)
+
+    with pytest.raises(ConfigurationError):
+        await v.prepare()
+    calls = transport.calls
+
+    with pytest.raises(ConfigurationError):
+        await v.prepare()
+    with pytest.raises(ConfigurationError):
+        await run(v)
+    assert transport.calls == calls, "a remembered contract failure makes no further outbound call"
+
+
+async def test_the_gate_passes_silently_against_a_strict_posture(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = SplitTransport(json_reply(document()))
+    v = gated(transport)
+
+    with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
+        await v.prepare()
+        session = await run(v)
+
+    assert session.user.id == "u1"
+    assert not caplog.records, "a strict posture passes the gate and logs nothing"
+
+
+async def test_the_gate_maps_its_own_reachability_failure_to_service_unavailable() -> None:
+    """The advisory request's own failure is transient, not a verdict on the posture: under the
+    gate it surfaces as the rung-1 mapping rather than being swallowed."""
+    with pytest.raises(AuthServiceUnavailable):
+        await gated(_AdvisoryFailingTransport()).probe()
+
+
+async def test_a_gate_reachability_failure_at_startup_is_not_remembered() -> None:
+    v = gated(_AdvisoryFailingTransport())
+
+    with pytest.raises(ConfigurationError) as caught:
+        await v.prepare()
+
+    assert "startup" in str(caught.value)
+    assert v._contract_failure is None, "reachability was not remembered as a contract failure"  # pyright: ignore[reportPrivateUsage]
+
+
 # ---------------------------------------------------------------- prepare()
 
 

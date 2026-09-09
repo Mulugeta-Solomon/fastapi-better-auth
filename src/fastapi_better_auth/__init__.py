@@ -33,7 +33,7 @@ from ._internal.errors import (
 )
 from ._internal.httpx_transports import Httpx2Transport, HttpxTransport
 from ._internal.jwt_verifier import JwtVerifier
-from ._internal.models import Session, User, UserT
+from ._internal.models import AdminUser, Session, User, UserT
 from ._internal.parsing import parse_user
 from ._internal.remote_verifier import RemoteVerifier
 from ._internal.shared_secret import SharedSecret
@@ -57,6 +57,7 @@ from ._internal.verifiers import PreparedVerifier, Verifier
 
 __all__ = [
     "BEARER_CHALLENGE",
+    "AdminUser",
     "AmbiguousCredentials",
     "AuthServiceUnavailable",
     "BetterAuth",

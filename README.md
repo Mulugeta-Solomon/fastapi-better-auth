@@ -18,6 +18,13 @@ makes the sessions that service issues first-class in FastAPI. Three modes ship.
 what they couple to, what a request costs, and — the row that should decide it — what they can
 still see once a session goes away.
 
+> **If your Better Auth server mounts `bearer()`, set `requireSignature: true` before anything else
+> on this page.** It defaults to `false`, and while it is false a raw session token written into a
+> log line, a database dump or a backup is a live `Authorization: Bearer` credential. That is
+> upstream's setting, so it holds in all three modes and no configuration here changes it. The
+> one-line fix, and the startup gate Mode C can enforce it with:
+> [§ `requireSignature`](#requiresignature-a-raw-session-token-is-a-bearer-credential).
+
 | | **A — cookie + shared store** | **B — JWT / JWKS** | **C — remote get-session** |
 |---|---|---|---|
 | **Revocation lag** | instant | ≤ token lifetime (15 min upstream default) | instant |
@@ -158,6 +165,115 @@ async def greeting(session: MaybeMember) -> str:
 `optional_session` returns `None` for one situation only: no credential was presented at all. One
 that *was* presented and did not verify still fails — a forged or expired token is never downgraded
 to "anonymous".
+
+### Fields the admin plugin adds: `AdminUser`
+
+If your Better Auth server mounts the [admin plugin](https://better-auth.com/docs/plugins/admin) it
+adds four columns to `user` — `role`, `banned`, `banReason`, `banExpires` — and one to `session`,
+`impersonatedBy` (`dist/plugins/admin/schema.mjs:3-30`). `AdminUser` is the subclass you would otherwise
+write for the four:
+
+```python
+from typing import Annotated
+
+from fastapi import Depends, FastAPI
+
+from fastapi_better_auth import AdminUser, BetterAuth, JwtVerifier, Session
+
+auth = BetterAuth(verifiers=[JwtVerifier(base_url="https://auth.example.com")])
+CurrentAdmin = Annotated[Session[AdminUser], Depends(auth.current_session(user_model=AdminUser))]
+
+app = FastAPI()
+
+
+@app.get("/role")
+async def whoami(session: CurrentAdmin) -> str:
+    return session.user.role or "unknown"
+```
+
+The plugin declares all five `input: false` (same file), so they are server-controlled and an account
+holder can never set one at sign-up — which is what makes them worth typing, unlike an `additionalFields`
+entry. Without the plugin the keys are simply absent and every field reads `None`, which means
+**unknown** and never *safe*: a missing `banned` is not an unbanned user.
+
+`banned` is a *view*, not a decision. In Modes A and C the ban is enforced by the verifier — from
+the store record or the upstream document — before the model is built, so a live ban is a `401` and
+your route never runs. A `banned=True` you can actually read is therefore a ban that has **lapsed**
+(`ban_expires` in the past), or Mode B data, where a JWT carries whatever was true when it was
+minted. It is also a `StrictBool`: a `1` or a `"true"` on the wire is refused rather than guessed at.
+
+The session half sits on the session, not the user. `session.impersonated_by` is the admin's user id
+when this session came from the plugin's impersonation endpoint, and `None` otherwise — including in
+Mode B, always, because a JWT carries the user object and no session row. It is **provenance, not
+permission**: it tells you an administrator is acting as this user, never that the request may do
+anything extra.
+
+### `additionalFields`: make sure they reach the wire
+
+A `User` subclass ignores keys it does not declare, and generates a camelCase alias from each Python
+name. That is the right default — upstream ships often, and a field you have not declared must not
+turn an authentic request into a 500 — but it has one sharp edge worth knowing before you rely on
+it: **a name mismatch between your Node-side `additionalFields` key and your Python field is not an
+error.** Declare `jurisdiction_scope` (wire key `jurisdictionScope`) while the server sends
+`jurisdiction`, and every request reads `None` for ever.
+
+Which way that fails is your choice, and it is the annotation that makes it:
+
+```python
+from fastapi_better_auth import User
+
+
+class Lenient(User):
+    """Forward-compatible. A name mismatch reads None, and nothing says so."""
+
+    jurisdiction_scope: str | None = None
+
+
+class Scoped(User):
+    """Fails closed. A name mismatch refuses every request, from the first one."""
+
+    jurisdiction_scope: str
+```
+
+A required field is the strict mode; there is no separate switch. The refusal is the same uniform
+`401` as everything else, so the client learns nothing — but the diagnosis is on the exception as
+`InvalidCredential.reason`, naming the **wire key** the model expected:
+
+    Scoped payload rejected (1): jurisdictionScope: [missing]
+
+and the first time it happens the library logs one `WARNING` per process per user model on the
+`fastapi_better_auth` logger, naming the model and the missing wire keys. Nothing the payload
+carried appears in either — only the field names your own model declared.
+
+Neither shape can tell you the names are right *before* the first request, so verify them once, as a
+smoke test against your real Better Auth server. The check is the same in every mode: sign in, then
+assert the key is on the wire where that mode reads it.
+
+```text
+# Run against a real Better Auth server, once per deployment, in your own test suite.
+EXPECTED = {"jurisdictionScope", "role"}          # the WIRE keys, camelCase
+
+# Mode B — the JWT payload. Fetch a token and decode it WITHOUT verifying; you are
+# inspecting shape, not authenticating.
+#   POST /api/auth/sign-in/email  ->  cookie
+#   GET  /api/auth/token          ->  {"token": "..."}
+#   claims = jwt.decode(token, options={"verify_signature": False})
+#   assert EXPECTED <= claims.keys()
+#
+# Mode C — the get-session body.
+#   GET /api/auth/get-session with the cookie  ->  {"session": {...}, "user": {...}}
+#   assert EXPECTED <= body["user"].keys()
+#
+# Mode A — the store record, read through the store you configured.
+#   record = await store.fetch_session_by_token(raw_token)
+#   user = record.user or await store.fetch_user_by_id(record.user_id)
+#   assert EXPECTED <= user.payload.keys()
+```
+
+There is deliberately no startup gate for this. At boot there is no payload to inspect in any mode —
+Mode B has no token, Mode C's readiness probe carries no cookie, and Mode A's store has no
+particular user — so a boot check would have to sign in with a real credential, which is exactly the
+smoke test above, and the smoke test belongs in your suite rather than in your `lifespan`.
 
 ## Quickstart (Mode A — session cookie)
 
@@ -402,6 +518,8 @@ auth = BetterAuth(
             base_url=os.environ["BETTER_AUTH_URL"],
             csrf=OriginCheck(allowed_origins=["https://app.example.com"]),
             secret=SharedSecret(os.environ["BETTER_AUTH_SECRET"]),
+            # Refuse to start against a server whose bearer plugin is at requireSignature: false.
+            refuse_unsigned_bearer=True,
         )
     ]
 )
@@ -417,7 +535,9 @@ and it asserts the contract Mode C rests on: reachable, `200`, `application/json
 boot, rather than a 401 per request forever. It is also the backstop against a `Transport` that
 retains cookies: both shipped adapters install a dead cookie jar, but a `Transport` you write is
 yours, and a session document coming back from a request that carried no cookie means the client is
-replaying somebody's. That is refused by name rather than served.
+replaying somebody's. That is refused by name rather than served. `refuse_unsigned_bearer=True`
+adds one more rung to the same probe — the upstream `bearer` plugin's posture, refused at boot
+instead of warned about; see [§ `requireSignature`](#requiresignature-a-raw-session-token-is-a-bearer-credential).
 
 What the probe does **not** prove: that a real cookie will verify, that your secret matches, that
 the server will still be up on the next request. It proves the URI and the contract, once.
@@ -523,11 +643,25 @@ With it set, a dot-less token is ignored outright (`dist/plugins/bearer/index.mj
 advice taken on faith: the conformance lane runs two live Better Auth servers, one at each setting,
 and pins the behaviour in both directions — `tests/e2e/test_conformance.py::TestBearerPosture`.
 
-`RemoteVerifier` checks for the permissive posture at startup, advisory-only. Alongside the probe it
-sends one request carrying a manufactured random token and looks at nothing but whether a
-`set-cookie` header came back: the permissive posture emits one, the strict posture does not. If it
-sees one it logs a single warning naming the fix. It never refuses, never reads that header's value,
-and never replays a real credential — your server's posture is yours to set.
+`RemoteVerifier` checks for the permissive posture at startup. Alongside the probe it sends one
+request carrying a manufactured random token and looks at nothing but whether a `set-cookie` header
+came back: the permissive posture emits one, the strict posture does not. By default that check is
+advisory — one warning per process naming the fix, and nothing else. It never reads that header's
+value and never replays a real credential.
+
+**Make it a hard gate with `RemoteVerifier(refuse_unsigned_bearer=True)`.** The same request becomes
+a rung of the probe: a `set-cookie` is a `ConfigurationError` naming
+`bearer({ requireSignature: true })`, so `prepare()` refuses and a server wired through
+`FastAPI(lifespan=auth.lifespan)` never starts. It is remembered like every other contract failure —
+a deployment that skipped the lifespan and probes lazily refuses every request instead. Its own
+reachability failure is *not* a verdict: that stays the transient `AuthServiceUnavailable` the
+unreachable-at-boot path already handles, and is retried rather than remembered. The flag is
+opt-in because the posture is your server's to set, and off is the current behaviour exactly.
+
+**Modes A and B have no such check, and cannot.** Neither talks to your Better Auth server — Mode A
+reads the session store, Mode B verifies offline against a cached key set — so neither is ever in a
+position to observe the plugin's posture. There the warning above is documentation, and the fix is
+still the same one line upstream.
 
 ### Sessions do not slide on bridge traffic
 
@@ -753,6 +887,41 @@ it issues. Two topologies:
 Either way the browser or app performs its login flows against Better Auth, then presents the
 resulting credential to FastAPI, where this library verifies it — the session cookie for Modes A
 and C, a JWT for Mode B.
+
+## Who owns the database schema
+
+**One tool owns every table, and on a FastAPI project that tool is yours** — Alembic, or whatever
+your side already runs. The recipe: run `auth generate` on the Node side, hand-port the SQL it
+prints into one migration of your own, re-diff on every Better Auth upgrade, and **never run
+`auth migrate` against a database another tool migrates.** That includes not copying this
+repository's harness container, which does exactly that on every boot.
+
+The reason is what `auth migrate` is. It is Kysely-only — on any other adapter it logs "Only kysely
+adapter is supported for migrations", points you at `generate`, and calls `process.exit(1)`
+(`better-auth@1.7.3` `dist/db/get-migration.mjs:350`). And its plan is not a migration history:
+`getMigrations` introspects the live database, diffs it against the schema your config implies, and
+returns the difference as `toBeCreated` / `toBeAdded` / `toBeAddedIndexes` (`:335`, `:387-389`),
+which `runMigrations` then executes statement by statement (`:643-649`). No migrations table, no
+version stamp — nothing records that it ran, nothing can roll it back, and two tools that each
+introspect-and-diff the same database can each decide the other's work is drift.
+
+Better Auth 1.7.3 raises the stakes, because schema validation is now on by default.
+`advanced.database.validateSchema` defaults to `true`, and its own doc comment says what that
+buys: the schema is validated at initialization, problems are reported through the configured
+logger, and authentication requests await the same check and fail when the schema does not match
+(`@better-auth/core@1.7.3` `dist/types/init-options.d.mts:391-400`). All three halves are real. A
+failure at init is logged (`better-auth@1.7.3` `dist/auth/base.mjs:10-18`); **every HTTP request
+awaits the check** (`dist/api/index.mjs:167-168`) and so does every `auth.api.*` call
+(`dist/api/to-auth-endpoints.mjs:41-42`); and the check throws `SchemaMismatchError` whenever it
+finds anything (`@better-auth/core@1.7.3` `dist/db/schema-check.mjs:60-76`). None of it is
+`NODE_ENV`-gated. So a schema the Node side does not recognise stops that server serving rather
+than degrading quietly — which, on a database two tools have been fighting over, means the failure
+arrives during a deploy instead of during an incident. `better-auth@1.7.1` has none of this
+machinery: the same mismatch there is silent until something reads a missing column.
+
+This repository's harness is the exception that proves the rule — `harness/auth-server/Dockerfile`
+runs `auth migrate` on every start because nothing else owns that database, and a conformance
+harness *wants* its schema pinned to the version under test. A product does not.
 
 ## Why a library instead of the snippet
 

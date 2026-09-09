@@ -86,6 +86,7 @@ from .remote_config import (
     validated_optional_keyring,
     validated_prefix,
     validated_queue_timeout,
+    validated_refuse_unsigned_bearer,
     validated_secure_cookies,
     validated_transport,
 )
@@ -192,6 +193,13 @@ class RemoteVerifier:
             bypass.
         max_remembered: The most forged-cookie verdicts held at once, 1024 by default.
         max_bytes: The largest get-session body this verifier will read, 64 KiB by default.
+        refuse_unsigned_bearer: Whether the boot probe's bearer rung *refuses* a Better Auth server
+            whose `bearer` plugin is at its default `requireSignature: false`, `False` by default.
+            Off, that rung logs one advisory warning per process and serves. On, it is a contract
+            failure: `prepare()` raises `ConfigurationError` naming
+            `bearer({ requireSignature: true })`, and a lazily-probed verifier raises on every
+            request. Either way it reads only whether a `set-cookie` came back, never its value,
+            and never replays a real credential.
         clock: A monotonic clock, injected so the cache TTL, the backoff latch and the probe-retry
             window are testable without sleeping.
 
@@ -199,7 +207,8 @@ class RemoteVerifier:
         ConfigurationError: For any unusable configuration, at construction: a `base_url` that is
             not an origin, a `csrf` that is `None` or not a `CsrfPolicy`, a `transport` that is not
             one, both of `secret`/`secrets`, a non-`SharedSecret` entry, a blank or illegal
-            `cookie_name`/`secure_prefix`, a non-bool `secure_cookies`, a malformed `base_path`, a
+            `cookie_name`/`secure_prefix`, a non-bool `secure_cookies` or `refuse_unsigned_bearer`,
+            a malformed `base_path`, a
             `concurrency`/`queue_timeout`/`negative_ttl`/`max_remembered`/`max_bytes` out of range,
             or a non-callable `clock`.
     """
@@ -221,6 +230,7 @@ class RemoteVerifier:
         negative_ttl: float = NEGATIVE_TTL,
         max_remembered: int = MAX_REMEMBERED_MISSES,
         max_bytes: int = MAX_SESSION_BYTES,
+        refuse_unsigned_bearer: bool = False,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._origin = normalize_base_url(base_url)
@@ -240,6 +250,7 @@ class RemoteVerifier:
         self._concurrency = validated_concurrency(concurrency)
         self._queue_timeout = validated_queue_timeout(queue_timeout)
         self._max_bytes = validated_cap(max_bytes)
+        self._refuse_unsigned_bearer = validated_refuse_unsigned_bearer(refuse_unsigned_bearer)
         self._clock = validated_clock(clock)
         self._uri = f"{self._origin}{self._base_path}{GET_SESSION_PATH}{GET_SESSION_QUERY}"
         self.credential_source = f"{COOKIE_SOURCE_PREFIX}{self._cookie_name}"
@@ -279,6 +290,11 @@ class RemoteVerifier:
         return self._secure_cookies
 
     @property
+    def refuse_unsigned_bearer(self) -> bool:
+        """Whether the boot probe refuses an upstream `bearer` plugin at `requireSignature: false`."""
+        return self._refuse_unsigned_bearer
+
+    @property
     def csrf(self) -> CsrfPolicy:
         """The cross-site request forgery policy every unsafe request is measured against."""
         return self._csrf
@@ -307,12 +323,13 @@ class RemoteVerifier:
         instead of refusing its first authenticated request. Idempotent.
 
         Two failure classes are handled differently. A **contract** failure - a non-200, a
-        non-JSON or non-null body, a session document from a bare request - is a permanent fact
-        about the deployment: it is remembered, and every later `prepare()` and `verify()`
-        re-raises it. A **reachability** failure at startup - a timeout, a refused connection - is
-        raised as a `ConfigurationError` too, because an auth service you cannot reach at boot is a
-        deployment that should not take traffic; but it is *not* remembered, so wiring the probe
-        lazily (never calling `prepare()`) instead lets the first request retry it.
+        non-JSON or non-null body, a session document from a bare request, and under
+        `refuse_unsigned_bearer=True` an upstream that accepts an unsigned bearer token - is a
+        permanent fact about the deployment: it is remembered, and every later `prepare()` and
+        `verify()` re-raises it. A **reachability** failure at startup - a timeout, a refused
+        connection - is raised as a `ConfigurationError` too, because an auth service you cannot
+        reach at boot is a deployment that should not take traffic; but it is *not* remembered, so
+        wiring the probe lazily (never calling `prepare()`) instead lets the first request retry it.
 
         Raises:
             ConfigurationError: A contract failure (remembered), or an unreachable server at boot.
@@ -333,18 +350,25 @@ class RemoteVerifier:
         One bare GET (no cookie) proves the deployment answers `200` with a literal `null` body -
         the 200-null contract Mode C's whole outcome mapping rests on - and is also the dead-jar
         detector: a session document from a bare request means the transport is replaying a
-        retained cookie. A second, advisory-only request checks whether the bearer plugin is in the
-        permissive `requireSignature: false` posture and logs one warning if so; it never refuses.
+        retained cookie. A second request checks whether the bearer plugin is in the permissive
+        `requireSignature: false` posture: with `refuse_unsigned_bearer=False` it logs one warning
+        and never refuses, with `True` it refuses.
 
         This is the raw one-shot probe. `prepare()` is the memoized, fail-closed version an
         operator wires into startup.
 
         Raises:
-            ConfigurationError: A contract failure - a non-200, a non-JSON or non-null body, or a
-                session document from a bare request. The reason names the URI.
+            ConfigurationError: A contract failure - a non-200, a non-JSON or non-null body, a
+                session document from a bare request, or (under `refuse_unsigned_bearer`) an
+                upstream that accepts an unsigned bearer token. The reason names the URI.
             AuthServiceUnavailable: A reachability failure - the server could not be reached.
         """
-        await run_probe(self._transport, uri=self._uri, max_bytes=self._max_bytes)
+        await run_probe(
+            self._transport,
+            uri=self._uri,
+            max_bytes=self._max_bytes,
+            refuse_unsigned_bearer=self._refuse_unsigned_bearer,
+        )
 
     def extract(self, connection: HTTPConnection) -> RemoteCredential | None:
         """Return this verifier's cookie material and CSRF snapshot, or `None` if it is absent.
@@ -478,7 +502,12 @@ class RemoteVerifier:
         previous = self._probe_attempted_at
         self._probe_attempted_at = self._clock()
         try:
-            await run_probe(self._transport, uri=self._uri, max_bytes=self._max_bytes)
+            await run_probe(
+                self._transport,
+                uri=self._uri,
+                max_bytes=self._max_bytes,
+                refuse_unsigned_bearer=self._refuse_unsigned_bearer,
+            )
         except ConfigurationError as contract:
             self._contract_failure = str(contract)
             raise
@@ -654,6 +683,7 @@ def _build_session(
     # The forwarded token, the record's copy of it, and the payload's own `token` column all live
     # in this frame; all must be gone before it exits, on the refusal path as well as the return.
     expires_at = record.expires_at
+    impersonated_by = record.impersonated_by
     raw = record.payload
     del record
     try:
@@ -661,6 +691,7 @@ def _build_session(
             user=parse_user(user_model, user.payload),
             expires_at=expires_at,
             token=SecretStr(token),
+            impersonated_by=impersonated_by,
             raw=raw,
         )
     finally:
