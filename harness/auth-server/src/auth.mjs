@@ -33,8 +33,21 @@ export const auth = betterAuth({
   plugins: [jwt(), bearer({ requireSignature }), admin()],
   ...(rateLimit && { rateLimit }),
   ...(redis && {
+    // All five methods the interface declares, identically at 1.7.1 and 1.7.3
+    // (@better-auth/core/dist/db/type.d.mts:148-193). EXPIRE ... NX is what makes
+    // "the TTL is applied only on creation" true (Redis >= 7.0; this harness runs 7.4).
     secondaryStorage: {
       get: (key) => redis.get(key),
+      getAndDelete: (key) => redis.getdel(key),
+      increment: async (key, ttl) => {
+        const seconds = Number.isInteger(ttl) && ttl > 0 ? ttl : null;
+        const chain = redis.multi().incr(key);
+        if (seconds !== null) chain.expire(key, seconds, "NX");
+        const replies = await chain.exec();
+        if (!replies) throw new Error("secondaryStorage.increment: INCR/EXPIRE was aborted");
+        for (const [error] of replies) if (error) throw error;
+        return replies[0][1];
+      },
       set: async (key, value, ttl) => {
         if (ttl) await redis.set(key, value, "EX", ttl);
         else await redis.set(key, value);

@@ -17,15 +17,21 @@ that proves exactly that, and each rung is written knowing what it does and does
    the transport is replaying a retained cookie - a distinct fault naming the transport, not the
    deployment.
 
-Then one **advisory-only** second request carries `Authorization: Bearer <a manufactured random
-token>`, no cookie, and checks ONLY whether a `set-cookie` header is *present* - never its value
-(the `TransportResponse` rule stands). Present means the bearer plugin self-signed the manufactured
+Then one second request carries `Authorization: Bearer <a manufactured random token>`, no cookie,
+and checks ONLY whether a `set-cookie` header is *present* - never its value (the
+`TransportResponse` rule stands). Present means the bearer plugin self-signed the manufactured
 token and then cleared the missing session, which happens only in the permissive
-`requireSignature: false` posture; it fires one `logger.warning` per process and NEVER refuses,
-NEVER replays a real credential, and NEVER acts as a kill-switch. What it does NOT prove: that Mode
-C is insecure - Mode C forwards a cookie and never a bearer, and the cookie path always verifies
-upstream. The hazard is about *other* consumers of a leaked raw token, which is why this is
-advisory and documentation, not a refusal.
+`requireSignature: false` posture. What it does NOT prove: that Mode C is insecure - Mode C
+forwards a cookie and never a bearer, and the cookie path always verifies upstream. The hazard is
+about *other* consumers of a leaked raw token.
+
+That rung has two settings, and `refuse_unsigned_bearer` picks between them. **Off** (the default)
+it is advisory: one `logger.warning` per process, NEVER a refusal, and its own transport failure is
+swallowed - the posture is the operator's to set. **On** it is a rung like the four above: a
+`set-cookie` is a `ConfigurationError` naming the one-line upstream fix, and its own reachability
+failure surfaces as `AuthServiceUnavailable` the way rung 1's does, so a transient outage is
+retried rather than remembered as a verdict. Neither setting reads the header's value, replays a
+real credential, or acts as a kill switch at request time.
 
 The probe raises `ConfigurationError` for a contract failure (permanent: a non-200, a non-JSON or
 non-null body, a dead jar) and `AuthServiceUnavailable` for a reachability failure (transient); the
@@ -65,19 +71,30 @@ ROUTING_STATUSES = frozenset({404, 405, 415})
 _advised = Once()
 
 
-async def run_probe(transport: Transport, *, uri: str, max_bytes: int) -> None:
-    """Prove the deployment honours the 200-null contract, then advise on `requireSignature`.
+async def run_probe(
+    transport: Transport, *, uri: str, max_bytes: int, refuse_unsigned_bearer: bool = False
+) -> None:
+    """Prove the deployment honours the 200-null contract, then check `requireSignature`.
+
+    Args:
+        transport: The HTTP boundary both requests go out through.
+        uri: The pinned get-session URI.
+        max_bytes: The largest body either request will read.
+        refuse_unsigned_bearer: Whether the bearer rung refuses a permissive upstream posture
+            (`True`) or logs one advisory warning per process and serves (`False`, the default -
+            the pre-gate behaviour, so an older caller of this internal entry point is unchanged).
 
     Raises:
         ConfigurationError: A contract failure - a non-200, a non-JSON body, a body that is not
-            literally `null`, or a session document from a bare request (the dead-jar detector).
+            literally `null`, or a session document from a bare request (the dead-jar detector);
+            and, under `refuse_unsigned_bearer`, an upstream that accepts an unsigned bearer.
             Permanent facts about the deployment.
         AuthServiceUnavailable: A reachability failure - a timeout, a refused connection, an
             oversized or content-encoded answer. Transient.
     """
     response = await _probe_get(transport, uri, {"accept": ACCEPT_JSON}, max_bytes)
     _assert_null_contract(response, uri, transport)
-    await _advise(transport, uri=uri, max_bytes=max_bytes)
+    await _advise(transport, uri=uri, max_bytes=max_bytes, refuse=refuse_unsigned_bearer)
 
 
 def _assert_null_contract(response: TransportResponse, uri: str, transport: Transport) -> None:
@@ -108,18 +125,29 @@ def _assert_null_contract(response: TransportResponse, uri: str, transport: Tran
     )
 
 
-async def _advise(transport: Transport, *, uri: str, max_bytes: int) -> None:
-    """The advisory-only bearer probe. Never refuses; swallows every failure of its own."""
+async def _advise(transport: Transport, *, uri: str, max_bytes: int, refuse: bool) -> None:
+    """The bearer posture rung: advisory by default, refusing under `refuse_unsigned_bearer`.
+
+    Advisory, it swallows every failure of its own and warns once per process. Refusing, it is a
+    rung like the four before it: its own failures propagate (so a reachability failure stays an
+    `AuthServiceUnavailable` the caller can retry) and a `set-cookie` is a `ConfigurationError`.
+    """
     token = "".join(secrets.choice(TOKEN_ALPHABET) for _ in range(MANUFACTURED_TOKEN_LENGTH))
     headers = {"accept": ACCEPT_JSON, AUTHORIZATION: f"Bearer {token}"}
     try:
         response = await _probe_get(transport, uri, headers, max_bytes)
     except (BetterAuthError, SessionError):
+        if refuse:
+            raise
         return
     finally:
         headers.clear()
         token = ""
-    if SET_COOKIE in response.headers and _advised.fire():
+    if SET_COOKIE not in response.headers:
+        return
+    if refuse:
+        raise ConfigurationError(_unsigned_bearer_message(uri))
+    if _advised.fire():
         logger.warning(
             "get-session accepted a manufactured bearer token and set a session cookie, so the"
             " bearer plugin is at its default requireSignature: false. A raw session token is then"
@@ -127,6 +155,17 @@ async def _advise(transport: Transport, *, uri: str, max_bytes: int) -> None:
             " one-line fix upstream is bearer({ requireSignature: true }). Advisory only: Mode C"
             " forwards a cookie, never a bearer."
         )
+
+
+def _unsigned_bearer_message(uri: str) -> str:
+    return (
+        f"get-session at {uri} accepted a manufactured bearer token and set a session cookie, so"
+        " the bearer plugin upstream is at its default requireSignature: false. A raw session"
+        " token is then a bearer credential, so a token in a log, dump or backup is a credential"
+        " leak. RemoteVerifier(refuse_unsigned_bearer=True) makes that a refusal rather than a"
+        " warning: fix it upstream with bearer({ requireSignature: true }), or drop the flag to go"
+        " back to the advisory warning."
+    )
 
 
 async def _probe_get(

@@ -104,11 +104,8 @@ def verifier(transport: ScriptedTransport, **kwargs: Any) -> RemoteVerifier:
     kwargs.setdefault("csrf", CsrfDisabled(reason="core pipeline tests do not exercise CSRF"))
     kwargs.setdefault("secure_cookies", False)
     built = RemoteVerifier(base_url=ORIGIN, transport=transport, **kwargs)
-    # WP15 added the readiness probe at pipeline step 8. These pin the post-readiness pipeline -
-    # the outcome table, the rungs, the closed header set, the frame scrubs - so the probe is
-    # marked already-passed; the probe/prepare/_ready gate has its own suite in
-    # test_remote_startup.py. A scripted double answers every request the same, so an unwarmed
-    # probe would read the row's own document as a dead-jar and never reach the fetch.
+    # A scripted double answers every request the same, so an unwarmed probe would read the row's
+    # own document as a dead jar and never reach the fetch. The probe has its own suite.
     built._probed_ok = True  # pyright: ignore[reportPrivateUsage]
     return built
 

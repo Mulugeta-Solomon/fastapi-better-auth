@@ -18,6 +18,13 @@ makes the sessions that service issues first-class in FastAPI. Three modes ship.
 what they couple to, what a request costs, and — the row that should decide it — what they can
 still see once a session goes away.
 
+> **If your Better Auth server mounts `bearer()`, set `requireSignature: true` before anything else
+> on this page.** It defaults to `false`, and while it is false a raw session token written into a
+> log line, a database dump or a backup is a live `Authorization: Bearer` credential. That is
+> upstream's setting, so it holds in all three modes and no configuration here changes it. The
+> one-line fix, and the startup gate Mode C can enforce it with:
+> [§ `requireSignature`](#requiresignature-a-raw-session-token-is-a-bearer-credential).
+
 | | **A — cookie + shared store** | **B — JWT / JWKS** | **C — remote get-session** |
 |---|---|---|---|
 | **Revocation lag** | instant | ≤ token lifetime (15 min upstream default) | instant |
@@ -402,6 +409,8 @@ auth = BetterAuth(
             base_url=os.environ["BETTER_AUTH_URL"],
             csrf=OriginCheck(allowed_origins=["https://app.example.com"]),
             secret=SharedSecret(os.environ["BETTER_AUTH_SECRET"]),
+            # Refuse to start against a server whose bearer plugin is at requireSignature: false.
+            refuse_unsigned_bearer=True,
         )
     ]
 )
@@ -417,7 +426,9 @@ and it asserts the contract Mode C rests on: reachable, `200`, `application/json
 boot, rather than a 401 per request forever. It is also the backstop against a `Transport` that
 retains cookies: both shipped adapters install a dead cookie jar, but a `Transport` you write is
 yours, and a session document coming back from a request that carried no cookie means the client is
-replaying somebody's. That is refused by name rather than served.
+replaying somebody's. That is refused by name rather than served. `refuse_unsigned_bearer=True`
+adds one more rung to the same probe — the upstream `bearer` plugin's posture, refused at boot
+instead of warned about; see [§ `requireSignature`](#requiresignature-a-raw-session-token-is-a-bearer-credential).
 
 What the probe does **not** prove: that a real cookie will verify, that your secret matches, that
 the server will still be up on the next request. It proves the URI and the contract, once.
@@ -523,11 +534,25 @@ With it set, a dot-less token is ignored outright (`dist/plugins/bearer/index.mj
 advice taken on faith: the conformance lane runs two live Better Auth servers, one at each setting,
 and pins the behaviour in both directions — `tests/e2e/test_conformance.py::TestBearerPosture`.
 
-`RemoteVerifier` checks for the permissive posture at startup, advisory-only. Alongside the probe it
-sends one request carrying a manufactured random token and looks at nothing but whether a
-`set-cookie` header came back: the permissive posture emits one, the strict posture does not. If it
-sees one it logs a single warning naming the fix. It never refuses, never reads that header's value,
-and never replays a real credential — your server's posture is yours to set.
+`RemoteVerifier` checks for the permissive posture at startup. Alongside the probe it sends one
+request carrying a manufactured random token and looks at nothing but whether a `set-cookie` header
+came back: the permissive posture emits one, the strict posture does not. By default that check is
+advisory — one warning per process naming the fix, and nothing else. It never reads that header's
+value and never replays a real credential.
+
+**Make it a hard gate with `RemoteVerifier(refuse_unsigned_bearer=True)`.** The same request becomes
+a rung of the probe: a `set-cookie` is a `ConfigurationError` naming
+`bearer({ requireSignature: true })`, so `prepare()` refuses and a server wired through
+`FastAPI(lifespan=auth.lifespan)` never starts. It is remembered like every other contract failure —
+a deployment that skipped the lifespan and probes lazily refuses every request instead. Its own
+reachability failure is *not* a verdict: that stays the transient `AuthServiceUnavailable` the
+unreachable-at-boot path already handles, and is retried rather than remembered. The flag is
+opt-in because the posture is your server's to set, and off is the current behaviour exactly.
+
+**Modes A and B have no such check, and cannot.** Neither talks to your Better Auth server — Mode A
+reads the session store, Mode B verifies offline against a cached key set — so neither is ever in a
+position to observe the plugin's posture. There the warning above is documentation, and the fix is
+still the same one line upstream.
 
 ### Sessions do not slide on bridge traffic
 
@@ -666,6 +691,41 @@ it issues. Two topologies:
 Either way the browser or app performs its login flows against Better Auth, then presents the
 resulting credential to FastAPI, where this library verifies it — the session cookie for Modes A
 and C, a JWT for Mode B.
+
+## Who owns the database schema
+
+**One tool owns every table, and on a FastAPI project that tool is yours** — Alembic, or whatever
+your side already runs. The recipe: run `auth generate` on the Node side, hand-port the SQL it
+prints into one migration of your own, re-diff on every Better Auth upgrade, and **never run
+`auth migrate` against a database another tool migrates.** That includes not copying this
+repository's harness container, which does exactly that on every boot.
+
+The reason is what `auth migrate` is. It is Kysely-only — on any other adapter it logs "Only kysely
+adapter is supported for migrations", points you at `generate`, and calls `process.exit(1)`
+(`better-auth@1.7.3` `dist/db/get-migration.mjs:350`). And its plan is not a migration history:
+`getMigrations` introspects the live database, diffs it against the schema your config implies, and
+returns the difference as `toBeCreated` / `toBeAdded` / `toBeAddedIndexes` (`:335`, `:387-389`),
+which `runMigrations` then executes statement by statement (`:643-649`). No migrations table, no
+version stamp — nothing records that it ran, nothing can roll it back, and two tools that each
+introspect-and-diff the same database can each decide the other's work is drift.
+
+Better Auth 1.7.3 raises the stakes, because schema validation is now on by default.
+`advanced.database.validateSchema` defaults to `true`, and its own doc comment says what that
+buys: the schema is validated at initialization, problems are reported through the configured
+logger, and authentication requests await the same check and fail when the schema does not match
+(`@better-auth/core@1.7.3` `dist/types/init-options.d.mts:391-400`). All three halves are real. A
+failure at init is logged (`better-auth@1.7.3` `dist/auth/base.mjs:10-18`); **every HTTP request
+awaits the check** (`dist/api/index.mjs:167-168`) and so does every `auth.api.*` call
+(`dist/api/to-auth-endpoints.mjs:41-42`); and the check throws `SchemaMismatchError` whenever it
+finds anything (`@better-auth/core@1.7.3` `dist/db/schema-check.mjs:60-76`). None of it is
+`NODE_ENV`-gated. So a schema the Node side does not recognise stops that server serving rather
+than degrading quietly — which, on a database two tools have been fighting over, means the failure
+arrives during a deploy instead of during an incident. `better-auth@1.7.1` has none of this
+machinery: the same mismatch there is silent until something reads a missing column.
+
+This repository's harness is the exception that proves the rule — `harness/auth-server/Dockerfile`
+runs `auth migrate` on every start because nothing else owns that database, and a conformance
+harness *wants* its schema pinned to the version under test. A product does not.
 
 ## Why a library instead of the snippet
 
