@@ -69,6 +69,17 @@ header at all, because Better Auth never emits one and no extension is supported
   cookie of the same name locks the victim out of this API until that cookie is gone — a denial
   of service, never a login as someone else. Better Auth uses the `__Secure-` prefix, which does
   not prevent this; only a `__Host-` cookie would, and that is an upstream choice.
+- **A wrong shared secret that is well *shaped* stays invisible until a request fails.**
+  `SharedSecret` refuses what it can see is unusable — empty, whitespace-edged, a known placeholder,
+  under 32 characters, a short repetition — but nothing on this side can know whether a validly
+  shaped value is the one your Better Auth server actually signs with. A mismatch is a constant-time
+  comparison miss on every request, answered as the same uniform 401 a forgery gets and, by default,
+  not logged at all. Close it at boot: log `secret.fingerprint` from your `lifespan`, and print the
+  identical construction from the Node side's own startup —
+  `"tok_fp=" + createHash("sha256").update(secret, "utf8").digest("hex").slice(0, 8)`. Two different
+  strings in two boot logs is the whole check, and the fingerprint — eight hex characters of a
+  SHA-256 — is the only form of the secret that may be written down anywhere. README.md carries the
+  two-sided recipe.
 - **Bans are enforced locally and fail closed.** A stored `banned` value that is not `true`,
   `false` or absent is treated as banned; a store that hands the verifier a malformed record is a
   refusal, never an exception.

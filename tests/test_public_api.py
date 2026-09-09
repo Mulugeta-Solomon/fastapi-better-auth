@@ -11,6 +11,7 @@ import fastapi_better_auth
 
 EXPECTED = (
     "BEARER_CHALLENGE",
+    "VERIFIED_BETTER_AUTH",
     "AdminUser",
     "AmbiguousCredentials",
     "AuthServiceUnavailable",
@@ -55,7 +56,9 @@ EXPECTED = (
     "normalize_base_url",
     "parse_user",
 )
-NON_CLASS_EXPORTS = frozenset({"BEARER_CHALLENGE", "UserT", "normalize_base_url", "parse_user"})
+NON_CLASS_EXPORTS = frozenset(
+    {"BEARER_CHALLENGE", "VERIFIED_BETTER_AUTH", "UserT", "normalize_base_url", "parse_user"}
+)
 SANCTIONED_TOOLS = ("normalize_base_url", "parse_user")
 RESPONSE_CLASSVARS = ("response_status", "response_detail", "response_headers")
 

@@ -16,9 +16,14 @@ posture asserted in only one direction is not asserted at all.
 | 1.7.1 with `secondaryStorage` (Redis) | conformance, gating | every pull request, and every push to `main` | — (HEAD only) |
 | 1.7.1 with `bearer({ requireSignature: true })` | conformance (strict posture), gating | every pull request, and every push to `main` | — (HEAD only) |
 | 1.7.1 with `rateLimit: { enabled: true, customRules: { "/get-session": { window: 10, max: 3 } } }` | conformance (throttled posture), gating | every pull request, and every push to `main` | — (HEAD only) |
-| 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.3.0 on 2026-09-07 (run 34089159699) |
-| 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.3.0 on 2026-09-07 (run 34089159699) |
-| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.3.0 on 2026-09-07 (run 34089159699), `latest` = 1.7.3 that day |
+| 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.4.0 on 2026-09-09 (run 34374664791) |
+| 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.4.0 on 2026-09-09 (run 34374664791) |
+| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.4.0 on 2026-09-09 (run 34374664791), `latest` = 1.7.3 that day |
+
+That list is readable from a running application as `fastapi_better_auth.VERIFIED_BETTER_AUTH` — the
+canary matrix without its `latest` entry, which is a dist-tag rather than a version — and
+`tests/test_verified_better_auth.py` fails if this table, the canary workflow, the harness pin and
+the constant are ever edited out of sync.
 
 The strict posture is what makes "`bearer({ requireSignature: true })` is the fix" a tested claim
 rather than a reading of the source: the default-permissive server and the strict one are driven
@@ -97,7 +102,7 @@ The floor-resolution lane is what found it.
   hole, which is a patch release with an advisory.
 - **Mode A (cookie + shared session store)** reads Better Auth's *internal* formats: the signed
   cookie's HMAC construction and the session store's own layout. It is **tested against
-  better-auth 1.7.1** — the version the conformance lane pins — verified on **2026-09-07**, and an
+  better-auth 1.7.1** — the version the conformance lane pins — verified on **2026-09-10**, and an
   upstream change to either the cookie signing or the store layout may force a change here inside a
   minor release. That coupling is stated rather than hidden: Mode C (remote `get-session`) is the
   path with less of it, because it asks the server instead of reading its internals. The stores read
@@ -106,7 +111,7 @@ The floor-resolution lane is what found it.
   raw session token, with no namespace), and the JSON that key holds (`{session, user}`).
 - **Mode C (remote get-session)** couples to *less*, and the honest word for it is "less", never
   "format-independent". It is **tested against better-auth 1.7.1**, verified live on
-  **2026-09-07** across all four harness postures. Its dependencies are exactly these four, and
+  **2026-09-10** across all four harness postures. Its dependencies are exactly these four, and
   each is asserted in the conformance lane:
   1. **The 200-null contract** — `GET /api/auth/get-session` answers `200` with a body of literally
      `null` for a request that carries no valid session, rather than a `401`. The boot probe asserts
