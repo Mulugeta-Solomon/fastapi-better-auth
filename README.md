@@ -386,6 +386,9 @@ auth = BetterAuth(
     ]
 )
 
+# Where other services also own the `user` table, name the extra columns that may travel:
+#   store = SqlAlchemySessionStore(engine=engine, user_columns=["tenantId"])
+
 # Redis secondary-storage instead of SQL:
 #   from fastapi_better_auth import RedisSessionStore
 #   store = RedisSessionStore(url=os.environ["REDIS_URL"])   # a miss is a 401, never a DB fall-back
@@ -395,6 +398,16 @@ auth = BetterAuth(
 the raw-token key Better Auth's `secondaryStorage` writes. **A store reads; it never writes** — no
 `touch`, no `EXPIRE`-on-read — because a write here would extend or resurrect a session this side was
 only asked to verify.
+
+**Every column of both tables is read by default**, which is what makes your own `additionalFields`
+reach `session.user` — so do not put a secret on either table. Where the `user` table is shared with
+services that add internal columns to it, `user_columns=` (and `session_columns=` for the other
+table) names the extra columns that may be selected, and nothing else is. Both are opt-in and change
+no default, and neither narrows Better Auth's own set: the required columns are how a session is
+found at all, and `banned` / `banExpires` / `impersonatedBy` stay selected whatever the list says,
+because a ban is this library's business to enforce. A name the live table does not have is a
+`ConfigurationError` at `connect()`, beside the missing-column one. `RedisSessionStore` has no
+equivalent — it reads one stored JSON document, and a document has no SELECT to narrow.
 
 ### Is it the same secret? Fingerprint both sides at boot
 

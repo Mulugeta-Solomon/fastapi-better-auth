@@ -20,13 +20,12 @@ import importlib
 import logging
 import pathlib
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine, text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy import text
 
 from fastapi_better_auth import (
     AuthServiceUnavailable,
@@ -44,24 +43,23 @@ from fastapi_better_auth._internal.stores.sqlalchemy_core import (
 from tests.stores import (
     ADMIN_ID,
     EXPIRES_AT,
+    FLAVOURS,
     NOW,
     SESSION_ID,
     SESSION_ROW,
     TOKEN,
     USER_ID,
     USER_ROW,
-    StatementLog,
+    StoreFixture,
     async_engine,
-    build_schema,
     sync_engine,
 )
 
-FLAVOURS = ("async", "sync")
 UNKNOWN_TOKEN = "5RmMvJt3xQ8bWfKcApZnUhLd2YeGsT7q"
 BAN_EXPIRES = datetime(2026, 12, 1, tzinfo=timezone.utc)
 PACKAGE = "fastapi_better_auth._internal.stores"
 
-Build = Callable[..., "tuple[SessionStore, StatementLog]"]
+Build = StoreFixture
 
 
 @pytest.fixture
@@ -79,45 +77,15 @@ def flavour(request: pytest.FixtureRequest) -> str:
 
 @pytest.fixture
 async def build(tmp_path: pathlib.Path, flavour: str) -> AsyncIterator[Build]:
-    """Seed a database, then open a store of the flavour under test over the same file."""
-    engines: list[Engine | AsyncEngine] = []
-
-    def factory(
-        store_options: dict[str, Any] | None = None, **schema: Any
-    ) -> tuple[SessionStore, StatementLog]:
-        names = {key: schema[key] for key in ("session_table", "user_table") if key in schema}
-        names.update(store_options or {})
-        path = tmp_path / f"harness{len(engines)}.sqlite"
-        build_schema(path, **schema)
-        log = StatementLog()
-        engine: Engine | AsyncEngine
-        store: SessionStore
-        if flavour == "async":
-            engine = async_engine(path)
-            store = SqlAlchemySessionStore(engine=engine, **names)
-        else:
-            engine = sync_engine(path)
-            store = SyncStoreAdapter(engine=engine, **names)
-        log.attach(engine)
-        engines.append(engine)
-        return store, log
-
-    yield factory
-    for engine in engines:
-        if isinstance(engine, AsyncEngine):
-            await engine.dispose()
-        else:
-            engine.dispose()
+    fixture = StoreFixture(tmp_path, flavour)
+    yield fixture
+    await fixture.aclose()
 
 
 async def connect(store: SessionStore) -> None:
     """The startup hook, which the Protocol the tests hold does not declare."""
     assert isinstance(store, (SqlAlchemySessionStore, SyncStoreAdapter))
     await store.connect()
-
-
-def selects(log: StatementLog) -> list[str]:
-    return [line for line in log.statements if line.lstrip().upper().startswith("SELECT")]
 
 
 class TestFetchSessionByToken:
@@ -148,7 +116,7 @@ class TestFetchSessionByToken:
 
         await store.fetch_session_by_token(TOKEN)
 
-        assert len(selects(log)) == 1
+        assert len(log.selects) == 1
 
     @pytest.mark.anyio
     async def test_a_naive_stored_expiry_is_read_as_utc(self, build: Build) -> None:
@@ -515,7 +483,7 @@ class TestStatements:
         await store.fetch_session_by_token(TOKEN)
         await store.fetch_user_by_id(USER_ID)
 
-        for statement in selects(log):
+        for statement in log.selects:
             assert "LIMIT" in statement.upper()
 
 
