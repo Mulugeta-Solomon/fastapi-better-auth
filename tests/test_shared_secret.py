@@ -50,6 +50,27 @@ no UTF-8 encoding at all reaches the constructor the docstring's own example use
 
 ACCEPTED: tuple[str, ...] = (GOOD, OTHER, PASSPHRASE, f"abab{GOOD}", GOOD[:MIN_SECRET_LENGTH])
 
+NODE_FINGERPRINT_PREFIX = "tok_fp="
+NODE_FINGERPRINT_HEX = 8
+NODE_PARITY_VALUES: tuple[str, ...] = (
+    GOOD,
+    OTHER,
+    PASSPHRASE,
+    "日本語のシークレット-abcdefghijklmnopqrstuvwx",
+    "astral-🔐-secret-four-utf8-bytes-here",
+)
+NODE_PARITY_IDS = ("ascii", "ascii-other", "latin-diacritics", "japanese", "astral-emoji")
+"""Labels, not values: a parametrized id built from the value itself would print a secret."""
+
+
+def node_fingerprint(value: str) -> str:
+    """The README's Node one-liner, transcribed into `hashlib` and nothing more.
+
+    `"tok_fp=" + createHash("sha256").update(secret, "utf8").digest("hex").slice(0, 8)`.
+    """
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"{NODE_FINGERPRINT_PREFIX}{digest[:NODE_FINGERPRINT_HEX]}"
+
 
 def _library_frames(error: BaseException) -> list[Any]:
     """Only this library's own frames - a test's locals are not what a reporter blames."""
@@ -286,6 +307,34 @@ def test_the_fingerprint_cannot_be_turned_back_into_the_secret() -> None:
     secret = SharedSecret(GOOD)
 
     assert secret.fingerprint.endswith(hashlib.sha256(GOOD.encode()).hexdigest()[:8])
+
+
+@pytest.mark.parametrize("value", NODE_PARITY_VALUES, ids=NODE_PARITY_IDS)
+def test_the_node_side_one_liner_computes_the_identical_string(value: str) -> None:
+    """The README's boot-time mismatch check is two logs compared by eye, so the two sides
+    have to produce the same characters or the recipe is worse than nothing.
+
+    The Node half is documented as
+    `"tok_fp=" + createHash("sha256").update(secret, "utf8").digest("hex").slice(0, 8)`, and
+    `node_fingerprint` is that expression transcribed into `hashlib` - same digest, same hex
+    rendering, same eight-character slice, same literal prefix. Non-ASCII values are here on
+    purpose: `update(secret, "utf8")` and `str.encode("utf-8")` have to agree byte for byte,
+    including on an astral-plane character that is four UTF-8 bytes and two UTF-16 units, or
+    a passphrase secret would compare unequal on two sides that actually match.
+
+    This library encodes with the `replace` error handler, which the strict Node construction
+    has no equivalent of - but `SharedSecret` refuses every value that has no strict UTF-8
+    encoding at all, so no value that can reach `fingerprint` through one takes that branch.
+    """
+    assert SharedSecret(value).fingerprint == node_fingerprint(value)
+
+
+def test_the_recipe_tells_two_different_secrets_apart() -> None:
+    """A mismatch check is only a check if a mismatch is visible: eight hex characters is
+    32 bits, so two distinct secrets colliding here is what would make the recipe silent."""
+    computed = {node_fingerprint(value) for value in NODE_PARITY_VALUES}
+
+    assert len(computed) == len(NODE_PARITY_VALUES)
 
 
 def test_two_secrets_with_the_same_value_are_equal_and_hash_alike() -> None:

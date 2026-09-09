@@ -53,10 +53,12 @@ from ._internal.transport import (
     UntrustedResponse,
 )
 from ._internal.urls import normalize_base_url
+from ._internal.verified import VERIFIED_BETTER_AUTH
 from ._internal.verifiers import PreparedVerifier, Verifier
 
 __all__ = [
     "BEARER_CHALLENGE",
+    "VERIFIED_BETTER_AUTH",
     "AdminUser",
     "AmbiguousCredentials",
     "AuthServiceUnavailable",

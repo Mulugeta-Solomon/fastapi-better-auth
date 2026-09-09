@@ -20,6 +20,11 @@ posture asserted in only one direction is not asserted at all.
 | 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.4.0 on 2026-09-09 (run 34374664791) |
 | `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.4.0 on 2026-09-09 (run 34374664791), `latest` = 1.7.3 that day |
 
+That list is readable from a running application as `fastapi_better_auth.VERIFIED_BETTER_AUTH` — the
+canary matrix without its `latest` entry, which is a dist-tag rather than a version — and
+`tests/test_verified_better_auth.py` fails if this table, the canary workflow, the harness pin and
+the constant are ever edited out of sync.
+
 The strict posture is what makes "`bearer({ requireSignature: true })` is the fix" a tested claim
 rather than a reading of the source: the default-permissive server and the strict one are driven
 with the same credentials and asserted to answer differently. The throttled posture is what pins the
