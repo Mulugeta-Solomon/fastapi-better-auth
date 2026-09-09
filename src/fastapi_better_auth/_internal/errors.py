@@ -182,6 +182,32 @@ class CsrfFailure(SessionError):
     response_headers: ClassVar[Mapping[str, str] | None] = None
 
 
+class NotAuthorized(SessionError):
+    """An authenticated session was refused by an authorization rule.
+
+    403, not 401: the request proved who it is and was refused on what it may do, so there is
+    nothing for the client to re-authenticate and no `WWW-Authenticate` challenge to offer. It
+    is byte-identical to `CsrfFailure` on the wire - both say only "a real credential was
+    refused on policy", and neither says which policy.
+
+    Reaching it at all means authentication already succeeded: an anonymous or forged request
+    is answered `401` by the session dependency an authorization gate composes on, and never
+    reaches the rule. That order is what keeps a 403 from becoming an oracle for which
+    credentials this deployment accepts.
+
+    `reason` names the operator's own rule, the user id, and - for a membership refusal - the
+    sanitized resource id the request asked about. It is never rendered to the client, and it
+    never carries the client's data verbatim.
+
+    Raised by `BetterAuth.require` and `BetterAuth.require_membership`, and available for an
+    application's own authorization failures.
+    """
+
+    response_status: ClassVar[int] = 403
+    response_detail: ClassVar[str] = "Forbidden"
+    response_headers: ClassVar[Mapping[str, str] | None] = None
+
+
 class AmbiguousCredentials(SessionError):
     """Two or more credentials arrived on one request.
 

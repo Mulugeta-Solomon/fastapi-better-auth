@@ -27,6 +27,7 @@ from fastapi_better_auth import (
     CsrfFailure,
     InvalidCredential,
     MissingCredential,
+    NotAuthorized,
     SessionError,
     SessionExpired,
     SessionRevoked,
@@ -45,12 +46,18 @@ CSRF_CASE: tuple[str, type[SessionError], str] = (
     CsrfFailure,
     "origin https://evil.example rejected allowlist",
 )
+AUTHZ_CASE: tuple[str, type[SessionError], str] = (
+    "authz",
+    NotAuthorized,
+    "editor role required refused for user u2 in org_id=org_b",
+)
+FORBIDDEN_CASES = (CSRF_CASE, AUTHZ_CASE)
 AMBIGUOUS_CASE: tuple[str, type[SessionError], str] = (
     "ambiguous",
     AmbiguousCredentials,
     "2 credentials presented JwtVerifier CookieVerifier",
 )
-ALL_CASES = (*UNAUTHENTICATED_CASES, CSRF_CASE, AMBIGUOUS_CASE)
+ALL_CASES = (*UNAUTHENTICATED_CASES, *FORBIDDEN_CASES, AMBIGUOUS_CASE)
 
 PAYLOAD_MARKER = "mallory-9f3ab21c"
 MALFORMED_PAYLOAD = {"id": "u1", "image": f"https://cdn.example/{PAYLOAD_MARKER}/{'x' * 5000}"}
@@ -187,14 +194,33 @@ def test_the_401_family_is_indistinguishable_on_the_wire(
     assert all(response.headers["www-authenticate"] == "Bearer" for response in responses)
 
 
-def test_csrf_failure_is_a_403_with_no_challenge(app_and_observed: AppAndObserved) -> None:
+@pytest.mark.parametrize("path", [case[0] for case in FORBIDDEN_CASES])
+def test_a_policy_refusal_is_a_403_with_no_challenge(
+    app_and_observed: AppAndObserved, path: str
+) -> None:
     app, _ = app_and_observed
     with TestClient(app) as client:
-        response = client.get(f"/{CSRF_CASE[0]}")
+        response = client.get(f"/{path}")
 
     assert response.status_code == 403
     assert response.json() == {"detail": "Forbidden"}
     assert "www-authenticate" not in response.headers
+
+
+def test_the_403_family_is_indistinguishable_on_the_wire(
+    app_and_observed: AppAndObserved,
+) -> None:
+    """A failed CSRF check and a failed authorization check are one answer on the wire: both
+    say only that a real credential was refused on policy, and neither says which policy."""
+    app, _ = app_and_observed
+    with TestClient(app) as client:
+        responses = [client.get(f"/{path}") for path, _cls, _reason in FORBIDDEN_CASES]
+
+    headers = [comparable_headers(response) for response in responses]
+
+    assert {response.status_code for response in responses} == {403}
+    assert {response.content for response in responses} == {b'{"detail":"Forbidden"}'}
+    assert all(header == headers[0] for header in headers)
 
 
 def test_ambiguous_credentials_is_a_400_with_no_challenge(

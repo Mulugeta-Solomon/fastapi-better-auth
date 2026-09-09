@@ -25,6 +25,7 @@ from fastapi_better_auth import (
     CsrfFailure,
     InvalidCredential,
     MissingCredential,
+    NotAuthorized,
     SessionError,
     SessionExpired,
     SessionRevoked,
@@ -39,6 +40,7 @@ SHIPPED_NAMES = frozenset(
         "AuthServiceUnavailable",
         "MissingCredential",
         "CsrfFailure",
+        "NotAuthorized",
         "AmbiguousCredentials",
     }
 )
@@ -121,10 +123,12 @@ def test_every_error_renders_a_sanctioned_wire_shape(error_cls: type[SessionErro
     assert error.headers == headers
 
 
-def test_csrf_failure_is_the_only_403() -> None:
+def test_the_403_family_is_exactly_the_policy_refusals() -> None:
+    """403 is "you are somebody, and that somebody may not do this" — a request that carried a
+    credential and was refused on policy. Nothing about identity may claim it."""
     by_status = {cls.__name__ for cls in shipped_session_errors() if cls.response_status == 403}
 
-    assert by_status == {"CsrfFailure"}
+    assert by_status == {"CsrfFailure", "NotAuthorized"}
 
 
 def test_ambiguous_credentials_is_the_only_400() -> None:
@@ -137,7 +141,7 @@ def test_ambiguous_credentials_is_the_only_400() -> None:
 def test_the_401_family_is_exactly_the_credential_outcomes() -> None:
     by_status = {cls.__name__ for cls in shipped_session_errors() if cls.response_status == 401}
 
-    assert by_status == SHIPPED_NAMES - {"CsrfFailure", "AmbiguousCredentials"}
+    assert by_status == SHIPPED_NAMES - {"CsrfFailure", "NotAuthorized", "AmbiguousCredentials"}
 
 
 def test_a_missing_credential_is_indistinguishable_from_a_forged_one() -> None:
@@ -162,8 +166,22 @@ def test_an_unverifiable_session_fails_closed() -> None:
     assert AuthServiceUnavailable(reason="jwks fetch failed").status_code == 401
 
 
-def test_csrf_failure_carries_no_authentication_challenge() -> None:
-    assert CsrfFailure(reason="origin rejected").headers is None
+@pytest.mark.parametrize("error_cls", [CsrfFailure, NotAuthorized], ids=lambda c: c.__name__)
+def test_a_403_carries_no_authentication_challenge(error_cls: type[SessionError]) -> None:
+    assert error_cls(reason="refused on policy").headers is None
+
+
+def test_the_two_403s_are_indistinguishable_on_the_wire() -> None:
+    """A failed CSRF check and a failed authorization check must not be separable: the pair is
+    exactly "this credential is real and this request is still refused"."""
+    csrf = CsrfFailure(reason="origin https://evil.example rejected allowlist")
+    authz = NotAuthorized(reason="editor role required refused for user u2")
+
+    assert (csrf.status_code, csrf.detail, csrf.headers) == (
+        authz.status_code,
+        authz.detail,
+        authz.headers,
+    )
 
 
 @pytest.mark.parametrize(
@@ -276,6 +294,10 @@ def test_a_compliant_subclass_is_still_allowed() -> None:
 
 
 def test_error_classes_stay_importable_from_the_root() -> None:
-    assert {InvalidCredential, SessionExpired, SessionRevoked, AuthServiceUnavailable} <= set(
-        shipped_session_errors()
-    )
+    assert {
+        InvalidCredential,
+        SessionExpired,
+        SessionRevoked,
+        AuthServiceUnavailable,
+        NotAuthorized,
+    } <= set(shipped_session_errors())
