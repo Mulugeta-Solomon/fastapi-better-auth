@@ -130,6 +130,17 @@ def validated_secure_cookies(secure_cookies: object) -> bool:
     return secure_cookies
 
 
+def validated_refuse_unsigned_bearer(refuse_unsigned_bearer: object) -> bool:
+    if not isinstance(refuse_unsigned_bearer, bool):
+        raise ConfigurationError(
+            "RemoteVerifier(refuse_unsigned_bearer=...) must be a bool: True to make the boot"
+            " probe's advisory bearer check refuse a server whose bearer plugin is at its default"
+            " requireSignature: false, False to log one advisory warning and serve; got"
+            f" {type(refuse_unsigned_bearer).__name__}."
+        )
+    return refuse_unsigned_bearer
+
+
 def validated_base_path(base_path: object) -> str:
     if not isinstance(base_path, str):
         raise ConfigurationError(_BASE_PATH_MESSAGE.format(got=type(base_path).__name__))

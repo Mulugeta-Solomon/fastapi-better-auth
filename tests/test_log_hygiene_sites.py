@@ -278,7 +278,10 @@ def test_the_advisory_require_signature_warning_carries_no_credential(
 
     async def drive() -> None:
         await remote_probe.run_probe(
-            _CookieSettingTransport(), uri=f"{ORIGIN}/api/auth/get-session", max_bytes=65536
+            _CookieSettingTransport(),
+            uri=f"{ORIGIN}/api/auth/get-session",
+            max_bytes=65536,
+            refuse_unsigned_bearer=False,
         )
 
     anyio.run(drive)
