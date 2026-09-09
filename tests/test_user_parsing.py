@@ -387,9 +387,12 @@ def test_a_field_name_a_log_line_could_not_survive_is_redacted_here_too(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """`loc` for a `missing` error is the model's own alias, so this is belt and braces - but
-    the sanitizer runs on both channels or on neither."""
-    hostile: Any = {"new\nline": (str, ...)}
-    model = create_model("Injected", __base__=User, **hostile)
+    the sanitizer runs on both channels or on neither. The hostile spelling is the field's
+    validation alias: a field *named* that way has no `__init__` signature on the oldest
+    supported pydantic, and the alias is what a `missing` error reports anyway."""
+    model = create_model(
+        "Injected", __base__=User, injected=(str, Field(validation_alias="new\nline"))
+    )
 
     with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER), pytest.raises(InvalidCredential):
         parse_user(model, {"id": "u1"})
