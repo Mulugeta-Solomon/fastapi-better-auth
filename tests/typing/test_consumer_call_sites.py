@@ -9,7 +9,7 @@ The failing direction is pinned too. `assert_type` fails when the type is *wider
 for, so a deliberately-wrong assertion carrying `# pyright: ignore[reportAssertTypeFailure]`
 says "this is not that type" - and because the repository sets
 `reportUnnecessaryTypeIgnoreComment`, the day it silently becomes that type the suppression
-turns into an error of its own. Widening `Session[AdminUser].user` back to `User` is caught
+turns into an error of its own. Widening `Session[Member].user` back to `User` is caught
 from both sides, which no single positive assertion can do.
 
 The runtime half is deliberately thin: `assert_type` is a no-op at runtime, so the requests at
@@ -28,6 +28,7 @@ from pydantic import SecretStr
 from typing_extensions import assert_type
 
 from fastapi_better_auth import (
+    AdminUser,
     BetterAuth,
     JwtVerifier,
     Session,
@@ -43,7 +44,7 @@ HEADER = "x-cred-a"
 SECRET = "Zt7Qv1oXbK4mPr9wCyHnLdEuAsJf2Ng6"
 
 
-class AdminUser(User):
+class Member(User):
     """The deployment's own model - what `user_model=` is for."""
 
     role: str | None = None
@@ -51,10 +52,8 @@ class AdminUser(User):
 
 auth = BetterAuth(verifiers=[FakeVerifier(HEADER, payload={"id": "u1", "role": "admin"})])
 
-CurrentAdmin = Annotated[Session[AdminUser], Depends(auth.current_session(user_model=AdminUser))]
-MaybeAdmin = Annotated[
-    Session[AdminUser] | None, Depends(auth.optional_session(user_model=AdminUser))
-]
+CurrentMember = Annotated[Session[Member], Depends(auth.current_session(user_model=Member))]
+MaybeMember = Annotated[Session[Member] | None, Depends(auth.optional_session(user_model=Member))]
 CurrentUser = Annotated[Session[User], Depends(auth.current_session())]
 MaybeUser = Annotated[Session[User] | None, Depends(auth.optional_session())]
 
@@ -62,9 +61,9 @@ MaybeUser = Annotated[Session[User] | None, Depends(auth.optional_session())]
 # --- the session a route body receives -------------------------------------------------
 
 
-async def read_admin(session: CurrentAdmin) -> dict[str, str]:
-    assert_type(session, Session[AdminUser])
-    assert_type(session.user, AdminUser)
+async def read_member(session: CurrentMember) -> dict[str, str]:
+    assert_type(session, Session[Member])
+    assert_type(session.user, Member)
     assert_type(session.user.role, str | None)
     assert_type(session.user.id, str)
     assert_type(session.token, SecretStr | None)
@@ -74,12 +73,12 @@ async def read_admin(session: CurrentAdmin) -> dict[str, str]:
     return {"id": session.user.id, "role": session.user.role or ""}
 
 
-async def read_admin_maybe(session: MaybeAdmin) -> dict[str, str | None]:
-    assert_type(session, Session[AdminUser] | None)
+async def read_member_maybe(session: MaybeMember) -> dict[str, str | None]:
+    assert_type(session, Session[Member] | None)
     if session is None:
         return {"id": None}
-    assert_type(session, Session[AdminUser])
-    assert_type(session.user, AdminUser)
+    assert_type(session, Session[Member])
+    assert_type(session.user, Member)
     return {"id": session.user.id}
 
 
@@ -105,13 +104,24 @@ def takes_a_base_session(session: Session[User]) -> str:
     return session.user.id
 
 
-def read_the_surrounding_types(session: Session[AdminUser]) -> None:
+def read_the_surrounding_types(session: Session[Member]) -> None:
     assert_type(takes_a_base_session(session), str)
     assert_type(auth.verifiers, tuple[Verifier, ...])
     assert_type(BetterAuth.from_env(), BetterAuth)
-    assert_type(parse_user(AdminUser, {"id": "u1"}), AdminUser)
+    assert_type(parse_user(Member, {"id": "u1"}), Member)
     assert_type(parse_user(User, {"id": "u1"}), User)
     assert_type(normalize_base_url("https://auth.example.com"), str)
+
+
+def read_the_admin_user_types(session: Session[AdminUser]) -> None:
+    """The subclass this library ships, checked the way a consumer's editor checks it."""
+    assert_type(session.user, AdminUser)
+    assert_type(session.user.role, str | None)
+    assert_type(session.user.banned, bool | None)
+    assert_type(session.user.ban_reason, str | None)
+    assert_type(session.user.ban_expires, datetime | None)
+    assert_type(session.impersonated_by, str | None)
+    assert_type(session.user, User)  # pyright: ignore[reportAssertTypeFailure]
 
 
 def read_the_verifier_types(verifier: JwtVerifier) -> None:
@@ -133,8 +143,8 @@ def read_the_secret_types() -> None:
 # --- the routes are real ------------------------------------------------------------------
 
 app = FastAPI()
-app.add_api_route("/admin", read_admin, methods=["GET"])
-app.add_api_route("/admin-maybe", read_admin_maybe, methods=["GET"])
+app.add_api_route("/member", read_member, methods=["GET"])
+app.add_api_route("/member-maybe", read_member_maybe, methods=["GET"])
 app.add_api_route("/default", read_default, methods=["GET"])
 app.add_api_route("/default-maybe", read_default_maybe, methods=["GET"])
 
@@ -143,17 +153,25 @@ def test_every_asserted_call_site_is_a_route_that_answers() -> None:
     """`assert_type` is a runtime no-op, so without this the file is something pyright reads
     and nothing ever loads - and a call site nobody can reach proves nothing about one."""
     with client(app) as http:
-        admin = http.get("/admin", headers={HEADER: GOOD_CREDENTIAL})
-        anonymous = http.get("/admin-maybe")
+        member = http.get("/member", headers={HEADER: GOOD_CREDENTIAL})
+        anonymous = http.get("/member-maybe")
         default = http.get("/default", headers={HEADER: GOOD_CREDENTIAL})
 
-    assert admin.json() == {"id": "u1", "role": "admin"}
+    assert member.json() == {"id": "u1", "role": "admin"}
     assert anonymous.json() == {"id": None}
     assert default.json() == {"id": "u1"}
 
 
 def test_the_surrounding_types_are_exercised_too() -> None:
-    session = Session[AdminUser](user=AdminUser(id="u1"), expires_at=None, raw={"id": "u1"})
+    session = Session[Member](user=Member(id="u1"), expires_at=None, raw={"id": "u1"})
+    admin = Session[AdminUser](
+        user=AdminUser(id="u1", role="admin"),
+        expires_at=None,
+        impersonated_by="admin-1",
+        raw={"id": "u1"},
+    )
 
     assert takes_a_base_session(session) == "u1"
+    assert takes_a_base_session(admin) == "u1"
+    read_the_admin_user_types(admin)
     read_the_secret_types()

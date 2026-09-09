@@ -400,6 +400,7 @@ def _session(
     # payload under upstream's own `token` column - and all three must be gone before it
     # exits, on the refusal path as well as the return (D-181).
     expires_at = record.expires_at
+    impersonated_by = record.impersonated_by
     raw: Mapping[str, Any] = record.payload
     del record
     try:
@@ -407,6 +408,7 @@ def _session(
             user=parse_user(user_model, user.payload),
             expires_at=expires_at,
             token=SecretStr(token),
+            impersonated_by=impersonated_by,
             raw=raw,
         )
     finally:

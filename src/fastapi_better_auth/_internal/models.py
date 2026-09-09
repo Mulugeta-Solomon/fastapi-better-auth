@@ -15,6 +15,7 @@ from pydantic import (
     ConfigDict,
     Field,
     SecretStr,
+    StrictBool,
 )
 from pydantic.alias_generators import to_camel
 
@@ -22,6 +23,8 @@ ID_MAX_LENGTH = 255
 EMAIL_MAX_LENGTH = 320
 NAME_MAX_LENGTH = 1000
 IMAGE_MAX_LENGTH = 4096
+ROLE_MAX_LENGTH = 255
+BAN_REASON_MAX_LENGTH = 1000
 
 
 def _coerce_integer_id(value: Any) -> Any:
@@ -105,11 +108,12 @@ class User(BaseModel):
 
     Subclass it to type the fields your deployment actually has:
 
-        class AdminUser(User):
+        class Member(User):
             role: str | None = None
 
-    Then pass the subclass where a user model is expected; `Session[AdminUser].user` is
-    typed as `AdminUser`.
+    Then pass the subclass where a user model is expected; `Session[Member].user` is
+    typed as `Member`. If the fields you want are the ones Better Auth's `admin()` plugin
+    adds, `AdminUser` is that subclass already written.
 
     Do not treat these fields as trusted assertions about the user. A Better Auth
     `additionalFields` entry defaults to `input: true`, which means the account holder
@@ -134,6 +138,46 @@ class User(BaseModel):
     image: str | None = Field(default=None, max_length=IMAGE_MAX_LENGTH)
     created_at: UpstreamDatetime | None = None
     updated_at: UpstreamDatetime | None = None
+
+
+class AdminUser(User):
+    """A `User` with the four fields Better Auth's `admin()` plugin adds, already declared.
+
+    Pass it where a user model is expected - `Depends(auth.current_session(user_model=AdminUser))` -
+    and `session.user.role` is typed. It is exactly the subclass a deployment would otherwise
+    hand-write, so nothing here is new behaviour: the fields are parsed by the same alias
+    generator as every other, from the store payload (Mode A), the JWT claims (Mode B) or the
+    `get-session` body (Mode C).
+
+    **Only meaningful when the upstream server mounts `admin()`.** The plugin declares all four
+    columns `input: false`, so they are server-controlled and an account holder can never set one
+    at sign-up - which is what makes them worth typing at all, unlike an `additionalFields` entry.
+    A payload from a deployment without the plugin carries none of the keys and every field reads
+    `None`, which means **unknown** and never *safe*: a missing `banned` is not an unbanned user.
+
+    **A view, not a decision.** In Modes A and C the ban is enforced by the verifier, from the
+    store record or the upstream document, before this model is built - a live ban is a 401 and
+    the route never runs. So a `banned=True` reaching your route is a ban that has *lapsed*
+    (`ban_expires` in the past), or Mode B data, where a JWT carries whatever was true when it was
+    minted. Authorize on your own rules, never on this flag alone.
+
+    Attributes:
+        role: The plugin's role column, `"admin"` or `"user"` by default, and whatever names
+            `adminRoles`/`defaultRole` were configured with otherwise.
+        banned: Whether the user is banned, as a strict boolean: a `1`, a `"true"` or anything
+            else is refused rather than guessed at, because a guess on a ban flag is a guess in
+            the direction of letting a banned user in (D-182).
+        ban_reason: The operator's own text for the ban. Never rendered by this library.
+        ban_expires: When the ban lifts, timezone-aware. `None` on a banned user means the ban
+            is permanent, not that it has lapsed.
+
+    Instances are immutable.
+    """
+
+    role: str | None = Field(default=None, max_length=ROLE_MAX_LENGTH)
+    banned: StrictBool | None = None
+    ban_reason: str | None = Field(default=None, max_length=BAN_REASON_MAX_LENGTH)
+    ban_expires: UpstreamDatetime | None = None
 
 
 # The `_co` suffix PLC0105 asks for cannot be applied: this name is exported API.
@@ -162,6 +206,13 @@ class Session(BaseModel, Generic[UserT]):
             server-side session token to hand back. Held as a `SecretStr`, so it is
             masked in reprs and dumps and excluded from responses; read it deliberately
             with `.get_secret_value()`.
+        impersonated_by: The admin's user id when Better Auth's `admin()` plugin created this
+            session through its impersonation endpoint. It is **provenance, not permission**:
+            it says an administrator is acting as `user`, never that the request may do
+            anything more. `None` covers three different situations that are not worth
+            distinguishing on this field - nobody is impersonating, the plugin is not mounted,
+            and Mode B, where a JWT carries the user object alone and no session column can
+            reach it. It stays readable on `raw` as `impersonatedBy` too.
         raw: The upstream payload as it arrived - the decoded JWT claims, or the `session`
             half of the `get-session` body (never the `{session, user}` wrapper; the user is
             `Session.user`). Everything this model does not promote to a field
@@ -186,4 +237,5 @@ class Session(BaseModel, Generic[UserT]):
     user: UserT
     expires_at: AwareDatetime | None
     token: SecretStr | None = None
+    impersonated_by: str | None = None
     raw: RawPayload = Field(repr=False, exclude=True)

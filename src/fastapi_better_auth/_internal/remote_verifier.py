@@ -654,6 +654,7 @@ def _build_session(
     # The forwarded token, the record's copy of it, and the payload's own `token` column all live
     # in this frame; all must be gone before it exits, on the refusal path as well as the return.
     expires_at = record.expires_at
+    impersonated_by = record.impersonated_by
     raw = record.payload
     del record
     try:
@@ -661,6 +662,7 @@ def _build_session(
             user=parse_user(user_model, user.payload),
             expires_at=expires_at,
             token=SecretStr(token),
+            impersonated_by=impersonated_by,
             raw=raw,
         )
     finally:
