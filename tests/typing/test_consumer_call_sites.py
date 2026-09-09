@@ -60,26 +60,26 @@ CurrentUser = Annotated[Session[User], Depends(auth.current_session())]
 MaybeUser = Annotated[Session[User] | None, Depends(auth.optional_session())]
 
 
-class Member(User):
+class Staff(User):
     """The user model the authorization helpers are parameterized on."""
 
     role: str | None = None
 
 
-def is_editor(session: Session[Member]) -> bool:
+def is_editor(session: Session[Staff]) -> bool:
     return session.user.role == "editor"
 
 
-async def member_of(resource_id: str, session: Session[Member]) -> str | None:
+async def member_of(resource_id: str, session: Session[Staff]) -> str | None:
     return f"{session.user.id}:{resource_id}"
 
 
 Editor = Annotated[
-    Session[Member], Depends(auth.require(is_editor, reason="editor role", user_model=Member))
+    Session[Staff], Depends(auth.require(is_editor, reason="editor role", user_model=Staff))
 ]
 Scoped = Annotated[
-    Membership[Member, str],
-    Depends(auth.require_membership("org_id", member_of, reason="org member", user_model=Member)),
+    Membership[Staff, str],
+    Depends(auth.require_membership("org_id", member_of, reason="org member", user_model=Staff)),
 ]
 
 
@@ -124,8 +124,8 @@ async def read_default_maybe(session: MaybeUser) -> dict[str, str | None]:
 async def read_editor(session: Editor) -> dict[str, str]:
     """`require` hands the route the same session `current_session` would, parameterized on the
     same user model - so nothing downstream has to re-narrow what it was already given."""
-    assert_type(session, Session[Member])
-    assert_type(session.user, Member)
+    assert_type(session, Session[Staff])
+    assert_type(session.user, Staff)
     assert_type(session.user.role, str | None)
     assert_type(session.user, User)  # pyright: ignore[reportAssertTypeFailure]
     return {"id": session.user.id, "role": session.user.role or ""}
@@ -134,9 +134,9 @@ async def read_editor(session: Editor) -> dict[str, str]:
 async def read_scoped(access: Scoped) -> dict[str, str]:
     """`require_membership` hands the route the grant its own lookup returned, typed - which is
     the whole reason the result is a container rather than the session again."""
-    assert_type(access, Membership[Member, str])
-    assert_type(access.session, Session[Member])
-    assert_type(access.session.user, Member)
+    assert_type(access, Membership[Staff, str])
+    assert_type(access.session, Session[Staff])
+    assert_type(access.session.user, Staff)
     assert_type(access.resource_id, str)
     assert_type(access.grant, str)
     assert_type(access.grant, str | None)  # pyright: ignore[reportAssertTypeFailure]

@@ -272,6 +272,29 @@ def test_a_lookup_that_raises_fails_closed_and_is_logged(
     assert "membership table unreachable" not in observable(response)
 
 
+def test_a_lookup_that_raises_before_returning_its_coroutine_is_still_contained(
+    records: list[logging.LogRecord],
+) -> None:
+    """A plain `def` that raises does so at the call, before any coroutine exists to await.
+
+    The call itself sits inside the containment, not just the `await` (D-064): with only the
+    `await` wrapped, this exception would escape as a 500 whose traceback frames hold the
+    session - and in cookie mode the raw token with it."""
+    _verifier, auth = one_verifier()
+
+    def explode(_resource_id: str, _session: Session[Member]) -> str:
+        raise RuntimeError("policy table unreadable")
+
+    with client(membership_app(auth, explode)) as http:
+        response = http.get(CALLED, headers={HEADER: GOOD_CREDENTIAL})
+
+    written = rendered(records)
+    assert response.status_code == 403
+    assert response.json() == FORBIDDEN
+    assert "policy table unreadable" in written, "the operator lost the real exception"
+    assert "policy table unreadable" not in observable(response)
+
+
 def test_the_reason_for_an_escaped_lookup_names_the_exception_type() -> None:
     _verifier, auth = one_verifier()
 

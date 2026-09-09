@@ -655,8 +655,9 @@ two are unrelated.
 The failure that produces is not subtle. A handler that **selects data by the path's organization but
 authorizes on `activeOrganizationId`** lets any member of any organization read every organization's
 data: the check passes because they do have an active organization, and the query then runs against
-whatever the path said. `require_membership` cannot be written that way — the id it hands your lookup
-is the one FastAPI resolved from the request, and there is no other one to reach for.
+whatever the path said. `require_membership` hands your lookup the id FastAPI resolved from the request and no other,
+so the mistake can only be re-created inside the lookup — by ignoring that argument and reading
+`session.raw` instead, which is the one thing a `member` coroutine must never do.
 
 The real `member_of` is a query against the `member` table Better Auth already writes. It needs a
 database, so it is shown rather than executed here:
@@ -726,8 +727,10 @@ fingerprints — a key id, a truncated hash — never a raw credential.
 What it *does* log, all on the `fastapi_better_auth` logger, is the deployment telling on itself.
 At `WARNING`: a session-cache cookie it was not asked to read, a JWKS key it will not verify with or
 a refresh that failed while a usable key set was still on hand, a stored record or a database table
-it cannot use, a `429` backoff latch opening (once per latch, never once per refused request), and
-the advisory `requireSignature` warning (once per process). At `ERROR`, with the traceback: an
+it cannot use, a user model that declares a required field the upstream payload does not carry
+(once per process per model, naming the model and the missing wire keys), a `429` backoff latch
+opening (once per latch, never once per refused request), and the advisory `requireSignature`
+warning (once per process). At `ERROR`, with the traceback: an
 exception that escaped a verifier, and one that escaped an authorization predicate or a membership
 lookup — each answered as the uniform refusal rather than a `500`, so the log is the only place the
 real exception exists. The `reason` those build names the exception's *type* and not its message.
