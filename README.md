@@ -163,7 +163,8 @@ to "anonymous".
 
 If your Better Auth server mounts the [admin plugin](https://better-auth.com/docs/plugins/admin) it
 adds four columns to `user` — `role`, `banned`, `banReason`, `banExpires` — and one to `session`,
-`impersonatedBy`. `AdminUser` is the subclass you would otherwise write for the four:
+`impersonatedBy` (`dist/plugins/admin/schema.mjs:3-30`). `AdminUser` is the subclass you would otherwise
+write for the four:
 
 ```python
 from typing import Annotated
@@ -183,8 +184,8 @@ async def whoami(session: CurrentAdmin) -> str:
     return session.user.role or "unknown"
 ```
 
-The plugin declares all four `input: false`, so they are server-controlled and an account holder
-can never set one at sign-up — which is what makes them worth typing, unlike an `additionalFields`
+The plugin declares all five `input: false` (same file), so they are server-controlled and an account
+holder can never set one at sign-up — which is what makes them worth typing, unlike an `additionalFields`
 entry. Without the plugin the keys are simply absent and every field reads `None`, which means
 **unknown** and never *safe*: a missing `banned` is not an unbanned user.
 

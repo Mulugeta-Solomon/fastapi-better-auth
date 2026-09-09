@@ -17,6 +17,8 @@ import pytest
 from pydantic import ConfigDict, Field, ValidationError, create_model, field_validator
 
 from fastapi_better_auth import AdminUser, InvalidCredential, User, parse_user
+from fastapi_better_auth._internal import parsing
+from fastapi_better_auth._internal.once import OnceByKey
 
 LIBRARY_LOGGER = "fastapi_better_auth"
 LEAKY_MARKER = "mallory-9f3ab21c"
@@ -398,10 +400,15 @@ def test_a_field_name_a_log_line_could_not_survive_is_redacted_here_too(
 
 
 def test_a_refusal_that_is_not_about_a_missing_field_is_silent(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A `banned: "true"` is a wire-shape problem, not a name mismatch. Warning on it would
-    make the advisory fire for every malformed payload and stop meaning anything."""
+    make the advisory fire for every malformed payload and stop meaning anything.
+
+    The latch is replaced so this is a genuine observation: `AdminUser` is a module-level class
+    another test may already have fired the per-model latch for, and a silence that only means
+    "already warned" would let an advisory-on-every-error mutation pass."""
+    monkeypatch.setattr(parsing, "_advised", OnceByKey())
     with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER), pytest.raises(InvalidCredential):
         parse_user(AdminUser, {"id": "u1", "banned": "true"})
 
