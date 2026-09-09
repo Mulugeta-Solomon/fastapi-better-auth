@@ -27,13 +27,18 @@ from __future__ import annotations
 
 import pathlib
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, NamedTuple
 
+import anyio
 import httpx
+import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+import fastapi_better_auth
+from fastapi_better_auth import SessionError
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DOCUMENTS = (ROOT / "README.md", ROOT / "COMPATIBILITY.md")
@@ -81,6 +86,23 @@ UNOPENED_SPELLINGS = ("```py", "~~~python", "```python3", "   ```python")
 FENCE_OPENER = re.compile(r"^[ \t]*(?:`{3,}|~{3,})[ \t]*py", re.IGNORECASE | re.MULTILINE)
 """Deliberately looser than the extractor's gate: a backtick *or* tilde run, indented or not,
 whose info string starts with `py`. A closing fence carries no info string and never matches."""
+
+
+def refusal_names() -> tuple[str, ...]:
+    """Every exported name of a refusal — the words a response body may never contain.
+
+    Read off `__all__` rather than listed here, so a subclass added later is covered the day it
+    is exported instead of the day somebody remembers this file.
+    """
+    found: list[str] = []
+    for name in fastapi_better_auth.__all__:
+        member: object = getattr(fastapi_better_auth, name)
+        if isinstance(member, type) and issubclass(member, SessionError):
+            found.append(name)
+    return tuple(found)
+
+
+REFUSAL_NAMES = refusal_names()
 
 
 def python_fence_openers(text: str) -> int:
@@ -149,6 +171,57 @@ def secured_paths(document: Mapping[str, Any], method: str = "get") -> tuple[str
 def forged_cookie_header(value: str) -> str:
     """One `Cookie` header carrying the forgery under both spellings of the session cookie."""
     return "; ".join(f"{name}={value}" for name in COOKIE_NAMES)
+
+
+def rewrites_refusals(app: FastAPI) -> bool:
+    """Whether this snippet registered a handler of its own over the refusal family.
+
+    A snippet that reshapes the body owns the body, so the default-body pin cannot apply to it —
+    but the property that pin was protecting still has to, in the shape the snippet chose.
+    """
+    return any(
+        isinstance(key, type) and issubclass(key, SessionError) for key in app.exception_handlers
+    )
+
+
+VOLATILE_HEADERS = frozenset({"date"})
+"""Header names a client cannot read a refusal's class out of, whatever they say."""
+
+
+def whole_answer(response: httpx2.Response) -> tuple[int, bytes, frozenset[tuple[str, str]]]:
+    """Everything a caller receives, reduced to what two refusals could differ by.
+
+    Bodies are the obvious oracle and the only one a body comparison catches. A handler that
+    puts the class in a *header* — its own, or an extra one merged into `headers=` — answers
+    with two identical bodies and two distinguishable responses, so the property is the whole
+    response: the status, the body, and every header pair that is not volatile.
+    """
+    headers = frozenset(
+        (name.lower(), value)
+        for name, value in response.headers.multi_items()
+        if name.lower() not in VOLATILE_HEADERS
+    )
+    return response.status_code, response.content, headers
+
+
+def assert_one_answer(refusals: Sequence[httpx2.Response], where: str) -> None:
+    """A snippet's own envelope, held to what the default response gives for free.
+
+    An envelope handler is where the uniform 401 goes to die: read `type(exc).__name__` or
+    `exc.reason` into the answer and an unauthenticated caller can sort "expired" from "forged"
+    from "no such session", which is the whole oracle this library exists to remove. Anonymous
+    versus forged is the pair that proves it, because those are two different exception classes
+    and every other 401 sits between them; the challenge has to survive the rewrite as well,
+    since a handler that forgets `headers=` silently drops it.
+    """
+    for response in refusals:
+        assert response.status_code == 401, where
+        assert response.headers["www-authenticate"] == "Bearer", where
+        named = [name for name in REFUSAL_NAMES if name in response.text]
+        assert named == [], f"{where}: the response body names {named}"
+    # Counted before the assertion so a failure reports the count and never dumps the responses.
+    distinguishable = len({whole_answer(response) for response in refusals})
+    assert distinguishable == 1, f"{where}: {distinguishable} distinguishable responses"
 
 
 @pytest.fixture
@@ -245,13 +318,20 @@ def test_the_applications_the_snippets_build_enforce_and_document_themselves(
     once at the end, because a cookie mode that had to *ask upstream* to reject a forgery would
     still answer 401 — the refusal would be right and the documented behaviour ("refused locally,
     before any upstream call") would be false.
+
+    A snippet that registers a handler over the refusal family owns the body and is held to the
+    property the default body carries for free instead: anonymous and forged answered
+    byte-identically, the challenge still on the response, and no exception class named in it.
+    The page teaches that shape, so the page has to be the thing that proves it.
     """
     published: list[Mapping[str, Any]] = []
     anonymous: list[int] = []
     refused_posts: list[str] = []
+    enveloped: list[str] = []
 
     for snippet in ALL_SNIPPETS:
         for app in apps_in(run(snippet)):
+            rewritten = rewrites_refusals(app)
             with TestClient(app) as client:
                 document: dict[str, Any] = client.get("/openapi.json").json()
                 schemes: Mapping[str, Any] = document.get("components", {}).get(
@@ -262,12 +342,22 @@ def test_the_applications_the_snippets_build_enforce_and_document_themselves(
                 for path in secured_paths(document):
                     where = f"{snippet.id} GET {path}"
                     assert document["paths"][path]["get"]["security"] == BEARER_REQUIREMENT, where
+                    refusals: list[httpx2.Response] = []
                     for credential in FORGED:
                         forged = client.get(path, headers={"Authorization": f"Bearer {credential}"})
                         assert forged.status_code == 401, where
-                        assert forged.json() == UNAUTHENTICATED, where
                         assert forged.headers["www-authenticate"] == "Bearer", where
-                    anonymous.append(client.get(path).status_code)
+                        if not rewritten:
+                            assert forged.json() == UNAUTHENTICATED, where
+                        refusals.append(forged)
+                    unauthenticated = client.get(path)
+                    anonymous.append(unauthenticated.status_code)
+                    if rewritten:
+                        # The envelope rung lives here because every snippet that registers a
+                        # handler documents GET routes. A cookie-mode POST snippet that registers
+                        # one reddens the POST default-body pin below; extend the rung there then.
+                        assert_one_answer([*refusals, unauthenticated], where)
+                        enveloped.append(where)
                 for path in secured_paths(document, "post"):
                     where = f"{snippet.id} POST {path}"
                     requirement = document["paths"][path]["post"]["security"]
@@ -282,13 +372,14 @@ def test_the_applications_the_snippets_build_enforce_and_document_themselves(
                         }
                         forged = client.post(path, headers=headers)
                         assert forged.status_code == 401, where
-                        assert forged.json() == UNAUTHENTICATED, where
                         assert forged.headers["www-authenticate"] == "Bearer", where
+                        assert forged.json() == UNAUTHENTICATED, where
                         assert refuse_network == [], where
                     refused_posts.append(where)
 
     assert published, "no snippet builds an application that documents the bearer scheme"
     assert refused_posts, "no documented POST route was proven to refuse a forged cookie"
+    assert enveloped, "no snippet documents a handler of its own over the refusal family"
     assert all(
         {key: definition[key] for key in BEARER_DEFINITION} == BEARER_DEFINITION
         and definition["description"]
@@ -296,4 +387,50 @@ def test_the_applications_the_snippets_build_enforce_and_document_themselves(
     )
     assert 401 in anonymous, "no documented route refuses an anonymous request"
     assert set(anonymous) <= {200, 401}
+    assert refuse_network == []
+
+
+@pytest.mark.usefixtures("snippet_environment")
+def test_the_documented_fake_session_serves_the_snippets_own_routes(
+    refuse_network: list[str],
+) -> None:
+    """The testing recipe, executed — because nothing else on the page may execute it.
+
+    The fence teaches an override installed from a fixture and never at import, which is exactly
+    what leaves it untested: every other rung here drives applications that still refuse, so
+    `fake_session` and `with_fake_session` would ship as text, and a `Session(...)` or `User(...)`
+    keyword the models never had would read perfectly on PyPI and fail in the reader's suite. This
+    is the one place they run. The route is refused first, so the 200 that follows is the override
+    and not a snippet that was already open; the map is cleared and it is refused again, which is
+    the half the fence's teardown line promises. The served id is read off the session the fence
+    itself builds — a literal here would keep passing against a recipe that had quietly stopped
+    building the documented user.
+    """
+    driven: list[str] = []
+
+    for snippet in ALL_SNIPPETS:
+        namespace = run(snippet)
+        install = namespace.get("with_fake_session")
+        build = namespace.get("fake_session")
+        if install is None or build is None:
+            continue
+        session: Any = anyio.run(build)
+        for app in apps_in(namespace):
+            with TestClient(app) as client:
+                document: dict[str, Any] = client.get("/openapi.json").json()
+                paths = secured_paths(document)
+                for path in paths:
+                    assert client.get(path).status_code == 401, f"{snippet.id} refused {path}"
+                install(app, namespace["auth"])
+                for path in paths:
+                    where = f"{snippet.id} GET {path}"
+                    served = client.get(path)
+                    assert served.status_code == 200, where
+                    assert served.json()["id"] == session.user.id, where
+                    driven.append(where)
+                app.dependency_overrides.clear()
+                for path in paths:
+                    assert client.get(path).status_code == 401, f"{snippet.id} cleared {path}"
+
+    assert driven, "no snippet documents a fake session for a route to be served under"
     assert refuse_network == []
