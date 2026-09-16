@@ -16,9 +16,9 @@ posture asserted in only one direction is not asserted at all.
 | 1.7.1 with `secondaryStorage` (Redis) | conformance, gating | every pull request, and every push to `main` | — (HEAD only) |
 | 1.7.1 with `bearer({ requireSignature: true })` | conformance (strict posture), gating | every pull request, and every push to `main` | — (HEAD only) |
 | 1.7.1 with `rateLimit: { enabled: true, customRules: { "/get-session": { window: 10, max: 3 } } }` | conformance (throttled posture), gating | every pull request, and every push to `main` | — (HEAD only) |
-| 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.4.0 on 2026-09-09 (run 34374664791) |
-| 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.4.0 on 2026-09-09 (run 34374664791) |
-| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.4.0 on 2026-09-09 (run 34374664791), `latest` = 1.7.3 that day |
+| 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161) |
+| 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161) |
+| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161), `latest` = 1.7.5 that day |
 
 That list is readable from a running application as `fastapi_better_auth.VERIFIED_BETTER_AUTH` — the
 canary matrix without its `latest` entry, which is a dist-tag rather than a version — and
