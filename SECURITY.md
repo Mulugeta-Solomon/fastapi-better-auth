@@ -77,7 +77,8 @@ header at all, because Better Auth never emits one and no extension is supported
   (`SignedDoubleSubmit.token_for`), so a front end that mints it from a session-gated route mints
   it for the planted session. The same holds for a signed-in victim whose own cookie is
   `Domain`-scoped, as `crossSubDomainCookies` makes it, because a sibling server's `Set-Cookie`
-  with the same name, domain and path replaces that cookie outright (RFC 6265bis §5.7 step 23).
+  with the same name, domain, host-only flag and path replaces that cookie outright (RFC 6265bis
+  §5.7 step 23); both cookies are `Domain`-scoped, so the flag matches too.
   What bounds it is the cookie's name: a `__Host-` cookie is host-only (RFC 6265bis §4.1.3.2, §5.7
   step 21), so a sibling cannot set one for this API's host. Under `secure_prefix="__Host-"` a
   planted `__Secure-` cookie is not the one read: a signed-out victim's request is anonymous, and a
