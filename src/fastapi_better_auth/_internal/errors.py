@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, NamedTuple, cast
 
 from fastapi import HTTPException
 
@@ -20,17 +21,27 @@ SANCTIONED_RESPONSES: Mapping[int, tuple[str, Mapping[str, str] | None]] = Mappi
 SHADOWED_ATTRIBUTES = ("status_code", "detail", "headers")
 REFUSAL_STATUSES = frozenset({403, 404})
 CHALLENGE_HEADER = "www-authenticate"
+FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+FIELD_VALUE = re.compile(r"[\t\x20-\x7e\x80-\xff]*")
 STATUS_BREACH = "its status_code is not a plain int, 403 or 404"
-HEADERS_BREACH = "its headers are not a mapping of str to str"
+HEADERS_BREACH = "its headers are not a plain dict of str to str"
 CHALLENGE_BREACH = "its headers carry WWW-Authenticate"
+FIELD_BREACH = (
+    "its headers are not RFC 9110 fields: a name must be a token, and a value may carry no CR,"
+    " LF or other control character"
+)
 BREACH_CAUSES: Mapping[str, str] = MappingProxyType(
     {
         STATUS_BREACH: "A 401 would tell a session that already verified to re-authenticate, 400"
         " is the ambiguous-credential answer, and any other status is not a refusal.",
-        HEADERS_BREACH: "Starlette writes every header name and value as text; anything else"
-        " fails while the response is being written.",
+        HEADERS_BREACH: "Pass a mapping of str to str; it is copied into a plain dict. Nothing"
+        " else is honoured once the refusal leaves the rule, because only a plain dict reads the"
+        " same when it is checked and when it is written.",
         CHALLENGE_BREACH: "The challenge belongs to authentication, and a session that reached a"
         " rule already passed it.",
+        FIELD_BREACH: "A CR or LF in a value splits the response on a server that writes it, and"
+        " one that refuses it aborts the response or answers 500; a character above U+00FF is"
+        " not an octet at all (RFC 9110 sections 5.1, 5.5 and 5.6.2).",
     }
 )
 
@@ -293,7 +304,8 @@ class AuthorizationRefused(HTTPException):
     renders it.
 
     **Checked again as it leaves the rule.** An exception is a mutable object, so the gate holds
-    the refusal to the same rules the constructor does at the moment it is honoured; one edited
+    the refusal to the same rules the constructor does at the moment it is honoured - its headers
+    must then still be a plain `dict`, read once, and that read is what is written. One edited
     afterwards into something it could not have been built as is an accident, logged with its
     class and the rule it broke - never a header value, never the `detail` - and answered as the
     uniform `NotAuthorized`.
@@ -306,13 +318,15 @@ class AuthorizationRefused(HTTPException):
         detail: The body's `detail`, any JSON-serializable value, exactly as `HTTPException`
             takes it. `None` renders the status phrase.
         headers: Extra response headers: a mapping of `str` to `str`, copied as plain text at
-            construction. They may not carry `WWW-Authenticate` in any spelling: the challenge
-            belongs to authentication, and this session already passed it.
+            construction. Each name must be an RFC 9110 token and each value field content - no
+            CR, LF or other control character but a tab - so no value can split the response.
+            They may not carry `WWW-Authenticate` in any spelling: the challenge belongs to
+            authentication, and this session already passed it.
 
     Raises:
         ValueError: At construction, if `status_code` is not 403 or 404, or `headers` is not a
-            mapping of `str` to `str` or names `WWW-Authenticate`. Raised inside a rule, that is
-            an accident like any other.
+            mapping of `str` to `str`, names `WWW-Authenticate`, or holds a name or value RFC 9110
+            does not allow. Raised inside a rule, that is an accident like any other.
         TypeError: When a subclass is defined that sets `status_code`, `detail` or `headers`
             in its class body, where `__init__` would silently override them.
     """
@@ -333,48 +347,53 @@ class AuthorizationRefused(HTTPException):
     ) -> None:
         status = _plain_status(status_code)
         kept = None if headers is None else _plain_headers(headers)
-        breach = refusal_breach(status, kept)
-        if breach is not None:
-            raise ValueError(_misbuilt(breach, status_code))
-        super().__init__(
-            status_code=cast("int", status),
-            detail=detail,
-            headers=cast("dict[str, str] | None", kept),
-        )
+        verdict = judge_refusal(status, kept)
+        if verdict.breach is not None:
+            raise ValueError(_misbuilt(verdict.breach, status_code))
+        super().__init__(status_code=cast("int", status), detail=detail, headers=verdict.headers)
 
 
-def refusal_breach(status_code: object, headers: object) -> str | None:
-    """The invariant an explaining refusal breaks, or `None` when it keeps all of them.
+class Judgement(NamedTuple):
+    """One read of a refusal: the rule it breaks, if any, and its headers exactly as judged."""
+
+    breach: str | None
+    headers: dict[str, str] | None
+
+
+def judge_refusal(status_code: object, headers: object) -> Judgement:
+    """Hold an explaining refusal to its rules, reading its headers exactly once.
 
     Asked twice with the same answer: at construction, and by `authz` as the refusal leaves the
-    rule - an exception is a mutable object, and what reaches the wire is what it holds then.
+    rule - an exception is a mutable object, and what reaches the wire is what it holds then. The
+    headers judged are a fresh plain `dict` of that one read, and they are what the caller keeps,
+    so the object written to the wire is the object that was judged.
     """
     if type(status_code) is not int or status_code not in REFUSAL_STATUSES:
-        return STATUS_BREACH
+        return Judgement(STATUS_BREACH, None)
     if headers is None:
+        return Judgement(None, None)
+    pairs = _text_pairs(headers)
+    if pairs is None:
+        return Judgement(HEADERS_BREACH, None)
+    return Judgement(_field_breach(pairs), dict(pairs))
+
+
+def _text_pairs(headers: object) -> list[tuple[str, str]] | None:
+    """One read of exactly a plain `dict` of plain `str` to plain `str`, or `None`."""
+    if type(headers) is not dict:
         return None
-    names = _header_names(headers)
-    if names is None:
-        return HEADERS_BREACH
-    if any(name.strip().lower() == CHALLENGE_HEADER for name in names):
+    pairs = list(cast("dict[object, object]", headers).items())
+    if not all(type(name) is str and type(value) is str for name, value in pairs):
+        return None
+    return cast("list[tuple[str, str]]", pairs)
+
+
+def _field_breach(pairs: list[tuple[str, str]]) -> str | None:
+    if any(name.strip().lower() == CHALLENGE_HEADER for name, _ in pairs):
         return CHALLENGE_BREACH
-    return None
-
-
-def _header_names(headers: object) -> list[str] | None:
-    """The names of a mapping of plain `str` to plain `str`, or `None` for anything else."""
-    if not isinstance(headers, Mapping):
+    if all(FIELD_NAME.fullmatch(name) and FIELD_VALUE.fullmatch(value) for name, value in pairs):
         return None
-    try:
-        pairs = list(cast("Mapping[object, object]", headers).items())
-    except Exception:  # noqa: BLE001 - its message may quote a header; the caller logs the breach
-        return None
-    names: list[str] = []
-    for name, value in pairs:
-        if type(name) is not str or type(value) is not str:
-            return None
-        names.append(name)
-    return names
+    return FIELD_BREACH
 
 
 def _plain_status(status_code: object) -> object:

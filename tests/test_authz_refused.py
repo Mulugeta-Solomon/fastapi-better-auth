@@ -107,6 +107,37 @@ class HeaderText(str):
 
 
 LYING_INTS = (EqualToEverything(500), ConvertsToForbidden(500))
+TCHARS = "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+"""RFC 9110 section 5.6.2's `tchar`, written out rather than derived from the code under test."""
+SMUGGLED = "a\r\nWWW-Authenticate: Bearer smuggled"
+NOT_FIELDS: tuple[dict[str, str], ...] = (
+    {"X-Tag": SMUGGLED},
+    {"X-Tag": "a\nb"},
+    {"X-Tag": "a\rb"},
+    {"X-Tag": "a\x00b"},
+    {"X-Tag": "a\x1bb"},
+    {"X-Tag": "a\x7fb"},
+    {"X-Tag": "\u20ac"},
+    {"X Tag": "v"},
+    {"X-Tag:": "v"},
+    {"X-Tag\r\nX-Other": "v"},
+    {"": "v"},
+    {"X-T\u00e4g": "v"},
+)
+NOT_FIELD_IDS = (
+    "crlf-smuggled-challenge",
+    "lf",
+    "cr",
+    "nul",
+    "escape",
+    "del",
+    "not-an-octet",
+    "space-in-name",
+    "colon-in-name",
+    "crlf-in-name",
+    "empty-name",
+    "non-ascii-name",
+)
 NOT_TEXT_HEADERS: tuple[object, ...] = (
     {b"WWW-Authenticate": "Bearer"},
     {b"X-Tag": "a"},
@@ -282,8 +313,43 @@ def test_an_int_subclass_that_really_is_403_is_stored_as_a_plain_int() -> None:
 def test_headers_that_are_not_a_mapping_of_str_to_str_are_a_value_error(headers: object) -> None:
     """Starlette writes every name and value as text. A `bytes` challenge would slip past the
     spelling check and then crash the response mid-write — never the documented error."""
-    with pytest.raises(ValueError, match="mapping of str to str"):
+    with pytest.raises(ValueError, match="of str to str"):
         AuthorizationRefused(headers=headers)  # pyright: ignore[reportArgumentType]
+
+
+@pytest.mark.parametrize("headers", NOT_FIELDS, ids=NOT_FIELD_IDS)
+def test_a_header_that_is_not_an_rfc_9110_field_is_a_value_error(headers: dict[str, str]) -> None:
+    """A CR or LF in a value splits the response on a server that writes it, and aborts it (or
+    answers 500) on one that refuses: the one answer this library exists never to give."""
+    with pytest.raises(ValueError, match="RFC 9110"):
+        AuthorizationRefused(headers=headers)
+
+
+def accepted(headers: dict[str, str]) -> bool:
+    try:
+        AuthorizationRefused(headers=headers)
+    except ValueError:
+        return False
+    return True
+
+
+def test_a_header_name_is_accepted_exactly_when_it_is_a_token() -> None:
+    """Every code point below 0x80, and a few above, swept: the accepted set is the `tchar` set."""
+    swept = [*range(0x80), 0xA0, 0xE9, 0xFF, 0x100, 0x20AC]
+    names = {code for code in swept if accepted({f"X{chr(code)}Y": "v"})}
+
+    assert names == {ord(char) for char in TCHARS}, f"{len(names ^ set(map(ord, TCHARS)))} differ"
+    assert not accepted({"": "v"})
+
+
+def test_a_header_value_is_accepted_exactly_when_it_is_field_content() -> None:
+    """HTAB, SP, the visible characters and obs-text - nothing else, so no CR, LF, NUL, other C0
+    control or DEL, and nothing above 0xFF, which is not an octet at all."""
+    swept = [*range(0x200), 0x20AC, 0x1F600]
+    values = {code for code in swept if accepted({"X-Tag": f"a{chr(code)}b"})}
+    expected = {0x09, *range(0x20, 0x7F), *range(0x80, 0x100)}
+
+    assert values == expected, f"{len(values ^ expected)} code points differ"
 
 
 def test_str_subclass_names_and_values_are_kept_as_plain_str() -> None:
@@ -471,8 +537,19 @@ def test_a_lookup_that_refuses_before_returning_its_coroutine_is_honoured() -> N
         {"headers": {"www-authenticate": "Bearer"}},
         {"status_code": EqualToEverything(500)},
         {"headers": {b"WWW-Authenticate": "Bearer"}},
+        {"headers": {"X-Tag": SMUGGLED}},
+        {"headers": {"X Tag": "v"}},
     ],
-    ids=["401", "400", "500", "challenge", "lying-int", "bytes-challenge"],
+    ids=[
+        "401",
+        "400",
+        "500",
+        "challenge",
+        "lying-int",
+        "bytes-challenge",
+        "split-value",
+        "non-token-name",
+    ],
 )
 def test_a_marker_built_wrong_inside_a_rule_is_contained_and_logged(
     where: str, arguments: dict[str, Any], client_backend: str, records: list[logging.LogRecord]

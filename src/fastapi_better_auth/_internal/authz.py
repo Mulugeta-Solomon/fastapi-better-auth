@@ -32,7 +32,7 @@ from .errors import (
     ConfigurationError,
     NotAuthorized,
     SessionError,
-    refusal_breach,
+    judge_refusal,
 )
 from .models import Session, User, UserId
 from .reasons import safe_label
@@ -191,14 +191,18 @@ def _answered(refusal: AuthorizationRefused, what: str) -> BaseException:
 
     Logged without a traceback: that would render `str(refusal)`, which carries the `detail`.
     """
-    breach = refusal_breach(refusal.status_code, refusal.headers)
-    if breach is None:
+    verdict = judge_refusal(refusal.status_code, refusal.headers)
+    if verdict.breach is None:
+        refusal.headers = verdict.headers
         return refusal
     name = type(refusal).__name__
     logger.error(
-        "the %s refused with %s, but %s; answered as the uniform refusal", what, name, breach
+        "the %s refused with %s, but %s; answered as the uniform refusal",
+        what,
+        name,
+        verdict.breach,
     )
-    return NotAuthorized(reason=f"{name} from the {what} was not honoured: {breach}")
+    return NotAuthorized(reason=f"{name} from the {what} was not honoured: {verdict.breach}")
 
 
 def _contained(exc: BaseException, what: str) -> NotAuthorized:

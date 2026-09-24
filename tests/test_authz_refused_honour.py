@@ -4,9 +4,12 @@ The constructor refuses an honest mistake early and clearly, but an exception is
 `exc.headers["WWW-Authenticate"] = ...`, `exc.status_code = 401` or a reassigned `exc.headers`
 after construction would otherwise ride the honoured path straight to the wire. So the gate checks
 the refusal as it leaves the rule, with the same predicate the constructor uses: a plain `int`
-403 or 404, and headers that are `None` or a mapping of plain `str` to plain `str` naming no
-challenge. Anything else is an accident — logged with the class and the broken invariant, never a
-header value and never the `detail`, and answered as the uniform `NotAuthorized`.
+403 or 404, and headers that are `None` or exactly a plain `dict` of plain `str` to plain `str`,
+naming no challenge, every name an RFC 9110 token and every value free of CR, LF and other
+controls. The headers are read once, and that read — a fresh plain `dict` — is what is written, so
+a mapping that answers differently the second time cannot smuggle anything past the check.
+Anything else is an accident — logged with the class and the broken invariant, never a header
+value and never the `detail`, and answered as the uniform `NotAuthorized`.
 
 Every refusal here is built *valid* and tampered with afterwards, so none of these cases can be
 caught by the constructor: what catches them is the check at the honour point, or nothing.
@@ -15,7 +18,7 @@ caught by the constructor: what catches them is the check at the honour point, o
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, ItemsView, Iterator, Mapping
 from types import MappingProxyType
 from typing import Any
 
@@ -23,6 +26,7 @@ import pytest
 from exceptiongroup import ExceptionGroup
 
 from fastapi_better_auth import AuthorizationRefused, NotAuthorized, Session
+from fastapi_better_auth._internal.authz import permitted
 from tests.fakes import GOOD_CREDENTIAL, client
 from tests.log_hygiene import LIBRARY_LOGGER, capturing, rendered
 from tests.test_authz import FORBIDDEN, HEADER, Member, one_verifier
@@ -41,7 +45,9 @@ HEADER_VALUE = "Bearer realm=tampered-9f3ab21c"
 DETAIL_MARKER = "detail-marker-7c1de90f"
 STATUS = "status_code"
 CHALLENGE = "WWW-Authenticate"
-NOT_TEXT = "mapping of str to str"
+NOT_TEXT = "of str to str"
+NOT_FIELD = "RFC 9110"
+SPLIT = f"a\r\nWWW-Authenticate: {HEADER_VALUE}"
 
 Tamper = Callable[[Any], None]
 
@@ -51,6 +57,41 @@ class Tampered(AuthorizationRefused):
 
     def __init__(self) -> None:
         super().__init__(detail={"marker": DETAIL_MARKER}, headers={"X-Tag": "sound"})
+
+
+class LiesOnSecondRead(Mapping[str, str]):
+    """Clean the first time it is read, a challenge every time after: the #76 round-2 repro."""
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def _current(self) -> dict[str, str]:
+        self.reads += 1
+        return {"X-Tag": "sound"} if self.reads == 1 else {"WWW-Authenticate": HEADER_VALUE}
+
+    def items(self) -> ItemsView[str, str]:
+        return self._current().items()
+
+    def __getitem__(self, key: str) -> str:
+        return self._current()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._current())
+
+    def __len__(self) -> int:
+        return len(self._current())
+
+
+class DictThatLiesOnSecondRead(dict[str, str]):
+    """The same lie from a `dict` subclass: `isinstance(..., dict)` is not "a plain dict"."""
+
+    def __init__(self) -> None:
+        super().__init__({"X-Tag": "sound"})
+        self.reads = 0
+
+    def items(self) -> Any:
+        self.reads += 1
+        return (dict(self) if self.reads == 1 else {"WWW-Authenticate": HEADER_VALUE}).items()
 
 
 class UnreadableHeaders(Mapping[str, str]):
@@ -73,9 +114,18 @@ def setting(attribute: str, value: object) -> Tamper:
     return tamper
 
 
-def adding(name: str) -> Tamper:
+def adding(name: str, value: str = HEADER_VALUE) -> Tamper:
     def tamper(refusal: Any) -> None:
-        refusal.headers[name] = HEADER_VALUE
+        refusal.headers[name] = value
+
+    return tamper
+
+
+def reading_twice(make: Callable[[], object]) -> Tamper:
+    """Assign a lying mapping built fresh for this request, so no read is shared across legs."""
+
+    def tamper(refusal: Any) -> None:
+        refusal.headers = make()
 
     return tamper
 
@@ -94,16 +144,23 @@ BROKEN: dict[str, tuple[Tamper, str]] = {
     "reassigned-str-subclass": (setting("headers", {HeaderText("X-Tag"): HEADER_VALUE}), NOT_TEXT),
     "reassigned-pairs": (setting("headers", [("X-Tag", HEADER_VALUE)]), NOT_TEXT),
     "reassigned-unreadable": (setting("headers", UnreadableHeaders()), NOT_TEXT),
+    "reassigned-lying-mapping": (reading_twice(LiesOnSecondRead), NOT_TEXT),
+    "reassigned-lying-dict-subclass": (reading_twice(DictThatLiesOnSecondRead), NOT_TEXT),
+    "reassigned-read-only-mapping": (
+        setting("headers", MappingProxyType({"X-Tag": "proxy"})),
+        NOT_TEXT,
+    ),
+    "added-split-value": (adding("X-Tag", SPLIT), NOT_FIELD),
+    "reassigned-split-value": (setting("headers", {"X-Tag": SPLIT}), NOT_FIELD),
+    "reassigned-nul-value": (setting("headers", {"X-Tag": f"{HEADER_VALUE}\x00"}), NOT_FIELD),
+    "reassigned-non-token-name": (setting("headers", {"X Tag": HEADER_VALUE}), NOT_FIELD),
 }
 
 SOUND: dict[str, tuple[Tamper, int, dict[str, str]]] = {
     "added-sound-header": (adding("X-Other"), 403, {"x-tag": "sound", "x-other": HEADER_VALUE}),
     "status-404": (setting("status_code", 404), 404, {"x-tag": "sound"}),
-    "reassigned-read-only-mapping": (
-        setting("headers", MappingProxyType({"X-Tag": "proxy"})),
-        403,
-        {"x-tag": "proxy"},
-    ),
+    "reassigned-plain-dict": (setting("headers", {"X-Tag": "plain"}), 403, {"x-tag": "plain"}),
+    "added-tab-and-space": (adding("X-Other", "a\tb c"), 403, {"x-tag": "sound"}),
 }
 
 
@@ -193,3 +250,23 @@ def test_a_broken_refusal_delivered_as_a_single_leaf_group_is_contained(
     assert "www-authenticate" not in response.headers
     assert [type(exc) for exc in observed] == [NotAuthorized]
     assert [record.levelno for record in library(records)] == [logging.ERROR]
+
+
+def test_an_honoured_refusal_leaves_with_the_very_headers_it_was_judged_by() -> None:
+    """The check reads the headers once, and what is rendered must be that read rather than the
+    object it was read from: the gate hands on a fresh plain dict of the pairs it judged."""
+    reassigned = {"X-Tag": "reassigned"}
+    session = Session[Member](user=Member(id="u1"), expires_at=None, raw={"id": "u1"})
+
+    def refuse(_session: Session[Member]) -> bool:
+        refusal = Tampered()
+        refusal.headers = reassigned
+        raise refusal
+
+    with pytest.raises(AuthorizationRefused) as caught:
+        permitted(refuse, session)
+
+    kept = caught.value.headers
+    assert kept == {"X-Tag": "reassigned"}
+    assert kept is not reassigned
+    assert type(kept) is dict
