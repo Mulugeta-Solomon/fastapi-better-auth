@@ -730,13 +730,17 @@ and only when the request carries its cookie: see
 browser attaches the cookie to them exactly as it does to your front end's, and only the CSRF
 policy tells the two apart — which is why `OriginCheck` does not treat `Sec-Fetch-Site: same-site`
 as a pass. `OriginCheck` is the floor; but a *bare* double-submit cookie proves only that the sender
-could set a cookie, and a sibling can set one on the shared parent domain — the session cookie's own
-name included, unless that cookie is `__Host-`, which `crossSubDomainCookies` rules out (above) — so
-on a shared parent domain reach for `SignedDoubleSubmit`, whose token is an HMAC of the session token
-under your secret: bound to the session, and useless to a sibling. A **non-browser** client (mobile,
-server-to-server) has no `Origin` for `OriginCheck` to trust and belongs on **Mode B** (bearer)
-instead: compose both verifiers and each request picks its own by which credential it carries. All
-of this applies unchanged to Mode C, which reads the same cookie.
+could set a cookie, and a sibling can set one on the shared parent domain — so on a shared parent
+domain reach for `SignedDoubleSubmit`, whose token is an HMAC of the session token under your
+secret: bound to the session, and useless to a sibling. What neither policy stops is a sibling
+planting the session cookie's own name — possible unless that cookie is `__Host-`, which
+`crossSubDomainCookies` rules out (above). A signed-out victim's own front end then sends the
+attacker's session from an allowed origin, with a token minted for that same session, and the
+victim's writes land in the attacker's account
+([SECURITY.md](https://github.com/Mulugeta-Solomon/fastapi-better-auth/blob/main/SECURITY.md)). A
+**non-browser** client (mobile, server-to-server) has no `Origin` for `OriginCheck` to trust and
+belongs on **Mode B** (bearer) instead: compose both verifiers and each request picks its own by
+which credential it carries. All of this applies unchanged to Mode C, which reads the same cookie.
 
 **More than one front end is expected, not exceptional.** `allowed_origins` is a sequence and
 nothing says it holds one entry —
