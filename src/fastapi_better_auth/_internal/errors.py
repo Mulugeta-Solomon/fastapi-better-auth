@@ -18,10 +18,21 @@ SANCTIONED_RESPONSES: Mapping[int, tuple[str, Mapping[str, str] | None]] = Mappi
     }
 )
 SHADOWED_ATTRIBUTES = ("status_code", "detail", "headers")
+REFUSAL_STATUSES = frozenset({403, 404})
+CHALLENGE_HEADER = "www-authenticate"
 
 
 def _rebuild(error_cls: type[SessionError], reason: str) -> SessionError:
     return error_cls(reason=reason)
+
+
+def _refuse_shadowing(cls: type[HTTPException], consequence: str) -> None:
+    shadowed = [name for name in SHADOWED_ATTRIBUTES if name in cls.__dict__]
+    if shadowed:
+        raise TypeError(
+            f"{cls.__name__} sets {', '.join(shadowed)} in its class body. Those are"
+            f" instance attributes {consequence}"
+        )
 
 
 class BetterAuthError(Exception):
@@ -82,13 +93,11 @@ class SessionError(HTTPException):
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        shadowed = [name for name in SHADOWED_ATTRIBUTES if name in cls.__dict__]
-        if shadowed:
-            raise TypeError(
-                f"{cls.__name__} sets {', '.join(shadowed)} in its class body. Those are"
-                " instance attributes and would silently win over the response constants;"
-                " set response_status / response_detail / response_headers instead."
-            )
+        _refuse_shadowing(
+            cls,
+            "and would silently win over the response constants;"
+            " set response_status / response_detail / response_headers instead.",
+        )
         sanctioned = SANCTIONED_RESPONSES.get(cls.response_status)
         if sanctioned is None:
             raise TypeError(
@@ -200,7 +209,8 @@ class NotAuthorized(SessionError):
     never carries the client's data verbatim.
 
     Raised by `BetterAuth.require` and `BetterAuth.require_membership`, and available for an
-    application's own authorization failures.
+    application's own authorization failures. A rule whose refusal has to explain itself raises
+    `AuthorizationRefused` instead, which reaches the client with the status and body it chose.
     """
 
     response_status: ClassVar[int] = 403
@@ -234,3 +244,96 @@ class AmbiguousCredentials(SessionError):
     response_status: ClassVar[int] = 400
     response_detail: ClassVar[str] = "Ambiguous request"
     response_headers: ClassVar[Mapping[str, str] | None] = None
+
+
+class AuthorizationRefused(HTTPException):
+    """A refusal the authorization rule explains itself, raised on purpose from inside the rule.
+
+    `NotAuthorized` is one uniform `403` whatever the rule was - right for the session layer,
+    wrong for a product whose design requires a denial that names what was missing: "you may
+    not send SMS alerts", "that district is outside the area you cover". Only the rule that
+    refused knows which, so raise this - or your own subclass of it - from a `BetterAuth.require`
+    predicate or a `BetterAuth.require_membership` lookup, and it reaches the client exactly as
+    you built it: its status, its `detail`, its headers. Nothing is logged; it is an answer, not
+    an accident.
+
+        class MissingCapability(AuthorizationRefused):
+            def __init__(self, capability: str) -> None:
+                super().__init__(detail={"code": "missing_capability", "capability": capability})
+
+    **Reachable only after authentication.** Both gates compose on `current_session`, so an
+    anonymous or forged request is answered `401` before any rule runs, and this class raised by
+    a verifier is contained like any other escape. The body is only ever shown to a caller whose
+    credential already verified, so it is never an oracle for which credentials are accepted.
+
+    **What it must never carry:** anything read from the credential - a token, a cookie, a
+    signature, a session id - nor the upstream payload. It is the one deliberate exception to
+    this library's per-status uniformity, and it is safe only because the application chose
+    every byte of it, from its own rules and its own rows.
+
+    **Why a plain `HTTPException` in a rule is still contained.** A rule calls helpers, and a
+    helper's stray `404` or `500` is a bug, not a decision. Inside a rule only this class is
+    honoured; anything else is logged and answered as the uniform `NotAuthorized`.
+
+    It is not a `SessionError`: per-status uniformity is what it opts out of, so a handler you
+    registered for `SessionError` never sees it, and FastAPI's own `HTTPException` handler
+    renders it.
+
+    Args:
+        status_code: `403` (the default) or `404`, for a rule that would rather not confirm the
+            resource exists. A `401` would tell a session that is valid to re-authenticate, a
+            `400` is this library's ambiguous-credential answer, and a `5xx` is not a refusal.
+        detail: The body's `detail`, any JSON-serializable value, exactly as `HTTPException`
+            takes it. `None` renders the status phrase.
+        headers: Extra response headers, copied at construction. They may not carry
+            `WWW-Authenticate` in any spelling: the challenge belongs to authentication, and
+            this session already passed it.
+
+    Raises:
+        ValueError: At construction, if `status_code` is not 403 or 404 or `headers` names
+            `WWW-Authenticate`. Raised inside a rule, that is an accident like any other.
+        TypeError: When a subclass is defined that sets `status_code`, `detail` or `headers`
+            in its class body, where `__init__` would silently override them.
+    """
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        _refuse_shadowing(
+            cls,
+            "set by __init__, so a class value would be silently ignored;"
+            " pass them to super().__init__() instead.",
+        )
+
+    def __init__(
+        self,
+        status_code: int = 403,
+        detail: Any = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(
+            status_code=_refusal_status(status_code),
+            detail=detail,
+            headers=_refusal_headers(headers),
+        )
+
+
+def _refusal_status(status_code: object) -> int:
+    if isinstance(status_code, int) and status_code in REFUSAL_STATUSES:
+        return int(status_code)
+    raise ValueError(
+        f"AuthorizationRefused(status_code={status_code!r}) must be 403 or 404. A 401 would tell a"
+        " session that already verified to re-authenticate, 400 is the ambiguous-credential"
+        " answer, and any other status is not a refusal."
+    )
+
+
+def _refusal_headers(headers: Mapping[str, str] | None) -> dict[str, str] | None:
+    if headers is None:
+        return None
+    copied = dict(headers)
+    if any(name.strip().lower() == CHALLENGE_HEADER for name in copied):
+        raise ValueError(
+            "AuthorizationRefused(headers=...) may not carry WWW-Authenticate. The challenge"
+            " belongs to authentication, and a session that reached a rule already passed it."
+        )
+    return copied

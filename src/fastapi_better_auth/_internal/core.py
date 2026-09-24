@@ -370,7 +370,9 @@ class BetterAuth:
         **A predicate that raises fails closed.** The traceback is logged and the request is
         answered `NotAuthorized`, because a `500` is the one request-time answer a client can
         tell apart from every other. A `SessionError` or a `BetterAuthError` the predicate
-        raised on purpose is re-raised as itself, so a refusal you chose keeps its own shape.
+        raised on purpose is re-raised as itself, so a refusal you chose keeps its own shape -
+        and an `AuthorizationRefused` reaches the client with the status and body you built it
+        with, which is how a rule explains why it refused.
 
         Args:
             predicate: A synchronous callable taking the `Session` and answering `True` to
@@ -392,6 +394,7 @@ class BetterAuth:
                 being called; at request time, if `predicate` answers with an awaitable.
             NotAuthorized: At request time, when the predicate does not answer `True`, or
                 raises anything this library does not honour.
+            AuthorizationRefused: At request time, when the predicate raises one on purpose.
         """
         current = self.current_session(user_model=user_model)
         built = require_dependency(current, predicate, reason)
@@ -433,7 +436,9 @@ class BetterAuth:
 
         **Membership is your query.** This library owns no database, so `member` is a coroutine
         you write; whatever it returns other than `None` or `False` is the grant - a role, a
-        row, a set of scopes - and it reaches the route on `Membership.grant`, typed.
+        row, a set of scopes - and it reaches the route on `Membership.grant`, typed. To refuse
+        with a body that explains - naming what the user does cover, from the rows you just
+        read - raise an `AuthorizationRefused` from `member`; it reaches the client as built.
 
         Build it once at module level, like `require`. Composed on
         `current_session(user_model=...)`, so authentication happens first and exactly once.
@@ -461,6 +466,7 @@ class BetterAuth:
             NotAuthorized: At request time, when the resource id is not a usable identifier,
                 when `member` answers `None` or `False`, or when it raises anything this
                 library does not honour.
+            AuthorizationRefused: At request time, when `member` raises one on purpose.
         """
         current = self.current_session(user_model=user_model)
         built = membership_dependency(current, id_param, member, reason)

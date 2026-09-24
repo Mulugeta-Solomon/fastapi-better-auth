@@ -3,7 +3,8 @@
 Two dependency builders, both composed on `current_session`, so authentication happens first and
 exactly once and an unauthenticated request is a 401 that never reaches a rule. Both refuse with
 `NotAuthorized` - one 403, one body, no challenge - and put why on the exception rather than on
-the wire.
+the wire. A rule that must explain itself raises `AuthorizationRefused` on purpose, and that one
+reaches the client as built and logs nothing.
 
 The rules themselves are the consumer's: a synchronous predicate over the session, and an
 asynchronous membership lookup taking the resource id this request named. That is deliberate -
@@ -25,7 +26,13 @@ from fastapi import Depends
 from pydantic import TypeAdapter, ValidationError
 
 from .containment import unwrapped
-from .errors import BetterAuthError, ConfigurationError, NotAuthorized, SessionError
+from .errors import (
+    AuthorizationRefused,
+    BetterAuthError,
+    ConfigurationError,
+    NotAuthorized,
+    SessionError,
+)
 from .models import Session, User, UserId
 from .reasons import safe_label
 
@@ -44,7 +51,7 @@ RESERVED = frozenset({SESSION_PARAM, "connection"})
 
 PREDICATE = "authorization predicate"
 LOOKUP = "membership lookup"
-HONOURED: tuple[type[BaseException], ...] = (BetterAuthError, SessionError)
+HONOURED: tuple[type[BaseException], ...] = (BetterAuthError, SessionError, AuthorizationRefused)
 
 RESOURCE_ID: TypeAdapter[str] = TypeAdapter(UserId)
 """One spelling of the id rules: the same `UserId` a `User.id` is validated against."""
