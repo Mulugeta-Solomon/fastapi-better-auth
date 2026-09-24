@@ -12,10 +12,8 @@ from fastapi.security.base import SecurityBase
 from starlette.requests import HTTPConnection
 
 from .errors import ConfigurationError
+from .labels import BEARER_SOURCE, cookie_named
 from .verifiers import Verifier
-
-BEARER_SOURCE = "header:authorization-bearer"
-COOKIE_PREFIX = "cookie:"
 
 BEARER_SCHEME_NAME = "BetterAuthBearer"
 COOKIE_SCHEME_NAME = "BetterAuthCookie"
@@ -77,12 +75,12 @@ def schemes_for(verifiers: Sequence[Verifier]) -> tuple[DeclaredScheme, ...]:
     declares a cookie, the key is `BetterAuthCookie` whatever the cookie is called, so a
     per-environment cookie name never reaches the published contract. When two or more do, a
     single key cannot name them all, and each is published as `BetterAuthCookie-<cookie>`. The
-    cookie itself is always the scheme's `name`, and its description names it too.
+    cookie itself - the name the browser sends, prefix included - is always the scheme's `name`,
+    and its description names it too.
 
     Raises:
-        ConfigurationError: If two labels land on one OpenAPI component key - two cookie labels
-            that sanitize onto one, or one cookie behind two labels - which would publish one
-            definition under a name the other also claims.
+        ConfigurationError: If two cookie labels sanitize onto one OpenAPI component key, which
+            would publish one definition under a name the other also claims.
     """
     sole_cookie = sum(_declares_a_cookie(verifier) for verifier in verifiers) == 1
     declared: list[DeclaredScheme] = []
@@ -102,8 +100,8 @@ def scheme_for(verifier: Verifier, *, sole_cookie: bool) -> DeclaredScheme | Non
     `sole_cookie` says whether this is the only verifier in its set that declares a cookie. It
     decides a cookie scheme's key, and only the set can know it, so it has no default.
     """
-    source = verifier.credential_source.strip()
-    if source.casefold() == BEARER_SOURCE:
+    source = verifier.credential_source
+    if source.strip().casefold() == BEARER_SOURCE:
         return _declared(
             HTTPBearer(
                 auto_error=False,
@@ -111,7 +109,7 @@ def scheme_for(verifier: Verifier, *, sole_cookie: bool) -> DeclaredScheme | Non
                 description=BEARER_DESCRIPTION,
             )
         )
-    cookie = _cookie_name(source)
+    cookie = cookie_named(source)
     if cookie is None:
         return None
     return _declared(
@@ -159,22 +157,13 @@ def _declared(scheme: SecurityBase) -> DeclaredScheme:
 
 
 def _declares_a_cookie(verifier: Verifier) -> bool:
-    return _cookie_name(verifier.credential_source.strip()) is not None
+    return cookie_named(verifier.credential_source) is not None
 
 
 def _cookie_scheme_name(cookie: str, *, sole: bool) -> str:
     if sole:
         return COOKIE_SCHEME_NAME
     return COOKIE_SCHEME_PREFIX + UNSAFE_IN_A_NAME.sub("-", cookie)
-
-
-def _cookie_name(source: str) -> str | None:
-    """The cookie a `cookie:<name>` label names. Matched case-insensitively, sliced verbatim:
-    a cookie name is case-sensitive, so `__Secure-` may not be folded away."""
-    if not source.casefold().startswith(COOKIE_PREFIX):
-        return None
-    name = source[len(COOKIE_PREFIX) :].strip()
-    return name or None
 
 
 def _reject_name_collision(

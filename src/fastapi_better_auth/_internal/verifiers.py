@@ -49,20 +49,22 @@ class Verifier(Protocol):
 
     Attributes:
         credential_source: A short label naming *where* this verifier's credential comes
-            from - `"header:authorization-bearer"`, `"cookie:better-auth.session_token"`.
+            from - `"header:authorization-bearer"`, `"cookie:__Secure-better-auth.session_token"`.
+            A cookie label names the cookie exactly as the browser sends it, prefix included.
             `BetterAuth` requires a non-empty string and refuses, at construction, to
             compose two verifiers that declare the same one: they would both find the same
             credential, so every request carrying it would be `AmbiguousCredentials` - a
             total authentication outage that startup would otherwise call healthy, and one
             that comparing verifier *identity* cannot see, because the two are different
-            objects.
+            objects. A cookie and its `__Secure-` or `__Host-` form count as the same one.
 
-            It is an honesty contract, and it is used for exactly two things:
-            build-time collision detection, and naming the verifier in operator-facing
-            reasons and logs. It is **never** consulted at request time and no security
-            decision is ever made from it - a verifier that declares a label it does not
-            read is a verifier that misleads its own operator, not one that can authorize
-            anything. Dispatch keys on what `extract` actually returns.
+            It is an honesty contract, and it is used for exactly three things:
+            build-time collision detection, naming the verifier in operator-facing reasons
+            and logs, and the security scheme `/docs` publishes for it. It is **never**
+            consulted at request time and no security decision is ever made from it - a
+            verifier that declares a label it does not read is a verifier that misleads its
+            own operator, not one that can authorize anything. Dispatch keys on what
+            `extract` actually returns.
     """
 
     credential_source: str
