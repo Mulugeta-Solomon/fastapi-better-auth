@@ -82,6 +82,25 @@ def test_one_cookie_read_under_secure_and_host_prefixes_is_refused(first: str, s
     assert {f"{first.title()}Verifier", f"{second.title()}Verifier"} <= set(message.split())
 
 
+@pytest.mark.parametrize(("first", "second"), PAIRS, ids=PAIR_IDS)
+@pytest.mark.parametrize("secure_first", [True, False], ids=["secure-first", "plain-first"])
+@pytest.mark.parametrize("configured", ["__Host-x", "__Secure-x"])
+def test_a_configured_name_that_carries_a_browser_prefix_is_still_one_base(
+    first: str, second: str, secure_first: bool, configured: str
+) -> None:
+    """A `cookie_name` may itself begin with a browser prefix. Plain, `__Host-x` is read as
+    `__Host-x`; secure, as `__Secure-__Host-x`. That is still one configured base read plain and
+    prefixed, the pair above."""
+    message = refusal(
+        [
+            MODES[first](cookie_name=configured, secure_cookies=secure_first),
+            MODES[second](cookie_name=configured, secure_cookies=not secure_first),
+        ]
+    )
+
+    assert {f"{first.title()}Verifier", f"{second.title()}Verifier"} <= set(message.split())
+
+
 @pytest.mark.parametrize("prefix", ["__SECURE-", "__secure-", "__HOST-", "__host-"])
 def test_a_prefix_in_another_case_is_still_that_prefix(prefix: str) -> None:
     """RFC 6265bis §5.4: a user agent matches `__Secure-` and `__Host-` case-insensitively, so a

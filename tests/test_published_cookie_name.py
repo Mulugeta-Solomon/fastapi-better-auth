@@ -7,6 +7,10 @@ reads only `{secure_prefix}{cookie_name}`. The document told a reader to send a 
 refuses. Every `(secure_cookies, secure_prefix)` a verifier accepts is covered here, on the wire:
 a validly signed cookie sent under the published name authenticates, and every other spelling of
 the same base name does not.
+
+The signed cookie is held as a `SecretStr` and revealed only inside the header it is sent in, so a
+test frame never binds it: `pytest -l` renders a failing test's locals, and the mask is what the
+suite's frame walker (`tests/refusal_frames.py`) already treats as not a hit.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from typing import Any
 
 import pytest
 from fastapi import FastAPI
+from pydantic import SecretStr
 
 from fastapi_better_auth import (
     AmbiguousCredentials,
@@ -43,12 +48,17 @@ SETTING_IDS = ["secure", "host", "secure-empty-prefix", "plain", "plain-host-pre
 MODES = ["cookie", "remote"]
 
 
-def built(mode: str, secure_cookies: bool, secure_prefix: str) -> tuple[Verifier, str]:
+def built(mode: str, secure_cookies: bool, secure_prefix: str) -> tuple[Verifier, SecretStr]:
     """A verifier of either mode, and a validly signed value its own lookup accepts."""
     settings: dict[str, Any] = {"secure_cookies": secure_cookies, "secure_prefix": secure_prefix}
     if mode == "cookie":
-        return cookie_verifier(**settings), sign(CAPTURED_TOKEN)
-    return remote_verifier(ScriptedTransport(json_reply(document())), **settings), COOKIE_VALUE
+        return cookie_verifier(**settings), SecretStr(sign(CAPTURED_TOKEN))
+    transport = ScriptedTransport(json_reply(document()))
+    return remote_verifier(transport, **settings), SecretStr(COOKIE_VALUE)
+
+
+def cookie_header(name: str, value: SecretStr) -> dict[str, str]:
+    return {"Cookie": f"{name}={value.get_secret_value()}"}
 
 
 def published_name(app: FastAPI) -> str:
@@ -81,7 +91,7 @@ def test_a_signed_cookie_under_the_published_name_authenticates_and_no_other_spe
 
     with client(app, client_backend) as http:
         answers = {
-            name: http.get("/required", headers={"Cookie": f"{name}={value}"}).status_code
+            name: http.get("/required", headers=cookie_header(name, value)).status_code
             for name in SPELLINGS
         }
 
@@ -96,7 +106,9 @@ async def test_the_operator_text_naming_the_verifier_names_the_cookie_it_reads(m
     verifier, value = built(mode, True, "__Secure-")
     auth = BetterAuth(verifiers=[verifier, FakeVerifier("x-other")])
     resolve = resolver_of(auth.current_session(user_model=User))
-    presented = connection(cookie=f"__Secure-{COOKIE}={value}", x_other=GOOD_CREDENTIAL)
+    presented = connection(
+        cookie=f"__Secure-{COOKIE}={value.get_secret_value()}", x_other=GOOD_CREDENTIAL
+    )
 
     with pytest.raises(AmbiguousCredentials) as caught:
         await resolve(presented)

@@ -37,17 +37,23 @@ def cookie_named(source: str) -> str | None:
 def collision_key(source: str) -> str:
     """What two labels share when their verifiers would find one credential.
 
-    Casefolded, as every label comparison here is. A cookie label is reduced to its cookie's name
-    without one leading `__Secure-` or `__Host-`: the plain and the prefixed spellings of one base
-    name are how Better Auth names one session cookie in its two postures, and reading both is the
-    cross-name fixation shape. Any other prefix is part of an unrelated name, because no browser
-    gives it a meaning.
+    Casefolded, as every label comparison here is. A cookie label is reduced to its base: the
+    cookie's name with every leading `__Secure-` and `__Host-` removed. The plain and the prefixed
+    spellings of one base are how Better Auth names one session cookie in its two postures, and
+    reading both is the cross-name fixation shape. A configured name may itself begin with a
+    prefix, so the secure posture of `__Host-x` reads `__Secure-__Host-x`: one strip would leave
+    it looking unrelated to the plain `__Host-x`. Any other leading text is part of an unrelated
+    name, because no browser gives it a meaning.
     """
     cookie = cookie_named(source)
     if cookie is None:
         return source.strip().casefold()
-    folded = cookie.casefold()
-    for prefix in BROWSER_COOKIE_PREFIXES:
-        if folded.startswith(prefix):
-            return cookie_source(folded[len(prefix) :])
-    return cookie_source(folded)
+    return cookie_source(_base(cookie.casefold()))
+
+
+def _base(folded: str) -> str:
+    while True:
+        prefix = next((p for p in BROWSER_COOKIE_PREFIXES if folded.startswith(p)), None)
+        if prefix is None:
+            return folded
+        folded = folded[len(prefix) :]
