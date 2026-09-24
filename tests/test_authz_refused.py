@@ -80,6 +80,53 @@ CHALLENGE_SPELLINGS = (
 )
 
 
+class EqualToEverything(int):
+    """An int whose comparisons lie: it is `in {403, 404}` whatever its value is."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __hash__(self) -> int:
+        return hash(403)
+
+
+class ConvertsToForbidden(int):
+    """An int whose conversions lie: `int()` and `operator.index()` both answer 403."""
+
+    def __int__(self) -> int:
+        return 403
+
+    def __index__(self) -> int:
+        return 403
+
+
+class HeaderText(str):
+    """A `str` subclass, as an enum of header names would be."""
+
+    __slots__ = ()
+
+
+LYING_INTS = (EqualToEverything(500), ConvertsToForbidden(500))
+NOT_TEXT_HEADERS: tuple[object, ...] = (
+    {b"WWW-Authenticate": "Bearer"},
+    {b"X-Tag": "a"},
+    {"X-Tag": b"a"},
+    {"X-Tag": 1},
+    {1: "a"},
+    [("X-Tag", "a")],
+    "X-Tag: a",
+)
+NOT_TEXT_HEADER_IDS = (
+    "bytes-challenge",
+    "bytes-name",
+    "bytes-value",
+    "int-value",
+    "int-name",
+    "pairs",
+    "string",
+)
+
+
 class MissingCapability(AuthorizationRefused):
     """What a consumer writes: a refusal whose body names the capability the role lacks."""
 
@@ -175,7 +222,11 @@ def test_the_default_is_a_403_whose_body_is_the_status_phrase() -> None:
     assert (refusal.status_code, refusal.detail, refusal.headers) == (403, "Forbidden", None)
 
 
-@pytest.mark.parametrize("status", [403, 404, HTTPStatus.FORBIDDEN, HTTPStatus.NOT_FOUND], ids=str)
+@pytest.mark.parametrize(
+    "status",
+    [403, 404, HTTPStatus.FORBIDDEN, HTTPStatus.NOT_FOUND],
+    ids=["403", "404", "HTTPStatus.FORBIDDEN", "HTTPStatus.NOT_FOUND"],
+)
 def test_a_refusal_may_answer_403_or_404(status: int) -> None:
     refusal = AuthorizationRefused(status_code=status, detail={"code": "x"})
 
@@ -201,14 +252,48 @@ def test_the_challenge_header_in_any_spelling_is_a_value_error(name: str) -> Non
 
 
 def test_other_headers_are_kept_on_a_copy_of_their_own() -> None:
-    """Checked once, at construction, so the mapping it checked must be the one it keeps: a dict
-    the caller still holds could otherwise grow the challenge after the check."""
+    """The mapping construction checked must be the one it keeps: a dict the caller still holds
+    could otherwise grow the challenge after the check."""
     headers = {"X-Required-Capability": "send_sms"}
     refusal = AuthorizationRefused(headers=headers)
 
     headers["WWW-Authenticate"] = "Bearer"
 
     assert refusal.headers == {"X-Required-Capability": "send_sms"}
+
+
+@pytest.mark.parametrize("status", LYING_INTS, ids=["equal-to-everything-500", "converts-to-403"])
+def test_an_int_that_lies_is_judged_by_its_real_value(status: int) -> None:
+    """Checking the caller's object and storing `int()` of it are two different reads: one lies
+    in `__eq__`/`__hash__` and passes as 403, the other lies in `__int__`. The value is read
+    once, by `int`'s own conversion, and that one value is both checked and stored."""
+    with pytest.raises(ValueError, match="403 or 404"):
+        AuthorizationRefused(status_code=status)
+
+
+def test_an_int_subclass_that_really_is_403_is_stored_as_a_plain_int() -> None:
+    refusal = AuthorizationRefused(status_code=EqualToEverything(403))
+
+    assert type(refusal.status_code) is int
+    assert refusal.status_code == 403
+
+
+@pytest.mark.parametrize("headers", NOT_TEXT_HEADERS, ids=NOT_TEXT_HEADER_IDS)
+def test_headers_that_are_not_a_mapping_of_str_to_str_are_a_value_error(headers: object) -> None:
+    """Starlette writes every name and value as text. A `bytes` challenge would slip past the
+    spelling check and then crash the response mid-write — never the documented error."""
+    with pytest.raises(ValueError, match="mapping of str to str"):
+        AuthorizationRefused(headers=headers)  # pyright: ignore[reportArgumentType]
+
+
+def test_str_subclass_names_and_values_are_kept_as_plain_str() -> None:
+    """A `str` subclass can answer `strip()` or `lower()` differently from what is written to the
+    wire, so what is kept is plain text, and the check at honour time accepts nothing else."""
+    refusal = AuthorizationRefused(headers={HeaderText("X-Tag"): HeaderText("kept")})
+
+    assert refusal.headers == {"X-Tag": "kept"}
+    assert refusal.headers is not None
+    assert all(type(name) is str and type(value) is str for name, value in refusal.headers.items())
 
 
 @pytest.mark.parametrize("attribute", ["status_code", "detail", "headers"])
@@ -384,17 +469,22 @@ def test_a_lookup_that_refuses_before_returning_its_coroutine_is_honoured() -> N
         {"status_code": 400},
         {"status_code": 500},
         {"headers": {"www-authenticate": "Bearer"}},
+        {"status_code": EqualToEverything(500)},
+        {"headers": {b"WWW-Authenticate": "Bearer"}},
     ],
-    ids=["401", "400", "500", "challenge"],
+    ids=["401", "400", "500", "challenge", "lying-int", "bytes-challenge"],
 )
 def test_a_marker_built_wrong_inside_a_rule_is_contained_and_logged(
-    where: str, arguments: dict[str, Any], records: list[logging.LogRecord]
+    where: str, arguments: dict[str, Any], client_backend: str, records: list[logging.LogRecord]
 ) -> None:
+    """Each of these is a `ValueError` at construction, and inside a rule that is an accident.
+    The last two reached the wire before the fix: the lying int as a 500, the `bytes` challenge
+    as a crash while Starlette wrote the response."""
     _verifier, auth = one_verifier()
     app = raising_app(where, auth, lambda: AuthorizationRefused(**arguments), [])
     observed = recording(app)
 
-    with client(app) as http:
+    with client(app, client_backend) as http:
         response = http.get(URL[where], headers={HEADER: GOOD_CREDENTIAL})
 
     assert response.status_code == 403

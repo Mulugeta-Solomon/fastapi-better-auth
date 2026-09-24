@@ -25,6 +25,7 @@ import pytest
 from pydantic import SecretStr, create_model
 
 from fastapi_better_auth import (
+    AuthorizationRefused,
     AuthServiceUnavailable,
     BetterAuth,
     CookieVerifier,
@@ -150,6 +151,36 @@ def test_an_escaped_authorization_callback_logs_no_credential(
     assert_template_fired(records, manifest_site("the %s raised"))
     assert_no_leak(records, token)
     assert "RuntimeError" in caught.value.reason
+    assert token not in caught.value.reason
+
+
+def test_a_refusal_the_gate_will_not_honour_logs_no_header_no_detail_and_no_credential(
+    records: list[logging.LogRecord],
+) -> None:
+    """`authz` logs an `AuthorizationRefused` that broke its invariants after construction: the
+    class and which invariant, and nothing else. Its headers and its `detail` are the application's
+    own and may hold anything - here both echo the raw token the session carries - so the line is
+    written without a traceback, which would render `str(exc)` and with it the `detail`."""
+    token = SIGNER.sign(claims(issuer=ORIGIN))
+    session: Session[User] = Session(
+        user=User(id=STORED_USER_ID),
+        expires_at=None,
+        token=SecretStr(token),
+        raw={"token": token},
+    )
+
+    def refuse(_session: Session[User]) -> bool:
+        refusal = AuthorizationRefused(detail={"echo": token})
+        refusal.headers = {"WWW-Authenticate": f"Bearer {token}"}
+        raise refusal
+
+    with pytest.raises(NotAuthorized) as caught:
+        permitted(refuse, session)
+
+    assert_template_fired(records, manifest_site("the %s refused with"))
+    assert_no_leak(records, token)
+    assert all(record.exc_info is None for record in records)
+    assert "WWW-Authenticate" in caught.value.reason
     assert token not in caught.value.reason
 
 

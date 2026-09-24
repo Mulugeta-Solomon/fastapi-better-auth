@@ -1201,7 +1201,10 @@ warning (once per process). At `ERROR`, with the traceback: an
 exception that escaped a verifier, and one that escaped an authorization predicate or a membership
 lookup — each answered as the uniform refusal rather than a `500`, so the log is the only place the
 real exception exists. The `reason` those build names the exception's *type* and not its message.
-An `AuthorizationRefused` is an answer rather than an escape, and logs nothing.
+An `AuthorizationRefused` is an answer rather than an escape, and logs nothing — unless it was
+edited after it was built into something it could not have been built as (a `401`, a challenge
+header, headers that are not text): that one is logged at `ERROR` with its class and the rule it
+broke, never its headers or its `detail`, and answered as the uniform `403`.
 None of these lines carries a raw token, a cookie value or a signature.
 
 ### Your own error envelope

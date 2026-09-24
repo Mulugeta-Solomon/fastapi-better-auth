@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from fastapi import HTTPException
 
@@ -20,6 +20,19 @@ SANCTIONED_RESPONSES: Mapping[int, tuple[str, Mapping[str, str] | None]] = Mappi
 SHADOWED_ATTRIBUTES = ("status_code", "detail", "headers")
 REFUSAL_STATUSES = frozenset({403, 404})
 CHALLENGE_HEADER = "www-authenticate"
+STATUS_BREACH = "its status_code is not a plain int, 403 or 404"
+HEADERS_BREACH = "its headers are not a mapping of str to str"
+CHALLENGE_BREACH = "its headers carry WWW-Authenticate"
+BREACH_CAUSES: Mapping[str, str] = MappingProxyType(
+    {
+        STATUS_BREACH: "A 401 would tell a session that already verified to re-authenticate, 400"
+        " is the ambiguous-credential answer, and any other status is not a refusal.",
+        HEADERS_BREACH: "Starlette writes every header name and value as text; anything else"
+        " fails while the response is being written.",
+        CHALLENGE_BREACH: "The challenge belongs to authentication, and a session that reached a"
+        " rule already passed it.",
+    }
+)
 
 
 def _rebuild(error_cls: type[SessionError], reason: str) -> SessionError:
@@ -279,19 +292,27 @@ class AuthorizationRefused(HTTPException):
     registered for `SessionError` never sees it, and FastAPI's own `HTTPException` handler
     renders it.
 
+    **Checked again as it leaves the rule.** An exception is a mutable object, so the gate holds
+    the refusal to the same rules the constructor does at the moment it is honoured; one edited
+    afterwards into something it could not have been built as is an accident, logged with its
+    class and the rule it broke - never a header value, never the `detail` - and answered as the
+    uniform `NotAuthorized`.
+
     Args:
         status_code: `403` (the default) or `404`, for a rule that would rather not confirm the
-            resource exists. A `401` would tell a session that is valid to re-authenticate, a
-            `400` is this library's ambiguous-credential answer, and a `5xx` is not a refusal.
+            resource exists. Read once as a plain `int` - that value is checked and kept. A `401`
+            would tell a session that is valid to re-authenticate, a `400` is this library's
+            ambiguous-credential answer, and a `5xx` is not a refusal.
         detail: The body's `detail`, any JSON-serializable value, exactly as `HTTPException`
             takes it. `None` renders the status phrase.
-        headers: Extra response headers, copied at construction. They may not carry
-            `WWW-Authenticate` in any spelling: the challenge belongs to authentication, and
-            this session already passed it.
+        headers: Extra response headers: a mapping of `str` to `str`, copied as plain text at
+            construction. They may not carry `WWW-Authenticate` in any spelling: the challenge
+            belongs to authentication, and this session already passed it.
 
     Raises:
-        ValueError: At construction, if `status_code` is not 403 or 404 or `headers` names
-            `WWW-Authenticate`. Raised inside a rule, that is an accident like any other.
+        ValueError: At construction, if `status_code` is not 403 or 404, or `headers` is not a
+            mapping of `str` to `str` or names `WWW-Authenticate`. Raised inside a rule, that is
+            an accident like any other.
         TypeError: When a subclass is defined that sets `status_code`, `detail` or `headers`
             in its class body, where `__init__` would silently override them.
     """
@@ -310,30 +331,70 @@ class AuthorizationRefused(HTTPException):
         detail: Any = None,
         headers: Mapping[str, str] | None = None,
     ) -> None:
+        status = _plain_status(status_code)
+        kept = None if headers is None else _plain_headers(headers)
+        breach = refusal_breach(status, kept)
+        if breach is not None:
+            raise ValueError(_misbuilt(breach, status_code))
         super().__init__(
-            status_code=_refusal_status(status_code),
+            status_code=cast("int", status),
             detail=detail,
-            headers=_refusal_headers(headers),
+            headers=cast("dict[str, str] | None", kept),
         )
 
 
-def _refusal_status(status_code: object) -> int:
-    if isinstance(status_code, int) and status_code in REFUSAL_STATUSES:
-        return int(status_code)
-    raise ValueError(
-        f"AuthorizationRefused(status_code={status_code!r}) must be 403 or 404. A 401 would tell a"
-        " session that already verified to re-authenticate, 400 is the ambiguous-credential"
-        " answer, and any other status is not a refusal."
-    )
+def refusal_breach(status_code: object, headers: object) -> str | None:
+    """The invariant an explaining refusal breaks, or `None` when it keeps all of them.
 
-
-def _refusal_headers(headers: Mapping[str, str] | None) -> dict[str, str] | None:
+    Asked twice with the same answer: at construction, and by `authz` as the refusal leaves the
+    rule - an exception is a mutable object, and what reaches the wire is what it holds then.
+    """
+    if type(status_code) is not int or status_code not in REFUSAL_STATUSES:
+        return STATUS_BREACH
     if headers is None:
         return None
-    copied = dict(headers)
-    if any(name.strip().lower() == CHALLENGE_HEADER for name in copied):
-        raise ValueError(
-            "AuthorizationRefused(headers=...) may not carry WWW-Authenticate. The challenge"
-            " belongs to authentication, and a session that reached a rule already passed it."
-        )
-    return copied
+    names = _header_names(headers)
+    if names is None:
+        return HEADERS_BREACH
+    if any(name.strip().lower() == CHALLENGE_HEADER for name in names):
+        return CHALLENGE_BREACH
+    return None
+
+
+def _header_names(headers: object) -> list[str] | None:
+    """The names of a mapping of plain `str` to plain `str`, or `None` for anything else."""
+    if not isinstance(headers, Mapping):
+        return None
+    try:
+        pairs = list(cast("Mapping[object, object]", headers).items())
+    except Exception:  # noqa: BLE001 - its message may quote a header; the caller logs the breach
+        return None
+    names: list[str] = []
+    for name, value in pairs:
+        if type(name) is not str or type(value) is not str:
+            return None
+        names.append(name)
+    return names
+
+
+def _plain_status(status_code: object) -> object:
+    if isinstance(status_code, int) and not isinstance(status_code, bool):
+        return int.__int__(status_code)
+    return status_code
+
+
+def _plain_headers(headers: object) -> object:
+    if not isinstance(headers, Mapping):
+        return headers
+    source = cast("Mapping[object, object]", headers)
+    plain: dict[str, str] = {}
+    for name, value in source.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            return source
+        plain[str.__str__(name)] = str.__str__(value)
+    return plain
+
+
+def _misbuilt(breach: str, status_code: object) -> str:
+    got = f" (got {status_code!r})" if breach == STATUS_BREACH else ""
+    return f"AuthorizationRefused was built wrong: {breach}{got}. {BREACH_CAUSES[breach]}"
