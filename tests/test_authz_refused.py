@@ -117,6 +117,10 @@ NOT_FIELDS: tuple[dict[str, str], ...] = (
     {"X-Tag": "a\x00b"},
     {"X-Tag": "a\x1bb"},
     {"X-Tag": "a\x7fb"},
+    {"X-Tag": "a\x80b"},
+    {"X-Tag": "a\x85b"},
+    {"X-Tag": "a\xe9b"},
+    {"X-Tag": "a\xffb"},
     {"X-Tag": "\u20ac"},
     {"X Tag": "v"},
     {"X-Tag:": "v"},
@@ -131,6 +135,10 @@ NOT_FIELD_IDS = (
     "nul",
     "escape",
     "del",
+    "obs-text-80",
+    "nel-85",
+    "obs-text-e9",
+    "obs-text-ff",
     "not-an-octet",
     "space-in-name",
     "colon-in-name",
@@ -343,11 +351,12 @@ def test_a_header_name_is_accepted_exactly_when_it_is_a_token() -> None:
 
 
 def test_a_header_value_is_accepted_exactly_when_it_is_field_content() -> None:
-    """HTAB, SP, the visible characters and obs-text - nothing else, so no CR, LF, NUL, other C0
-    control or DEL, and nothing above 0xFF, which is not an octet at all."""
+    """HTAB, SP and visible US-ASCII - nothing else, so no CR, LF, NUL, other C0 control or DEL,
+    no obs-text (NEL included), which RFC 9110 section 5.5 says new fields should not use and
+    which a client may be unable to decode, and nothing above 0xFF, which is not an octet."""
     swept = [*range(0x200), 0x20AC, 0x1F600]
     values = {code for code in swept if accepted({"X-Tag": f"a{chr(code)}b"})}
-    expected = {0x09, *range(0x20, 0x7F), *range(0x80, 0x100)}
+    expected = {0x09, *range(0x20, 0x7F)}
 
     assert values == expected, f"{len(values ^ expected)} code points differ"
 

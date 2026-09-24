@@ -22,13 +22,13 @@ SHADOWED_ATTRIBUTES = ("status_code", "detail", "headers")
 REFUSAL_STATUSES = frozenset({403, 404})
 CHALLENGE_HEADER = "www-authenticate"
 FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
-FIELD_VALUE = re.compile(r"[\t\x20-\x7e\x80-\xff]*")
+FIELD_VALUE = re.compile(r"[\t\x20-\x7e]*")
 STATUS_BREACH = "its status_code is not a plain int, 403 or 404"
 HEADERS_BREACH = "its headers are not a plain dict of str to str"
 CHALLENGE_BREACH = "its headers carry WWW-Authenticate"
 FIELD_BREACH = (
-    "its headers are not RFC 9110 fields: a name must be a token, and a value may carry no CR,"
-    " LF or other control character"
+    "its headers are not RFC 9110 fields: a name must be a token, and a value may carry only"
+    " tabs, spaces and visible US-ASCII"
 )
 BREACH_CAUSES: Mapping[str, str] = MappingProxyType(
     {
@@ -40,8 +40,9 @@ BREACH_CAUSES: Mapping[str, str] = MappingProxyType(
         CHALLENGE_BREACH: "The challenge belongs to authentication, and a session that reached a"
         " rule already passed it.",
         FIELD_BREACH: "A CR or LF in a value splits the response on a server that writes it, and"
-        " one that refuses it aborts the response or answers 500; a character above U+00FF is"
-        " not an octet at all (RFC 9110 sections 5.1, 5.5 and 5.6.2).",
+        " one that refuses it aborts the response or answers 500; obs-text is what RFC 9110 says"
+        " new fields should not use, and a client may be unable to decode it (sections 5.1, 5.5"
+        " and 5.6.2).",
     }
 )
 
@@ -318,8 +319,9 @@ class AuthorizationRefused(HTTPException):
         detail: The body's `detail`, any JSON-serializable value, exactly as `HTTPException`
             takes it. `None` renders the status phrase.
         headers: Extra response headers: a mapping of `str` to `str`, copied as plain text at
-            construction. Each name must be an RFC 9110 token and each value field content - no
-            CR, LF or other control character but a tab - so no value can split the response.
+            construction. Each name must be an RFC 9110 token and each value only tabs, spaces
+            and visible US-ASCII - so no value can split the response or reach a client as bytes
+            it cannot decode.
             They may not carry `WWW-Authenticate` in any spelling: the challenge belongs to
             authentication, and this session already passed it.
 

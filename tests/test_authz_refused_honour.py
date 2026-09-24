@@ -5,8 +5,8 @@ The constructor refuses an honest mistake early and clearly, but an exception is
 after construction would otherwise ride the honoured path straight to the wire. So the gate checks
 the refusal as it leaves the rule, with the same predicate the constructor uses: a plain `int`
 403 or 404, and headers that are `None` or exactly a plain `dict` of plain `str` to plain `str`,
-naming no challenge, every name an RFC 9110 token and every value free of CR, LF and other
-controls. The headers are read once, and that read — a fresh plain `dict` — is what is written, so
+naming no challenge, every name an RFC 9110 token and every value only tabs, spaces and visible
+US-ASCII. The headers are read once, and that read — a fresh plain `dict` — is what is written, so
 a mapping that answers differently the second time cannot smuggle anything past the check.
 Anything else is an accident — logged with the class and the broken invariant, never a header
 value and never the `detail`, and answered as the uniform `NotAuthorized`.
@@ -48,6 +48,8 @@ CHALLENGE = "WWW-Authenticate"
 NOT_TEXT = "of str to str"
 NOT_FIELD = "RFC 9110"
 SPLIT = f"a\r\nWWW-Authenticate: {HEADER_VALUE}"
+OBS_TEXT = (0x80, 0x85, 0xE9, 0xFF)
+"""The obs-text octets the round-3 ruling names: the range's ends, NEL, and a letter with an accent."""
 
 Tamper = Callable[[Any], None]
 
@@ -154,6 +156,13 @@ BROKEN: dict[str, tuple[Tamper, str]] = {
     "reassigned-split-value": (setting("headers", {"X-Tag": SPLIT}), NOT_FIELD),
     "reassigned-nul-value": (setting("headers", {"X-Tag": f"{HEADER_VALUE}\x00"}), NOT_FIELD),
     "reassigned-non-token-name": (setting("headers", {"X Tag": HEADER_VALUE}), NOT_FIELD),
+    **{
+        f"reassigned-obs-text-{code:02x}": (
+            setting("headers", {"X-Tag": f"a{chr(code)}b"}),
+            NOT_FIELD,
+        )
+        for code in OBS_TEXT
+    },
 }
 
 SOUND: dict[str, tuple[Tamper, int, dict[str, str]]] = {

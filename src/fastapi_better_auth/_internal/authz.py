@@ -147,11 +147,12 @@ def permitted(predicate: Predicate, session: Session[Any]) -> bool:
     except HONOURED:
         raise
     except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-        raise _resolved(exc, PREDICATE) from None
-    if inspect.isawaitable(answer):
-        _close(answer)
-        raise ConfigurationError(ASYNC_PREDICATE)
-    return answer is True
+        failure = _resolved(exc, PREDICATE)
+    else:
+        return _exactly_true(answer)
+    # Decided inside the handler (so _contained logs the accident), raised outside it: raised in
+    # there, even `from None` keeps the rule's exception - detail, headers - on __context__.
+    raise failure from None
 
 
 async def granted(member: Member, resource_id: str, session: Session[Any]) -> Any:
@@ -169,7 +170,15 @@ async def granted(member: Member, resource_id: str, session: Session[Any]) -> An
     except HONOURED:
         raise
     except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-        raise _resolved(exc, LOOKUP) from None
+        failure = _resolved(exc, LOOKUP)
+    raise failure from None  # outside the handler, as in `permitted`
+
+
+def _exactly_true(answer: object) -> bool:
+    if inspect.isawaitable(answer):
+        _close(answer)
+        raise ConfigurationError(ASYNC_PREDICATE)
+    return answer is True
 
 
 def _resolved(exc: Exception, what: str) -> BaseException:
