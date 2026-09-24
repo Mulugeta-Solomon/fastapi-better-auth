@@ -14,7 +14,7 @@ from typing import cast
 
 from .cookie_verifier import ILLEGAL_IN_A_COOKIE_NAME
 from .errors import ConfigurationError
-from .httpx_transports import HttpxTransport
+from .httpx_transports import default_transport
 from .negative_cache import (
     MAX_NEGATIVE_TTL,
     MAX_REMEMBERED,
@@ -39,7 +39,7 @@ _BASE_PATH_MESSAGE = (
 
 def validated_transport(transport: object) -> Transport:
     if transport is None:
-        return HttpxTransport()
+        return default_transport("RemoteVerifier")
     if not isinstance(transport, Transport):
         raise ConfigurationError(
             f"RemoteVerifier(transport=...) is a {type(transport).__name__}, which does not"

@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import pathlib
 import re
+import sys
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple
 
 import anyio
@@ -36,12 +38,14 @@ import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 import fastapi_better_auth
-from fastapi_better_auth import SessionError
+from fastapi_better_auth import BetterAuth, Session, SessionError, SharedSecret, User
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-DOCUMENTS = (ROOT / "README.md", ROOT / "COMPATIBILITY.md")
+README = ROOT / "README.md"
+DOCUMENTS = (README, ROOT / "COMPATIBILITY.md")
 
 FENCE = "```"
 PYTHON_FENCE = "```python"
@@ -79,6 +83,22 @@ signature of the wrong length, and a well-formed envelope whose HMAC does not ve
 
 BASE_URL = "https://auth.example.com"
 BROKEN_SNIPPET = "```python\nfrom fastapi_better_auth import BetterAuht\n```\n"
+
+TESTING_HEADING = "## Testing"
+HTTP_CLIENTS = ("httpx", "httpx2")
+"""The two libraries a bare `fastapi-better-auth-bridge` install has neither of (#65)."""
+
+FACTORY = "create_app"
+FACTORY_SETTINGS = "Settings"
+OFFLINE_DATABASE_URL = "sqlite+aiosqlite://"
+"""What the lane hands a documented factory: an engine that builds on every lane with no server.
+
+The page names no driver; the lane picks the one the dev group installs everywhere. The forged
+cookies are refused at the signature, so the store behind it is never asked anything.
+"""
+LANE_SECRET = "readme-lane-secret-that-signs-nothing-it-is-shown"
+FACTORY_FAKE_ID = "u-factory-fake"
+QUICKSTART_A = "## Quickstart (Mode A — session cookie)"
 
 UNOPENED_SPELLINGS = ("```py", "~~~python", "```python3", "   ```python")
 """Fence openers a reader calls python and `snippets` does not open. None may be silent."""
@@ -145,16 +165,59 @@ def snippets(path: pathlib.Path) -> tuple[Snippet, ...]:
 ALL_SNIPPETS = tuple(snippet for path in DOCUMENTS for snippet in snippets(path))
 
 
+def fences_under(heading: str) -> tuple[Snippet, ...]:
+    """The README's python fences between `heading` and the next `## ` heading, in page order."""
+    lines = README.read_text(encoding="utf-8").splitlines()
+    index = lines.index(heading)
+    end = next(
+        (number for number, line in enumerate(lines[index + 1 :], index + 2) if line[:3] == "## "),
+        len(lines) + 1,
+    )
+    return tuple(
+        snippet
+        for snippet in ALL_SNIPPETS
+        if snippet.document == README.name and index + 1 < snippet.line < end
+    )
+
+
 def run(snippet: Snippet) -> dict[str, Any]:
-    """Execute one snippet in a namespace of its own, and hand back what it defined."""
+    """Execute one snippet in a namespace of its own, and hand back what it defined.
+
+    Compiled with `dont_inherit=True`: a reader's module does not have this file's
+    `from __future__ import annotations`, so the snippet must not run under it either.
+    """
     namespace: dict[str, Any] = {"__name__": f"readme_snippet_{snippet.line}"}
+    code = compile(snippet.code, f"<{snippet.id}>", "exec", dont_inherit=True)
     # The source is this repository's own documentation, and running it IS the test.
-    exec(compile(snippet.code, f"<{snippet.id}>", "exec"), namespace)  # noqa: S102
+    exec(code, namespace)  # noqa: S102
     return namespace
 
 
+def factory_apps(namespace: Mapping[str, Any]) -> tuple[FastAPI, ...]:
+    """The application a fence's `create_app(settings)` builds from the lane's own settings.
+
+    A factory fence has no module-level app to find, so the lane calls the factory the way a
+    reader's test suite does. Its `Settings` fields are named here: renaming one is a loud
+    `TypeError`, and renaming the factory is caught by the factory rung's own census.
+    """
+    factory = namespace.get(FACTORY)
+    settings = namespace.get(FACTORY_SETTINGS)
+    if not callable(factory) or not isinstance(settings, type):
+        return ()
+    built = factory(
+        settings(
+            database_url=OFFLINE_DATABASE_URL,
+            better_auth_secret=SharedSecret(LANE_SECRET),
+            front_end_origin=ALLOWED_ORIGIN,
+        )
+    )
+    assert isinstance(built, FastAPI), f"{FACTORY} built a {type(built).__name__}"
+    return (built,)
+
+
 def apps_in(namespace: Mapping[str, Any]) -> tuple[FastAPI, ...]:
-    return tuple(value for value in namespace.values() if isinstance(value, FastAPI))
+    found = tuple(value for value in namespace.values() if isinstance(value, FastAPI))
+    return found + factory_apps(namespace)
 
 
 def secured_paths(document: Mapping[str, Any], method: str = "get") -> tuple[str, ...]:
@@ -166,6 +229,13 @@ def secured_paths(document: Mapping[str, Any], method: str = "get") -> tuple[str
         if "security" in operation:
             found.append(path)
     return tuple(found)
+
+
+def secured_routes(document: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    """Every secured `(method, path)` of the two methods the page documents routes on."""
+    return tuple(
+        (method, path) for method in ("get", "post") for path in secured_paths(document, method)
+    )
 
 
 def forged_cookie_header(value: str) -> str:
@@ -249,6 +319,23 @@ def refuse_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return attempted
 
 
+@pytest.fixture
+def refuse_database(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record — and refuse — any connection a documented engine tries to open.
+
+    The factory fence builds a real `AsyncEngine`; construction is offline, a checkout is not.
+    Refused at `AsyncEngine.connect`, the one door both the store's discovery and its lookups use.
+    """
+    attempted: list[str] = []
+
+    def refused(engine: AsyncEngine) -> object:
+        attempted.append(engine.url.drivername)
+        raise AssertionError("a snippet opened a database connection; snippets must not need one")
+
+    monkeypatch.setattr(AsyncEngine, "connect", refused)
+    return attempted
+
+
 def test_every_python_fence_in_the_documents_is_extracted() -> None:
     """The census of what a reader calls a python block, against what the extractor opened.
 
@@ -294,16 +381,39 @@ def test_the_extractor_catches_a_snippet_that_stopped_working(tmp_path: pathlib.
 
 @pytest.mark.parametrize("snippet", ALL_SNIPPETS, ids=[snippet.id for snippet in ALL_SNIPPETS])
 @pytest.mark.usefixtures("snippet_environment")
-def test_every_snippet_runs(snippet: Snippet, refuse_network: list[str]) -> None:
+def test_every_snippet_runs(
+    snippet: Snippet, refuse_network: list[str], refuse_database: list[str]
+) -> None:
     """Construction and route registration are the whole of what a snippet may do."""
     run(snippet)
 
     assert refuse_network == []
+    assert refuse_database == []
+
+
+def test_the_testing_recipe_runs_on_an_install_with_no_http_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#65: a Mode A install carries neither HTTP client, and `## Testing` is where it lands.
+
+    The recipe is about the override, not about a mode, so it has to construct on the bare
+    install. Found by its heading, not by a line number: prose edited above the section moves
+    every line, and a guard that quietly matched nothing would pass on an empty section.
+    """
+    found = fences_under(TESTING_HEADING)
+    assert len(found) == 1, f"{TESTING_HEADING} holds {len(found)} python fences, not one"
+    for library in HTTP_CLIENTS:
+        monkeypatch.setitem(sys.modules, library, None)
+
+    namespace = run(found[0])
+
+    assert apps_in(namespace), "the recipe builds no application to override"
+    assert isinstance(namespace.get("auth"), BetterAuth)
 
 
 @pytest.mark.usefixtures("snippet_environment")
 def test_the_applications_the_snippets_build_enforce_and_document_themselves(
-    refuse_network: list[str],
+    refuse_network: list[str], refuse_database: list[str]
 ) -> None:
     """The snippets are the real API, refusing real requests — not code that merely imports.
 
@@ -317,7 +427,8 @@ def test_the_applications_the_snippets_build_enforce_and_document_themselves(
     to refuse anything would be the bearer half. `refuse_network` is asserted per route as well as
     once at the end, because a cookie mode that had to *ask upstream* to reject a forgery would
     still answer 401 — the refusal would be right and the documented behaviour ("refused locally,
-    before any upstream call") would be false.
+    before any upstream call") would be false. `refuse_database` is the same instrument for a
+    documented engine: a factory fence owns a real one, and a forgery must never check it out.
 
     A snippet that registers a handler over the refusal family owns the body and is held to the
     property the default body carries for free instead: anonymous and forged answered
@@ -375,6 +486,7 @@ def test_the_applications_the_snippets_build_enforce_and_document_themselves(
                         assert forged.headers["www-authenticate"] == "Bearer", where
                         assert forged.json() == UNAUTHENTICATED, where
                         assert refuse_network == [], where
+                        assert refuse_database == [], where
                     refused_posts.append(where)
 
     assert published, "no snippet builds an application that documents the bearer scheme"
@@ -388,6 +500,7 @@ def test_the_applications_the_snippets_build_enforce_and_document_themselves(
     assert 401 in anonymous, "no documented route refuses an anonymous request"
     assert set(anonymous) <= {200, 401}
     assert refuse_network == []
+    assert refuse_database == []
 
 
 @pytest.mark.usefixtures("snippet_environment")
@@ -404,7 +517,8 @@ def test_the_documented_fake_session_serves_the_snippets_own_routes(
     and not a snippet that was already open; the map is cleared and it is refused again, which is
     the half the fence's teardown line promises. The served id is read off the session the fence
     itself builds — a literal here would keep passing against a recipe that had quietly stopped
-    building the documented user.
+    building the documented user. Secured routes of both documented methods are driven, because
+    the recipe's own route is a cookie-mode `POST` (it builds on the bare install, #65).
     """
     driven: list[str] = []
 
@@ -418,19 +532,70 @@ def test_the_documented_fake_session_serves_the_snippets_own_routes(
         for app in apps_in(namespace):
             with TestClient(app) as client:
                 document: dict[str, Any] = client.get("/openapi.json").json()
-                paths = secured_paths(document)
-                for path in paths:
-                    assert client.get(path).status_code == 401, f"{snippet.id} refused {path}"
+                routes = secured_routes(document)
+                for method, path in routes:
+                    where = f"{snippet.id} {method.upper()} {path}"
+                    assert client.request(method, path).status_code == 401, f"refused: {where}"
                 install(app, namespace["auth"])
-                for path in paths:
-                    where = f"{snippet.id} GET {path}"
-                    served = client.get(path)
+                for method, path in routes:
+                    where = f"{snippet.id} {method.upper()} {path}"
+                    served = client.request(method, path)
                     assert served.status_code == 200, where
                     assert served.json()["id"] == session.user.id, where
                     driven.append(where)
                 app.dependency_overrides.clear()
-                for path in paths:
-                    assert client.get(path).status_code == 401, f"{snippet.id} cleared {path}"
+                for method, path in routes:
+                    where = f"{snippet.id} {method.upper()} {path}"
+                    assert client.request(method, path).status_code == 401, f"cleared: {where}"
 
     assert driven, "no snippet documents a fake session for a route to be served under"
     assert refuse_network == []
+
+
+async def factory_fake_session() -> Session[User]:
+    return Session(
+        user=User(id=FACTORY_FAKE_ID),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        raw={"id": FACTORY_FAKE_ID},
+    )
+
+
+def override_through(app: FastAPI, auth: BetterAuth) -> None:
+    """§Testing's recipe, with both keys a factory app's routes can hold."""
+    app.dependency_overrides[auth.current_session()] = factory_fake_session
+    app.dependency_overrides[auth.optional_session()] = factory_fake_session
+
+
+def test_the_factory_app_is_overridden_through_the_instance_it_built(
+    refuse_network: list[str], refuse_database: list[str]
+) -> None:
+    """§Testing's factory sentence, held against §Quickstart's own factory (#69).
+
+    Two calls build two `BetterAuth` instances, and each memoizes its own dependencies: keys taken
+    off the other call's instance override nothing, so a forged cookie is refused for real; keys
+    taken off `app.state.auth` serve the fake session. Counted, so a renamed `create_app` fails
+    here rather than dropping out of the lane. Asyncio only, as every store-backed lane is: the
+    factory owns a SQLAlchemy `AsyncEngine`, an asyncio library.
+    """
+    built = [
+        namespace for namespace in map(run, fences_under(QUICKSTART_A)) if factory_apps(namespace)
+    ]
+    assert len(built) == 1, f"{QUICKSTART_A} holds {len(built)} fences defining {FACTORY}"
+    (app,), (other,) = factory_apps(built[0]), factory_apps(built[0])
+    assert app.state.auth is not other.state.auth
+    headers = {"Cookie": forged_cookie_header(FORGED_COOKIES[-1]), "Origin": ALLOWED_ORIGIN}
+
+    with TestClient(app) as client:
+        routes = secured_routes(client.get("/openapi.json").json())
+        override_through(app, other.state.auth)
+        missed = [client.request(method, path, headers=headers) for method, path in routes]
+        app.dependency_overrides.clear()
+        override_through(app, app.state.auth)
+        served = [client.request(method, path, headers=headers) for method, path in routes]
+
+    assert routes, f"{FACTORY} documents no secured route"
+    assert [answer.status_code for answer in missed] == [401] * len(routes)
+    assert [answer.status_code for answer in served] == [200] * len(routes)
+    assert all(FACTORY_FAKE_ID in answer.json().values() for answer in served)
+    assert refuse_network == []
+    assert refuse_database == []

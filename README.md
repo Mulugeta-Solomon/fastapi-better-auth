@@ -399,6 +399,19 @@ the raw-token key Better Auth's `secondaryStorage` writes. **A store reads; it n
 `touch`, no `EXPIRE`-on-read — because a write here would extend or resurrect a session this side was
 only asked to verify.
 
+**On Postgres, the SQL store's role needs `SELECT` on `session` and `user` and nothing else**
+(`GRANT SELECT ON "session", "user" TO <role>`): the admin plugin's columns and your
+`additionalFields` are columns of `user`, not separate grants, and the `USAGE` it needs on their
+schema is one `PUBLIC` holds on `public` by default — only a non-default `schema=` needs that
+granted. Granting no more is what turns the read-only property into a database guarantee: Postgres
+itself refuses every `INSERT`, `UPDATE` and `DELETE` the role attempts. Grant less — `SELECT` on
+`session` alone — and `connect()` still succeeds (discovery reads the system catalog, which needs no
+grant), then every lookup answers the uniform `401` as `AuthServiceUnavailable`, which this library
+does not log; its `reason` says the store lookup could not complete, so log it from your own
+`SessionError` handler ([Errors](#errors)) to see the misconfiguration.
+`tests/e2e/test_store_grants_live.py` proves the grant, the refused writes and that answer against a
+live Postgres.
+
 **Every column of both tables is read by default**, which is what makes your own `additionalFields`
 reach `session.user` — so do not put a secret on either table. Where the `user` table is shared with
 services that add internal columns to it, `user_columns=` (and `session_columns=` for the other
@@ -408,6 +421,94 @@ found at all, and `banned` / `banExpires` / `impersonatedBy` stay selected whate
 because a ban is this library's business to enforce. A name the live table does not have is a
 `ConfigurationError` at `connect()`, beside the missing-column one. `RedisSessionStore` has no
 equivalent — it reads one stored JSON document, and a document has no SELECT to narrow.
+
+### With an application factory
+
+Where a `create_app(settings)` factory owns the engine — the shape a test suite that builds several
+applications needs — the store, the verifier and the `BetterAuth` are built inside it too, and the
+routes come from a router factory handed that `BetterAuth`:
+
+```python
+import contextlib
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field
+
+from fastapi import APIRouter, Depends, FastAPI
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from fastapi_better_auth import (
+    BetterAuth,
+    CookieVerifier,
+    OriginCheck,
+    Session,
+    SharedSecret,
+    SqlAlchemySessionStore,
+    User,
+)
+
+
+@dataclass(frozen=True)
+class Settings:
+    database_url: str = field(repr=False)  # it carries the database password
+    better_auth_secret: SharedSecret
+    front_end_origin: str
+
+
+def build_router(auth: BetterAuth) -> APIRouter:
+    required = auth.current_session()
+    optional = auth.optional_session()
+
+    async def create_post(session: Session[User] = Depends(required)) -> dict[str, str]:
+        return {"author": session.user.id}
+
+    async def add_reaction(
+        session: Session[User] | None = Depends(optional),
+    ) -> dict[str, str | None]:
+        return {"author": None if session is None else session.user.id}
+
+    router = APIRouter()
+    router.add_api_route("/posts", create_post, methods=["POST"])
+    router.add_api_route("/reactions", add_reaction, methods=["POST"])
+    return router
+
+
+def create_app(settings: Settings) -> FastAPI:
+    engine = create_async_engine(settings.database_url)  # one pool per application, never shared
+    store = SqlAlchemySessionStore(engine=engine)
+    auth = BetterAuth(
+        verifiers=[
+            CookieVerifier(
+                secret=settings.better_auth_secret,
+                store=store,
+                csrf=OriginCheck(allowed_origins=[settings.front_end_origin]),
+            )
+        ]
+    )
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+        yield
+        await engine.dispose()
+
+    app = FastAPI(lifespan=lifespan)
+    app.state.auth = auth  # a test takes its override key off this instance
+    app.include_router(build_router(auth))
+    return app
+```
+
+The quickstart's module-level `CurrentSession` aliases cannot follow the bridge into the factory:
+kept at module scope they would need a module-level store over a module-level engine, and every
+application the factory returns would share that one pool — the thing `SqlAlchemySessionStore`'s
+*always injected, never built here* rule exists to prevent. Moved inside a function, an `Annotated`
+alias is no longer a type expression pyright accepts (`reportInvalidTypeForm`), and a nested route
+function that is only decorated is reported unused under `strict` (`reportUnusedFunction`) — hence
+gates declared as `Depends(...)` defaults and endpoints handed to `add_api_route` by name.
+
+The lifespan closes the pool the factory opened, and is where `await store.connect()` goes before
+the `yield` so a database whose schema cannot answer a lookup stops the application from starting;
+it is left out here only because this page runs without a database. A test builds its own
+application with `create_app(test_settings)` and takes its override key off `app.state.auth` — see
+[Testing](#testing).
 
 ### Is it the same secret? Fingerprint both sides at boot
 
@@ -1146,7 +1247,7 @@ and three constants read off the exception is a handler a reviewer can audit in 
 ## Testing
 
 Override `auth.current_session()` — **called**, with the parentheses — and your tests run as
-whatever session you hand back, with no token, no key set and no upstream:
+whatever session you hand back, with no cookie, no token, no store and no upstream:
 
 ```python
 from datetime import datetime, timedelta, timezone
@@ -1154,16 +1255,49 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI
 
-from fastapi_better_auth import BetterAuth, JwtVerifier, Session, User
+from fastapi_better_auth import (
+    BetterAuth,
+    CookieVerifier,
+    OriginCheck,
+    Session,
+    SharedSecret,
+    StoredSession,
+    StoredUser,
+    User,
+)
 
-auth = BetterAuth(verifiers=[JwtVerifier(base_url="https://auth.example.com")])
+
+class DictSessionStore:
+    """The quickstart's in-memory SessionStore: no database, no network, no extra."""
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, StoredSession] = {}
+        self._users: dict[str, StoredUser] = {}
+
+    async def fetch_session_by_token(self, token: str) -> StoredSession | None:
+        return self._sessions.get(token)
+
+    async def fetch_user_by_id(self, user_id: str) -> StoredUser | None:
+        return self._users.get(user_id)
+
+
+auth = BetterAuth(
+    verifiers=[
+        CookieVerifier(
+            # A literal only so this page runs; in production read it from the environment.
+            secret=SharedSecret("replace-this-with-your-own-32-plus-character-secret"),
+            store=DictSessionStore(),
+            csrf=OriginCheck(allowed_origins=["https://app.example.com"]),
+        )
+    ]
+)
 CurrentSession = Annotated[Session[User], Depends(auth.current_session())]
 
 app = FastAPI()
 
 
-@app.get("/me")
-async def me(session: CurrentSession) -> User:
+@app.post("/profile")
+async def update_profile(session: CurrentSession) -> User:
     return session.user
 
 
@@ -1180,6 +1314,12 @@ def with_fake_session(app: FastAPI, auth: BetterAuth) -> None:
     # Call this from a fixture, never at import: unoverridden routes must still refuse.
     app.dependency_overrides[auth.current_session()] = fake_session
 ```
+
+The override does not care which verifier `auth` holds. This one is Mode A's over an in-memory
+store, so the recipe runs on the bare install with no extra and no network; a Mode B
+`JwtVerifier(base_url=...)` built without `transport=` needs the `[httpx]` extra *by design* — it
+builds its HTTP client at construction, so a Mode B application missing it never starts instead of
+failing its first request.
 
 The parentheses are the whole of it. `current_session(user_model=...)` is memoized per user model,
 so calling it again hands back the *same* callable your routes already depend on — which is what
@@ -1219,6 +1359,22 @@ tests fail against real `401`s. Writing the *value* bare — `dependency_overrid
 auth.current_session` — is the one planting this library cannot refuse at build time, because the
 map is a plain dict it has no hook into; that one raises a `ConfigurationError` on the first request
 touching the dependency, having verified nothing and served nobody.
+
+**With an application factory** there is no module-level `auth` to import: the key is
+`<the BetterAuth the factory built>.current_session(user_model=...)` — `app.state.auth` in
+[the factory above](#with-an-application-factory). The memoization is per `BetterAuth` instance, so
+a key taken off any other instance — a leftover module-level one, or the one a second `create_app`
+call built — overrides nothing, and the route verifies for real and answers `401`. An application
+per test also leaves nothing behind to clear:
+
+```text
+@pytest.fixture
+def client():
+    app = create_app(test_settings)
+    with_fake_session(app, app.state.auth)
+    with TestClient(app) as http:
+        yield http
+```
 
 ## Do I need to run a Node service?
 

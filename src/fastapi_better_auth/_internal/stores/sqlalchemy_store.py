@@ -165,7 +165,13 @@ class SqlAlchemySessionStore(_CoreStore):
     **It never writes.** No INSERT, no UPDATE, no DELETE, no touch that refreshes an expiry -
     the Better Auth server owns every write there is, and a second author of the same rows is
     how a revoked session comes back. The invariant is asserted against the statements the
-    engine actually emits, not against a promise.
+    engine actually emits, not against a promise. On Postgres the store's role needs `SELECT` on
+    `session` and `user` and nothing else - the admin plugin's columns and a deployment's
+    `additionalFields` are columns of `user`, not separate grants - plus `USAGE` on their schema,
+    which `PUBLIC` holds on `public` by default, so only a non-default `schema=` needs it granted.
+    Granting no more is what turns the read-only property into a database guarantee. A role
+    granted less (`SELECT` on `session` alone) still passes `connect()`, since discovery reads the
+    system catalog, and then answers every lookup with `AuthServiceUnavailable` - the uniform 401.
 
     **The session and its user arrive together**, joined in one statement, so the happy path is
     a single round trip and the record's `user` is already populated. `fetch_user_by_id` is
@@ -275,10 +281,11 @@ class SyncStoreAdapter(_CoreStore):
 
     Because it needs no async driver, it runs on **both** anyio backends - asyncio and trio.
 
-    Every rule `SqlAlchemySessionStore` publishes holds here unchanged: read-only, one statement
-    for the session and its user, the schema discovered once, admin columns surfaced where they
-    exist, naive timestamps read as UTC, and the same opt-in `user_columns` / `session_columns`
-    allow-lists over the extra columns a deployment's own tables carry.
+    Every rule `SqlAlchemySessionStore` publishes holds here unchanged: read-only (so the same
+    `SELECT`-only grant on the two tables is all its role needs), one statement for the session
+    and its user, the schema discovered once, admin columns surfaced where they exist, naive
+    timestamps read as UTC, and the same opt-in `user_columns` / `session_columns` allow-lists
+    over the extra columns a deployment's own tables carry.
 
     **Concurrent lookups are bounded by this adapter, not by the process-wide thread pool.** Each
     lookup runs its DBAPI call on a worker thread that checks out one pooled connection; without a
