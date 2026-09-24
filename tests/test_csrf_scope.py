@@ -33,10 +33,17 @@ from tests.transports import ScriptedTransport, json_reply
 CROSS_SITE = "https://attacker.example.net"
 """A registrable domain other than `APP`'s, so a browser calls the request cross-site."""
 
+SIBLING = "https://blog.example.com"
+"""`APP`'s registrable domain, so same-site: a `Lax` cookie rides on its requests. Not allowed."""
+
 PUBLIC = "/access-requests"
 OPTIONAL = "/reactions"
-GUARDED = (OPTIONAL, "/posts", "/drafts")
+REQUIRED = "/posts"
+GUARDED = (OPTIONAL, REQUIRED, "/drafts")
 """`optional_session`, `current_session`, and a `require` gate composed on it."""
+
+UNSAFE_BEYOND_POST = ("PUT", "DELETE")
+"""Unsafe methods other than the POST every other case uses; `REQUIRED` answers both."""
 
 FORBIDDEN = {"detail": "Forbidden"}
 
@@ -60,7 +67,7 @@ def anyone(session: Session[User]) -> bool:
 
 
 def routes(auth: BetterAuth) -> FastAPI:
-    """A public POST beside three POSTs that depend on the verifier in the three ways it can be."""
+    """A public POST beside three routes that depend on the verifier in the three ways it can be."""
     app = FastAPI()
     optional = auth.optional_session()
     required = auth.current_session()
@@ -80,7 +87,8 @@ def routes(auth: BetterAuth) -> FastAPI:
 
     app.add_api_route(PUBLIC, public, methods=["POST"])
     app.add_api_route(OPTIONAL, react, methods=["POST"])
-    app.add_api_route("/posts", post, methods=["POST"])
+    for method in ("POST", *UNSAFE_BEYOND_POST):
+        app.add_api_route(REQUIRED, post, methods=[method])
     app.add_api_route("/drafts", draft, methods=["POST"])
     return app
 
@@ -205,3 +213,46 @@ def test_a_guarded_route_carrying_the_cookie_is_refused_cross_site_before_the_ba
     assert "www-authenticate" not in refused.headers
     calls = deployment.backend_calls()
     assert calls == 0
+
+
+@pytest.mark.parametrize("mode", DEPLOYMENTS)
+def test_a_same_site_sibling_carrying_the_cookie_is_refused_before_the_backend(
+    mode: str, client_backend: str
+) -> None:
+    """`SameSite=Lax` does nothing against a sibling, so the policy is what refuses it.
+
+    The browser attaches the cookie to a sibling's write because the request is same-site, and
+    says so in `Sec-Fetch-Site`; `same-site` is not a pass, and the sibling's `Origin` is not on
+    the allowlist, so the request stops at the CSRF step like a cross-site one.
+    """
+    deployment = DEPLOYMENTS[mode]()
+    sibling = {"Origin": SIBLING, "Sec-Fetch-Site": "same-site", "Cookie": deployment.cookie}
+    with client(deployment.app, client_backend) as http:
+        refused = http.post(REQUIRED, headers=sibling)
+
+    assert refused.status_code == 403
+    assert refused.json() == FORBIDDEN
+    calls = deployment.backend_calls()
+    assert calls == 0
+
+
+@pytest.mark.parametrize("mode", SERVED)
+@pytest.mark.parametrize("method", UNSAFE_BEYOND_POST)
+def test_every_unsafe_method_is_checked_not_only_post(
+    mode: str, method: str, client_backend: str
+) -> None:
+    """Refused cross-site before the backend, then served from the allowed origin.
+
+    The served half is what makes the refusal about CSRF: the same route, method and cookie
+    verify and answer once the request comes from the front end.
+    """
+    deployment = SERVED[mode]()
+    with client(deployment.app, client_backend) as http:
+        refused = http.request(method, REQUIRED, headers=cross_site(deployment.cookie))
+        before = deployment.backend_calls()
+        served = http.request(method, REQUIRED, headers=allowed(deployment.cookie))
+
+    assert refused.status_code == 403
+    assert before == 0
+    assert served.status_code == 200
+    assert served.json() == {"author": USER_ID}

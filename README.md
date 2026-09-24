@@ -490,10 +490,15 @@ The CSRF policy is not middleware and not a property of the application: it is a
 cookie verifier that holds it — `CookieVerifier` here, and `RemoteVerifier` in Mode C, which
 enforces the same policy before its get-session call. A verifier runs only for a route that depends
 on `current_session()` or `optional_session()`, or on a `require(...)` or `require_membership(...)`
-gate composed on them — and there only when the request carries that verifier's session cookie,
-because a request is handed to the verifier whose credential it carries, and one carrying none is
-anonymous. `OriginCheck` and `SignedDoubleSubmit` then check only unsafe methods and WebSocket
-handshakes, never `GET`, `HEAD` or `OPTIONS`. So:
+gate composed on them — and there only when the request carries the one cookie name that verifier
+reads: the prefixed name (`__Secure-better-auth.session_token` by default) under
+`secure_cookies=True`, the plain name under `False`. The other spelling is invisible to it, so a
+request carrying only that one is anonymous — a `401` from `current_session()`, `None` from
+`optional_session()` — and never a CSRF refusal. A request is handed to the verifier whose
+credential it carries, and one carrying two credentials, such as that cookie and a bearer token, is
+answered `400` (`AmbiguousCredentials`) before either one is verified, and so before CSRF.
+`OriginCheck` and `SignedDoubleSubmit` then check only unsafe methods and WebSocket handshakes,
+never `GET`, `HEAD` or `OPTIONS`. So:
 
 - **A public route that reads no cookie needs no CSRF answer, and gets none.** There is no ambient
   credential on it for a forged request to borrow — and its client need not send a CSRF header, or
@@ -571,6 +576,16 @@ never reaches `api.example.com`, whatever its `SameSite` says. Two ways to give 
    (`dist/cookies/index.mjs:38`), and a cookie scoped to `example.com` is sent to
    `app.example.com` and `api.example.com` alike. That widens where the cookie goes; it does not
    make any request same-site that was not already.
+
+**Only the first way keeps `__Host-` open.** `__Host-` is the one cookie prefix a sibling cannot
+plant, which is why `CookieVerifier`'s `secure_prefix` documentation and SECURITY.md tell you to
+prefer `secure_prefix="__Host-"` where you can make Better Auth emit it. RFC 6265bis defines a
+`__Host-` cookie as one set with `Secure`, `Path=/` and **no `Domain` attribute** (§4.1.3.2), and a
+browser ignores a `__Host-` cookie that is not host-only (§5.7 step 21). `crossSubDomainCookies`
+works by emitting `Domain=`, so a `__Host-` name under it is a cookie the browser drops without a
+word, and every session-guarded route answers `401`. The second way therefore gives that hardening
+up: its cookie is `__Secure-` at most, and a sibling can plant a `Domain`-scoped `__Secure-`
+cookie under the same name.
 
 **Read what the code does with `domain`, not what the option's doc comment says it does.** The
 comment says "By default, the domain will be the root domain from the base URL"
@@ -715,9 +730,10 @@ and only when the request carries its cookie: see
 browser attaches the cookie to them exactly as it does to your front end's, and only the CSRF
 policy tells the two apart — which is why `OriginCheck` does not treat `Sec-Fetch-Site: same-site`
 as a pass. `OriginCheck` is the floor; but a *bare* double-submit cookie proves only that the sender
-could set a cookie, and a sibling can set one on the shared parent domain — so on a shared parent
-domain reach for `SignedDoubleSubmit`, whose token is an HMAC of the session token under your
-secret: bound to the session, and useless to a sibling. A **non-browser** client (mobile,
+could set a cookie, and a sibling can set one on the shared parent domain — the session cookie's own
+name included, unless that cookie is `__Host-`, which `crossSubDomainCookies` rules out (above) — so
+on a shared parent domain reach for `SignedDoubleSubmit`, whose token is an HMAC of the session token
+under your secret: bound to the session, and useless to a sibling. A **non-browser** client (mobile,
 server-to-server) has no `Origin` for `OriginCheck` to trust and belongs on **Mode B** (bearer)
 instead: compose both verifiers and each request picks its own by which credential it carries. All
 of this applies unchanged to Mode C, which reads the same cookie.
