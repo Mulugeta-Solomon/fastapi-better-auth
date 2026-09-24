@@ -18,12 +18,15 @@ posture asserted in only one direction is not asserted at all.
 | 1.7.1 with `rateLimit: { enabled: true, customRules: { "/get-session": { window: 10, max: 3 } } }` | conformance (throttled posture), gating | every pull request, and every push to `main` | — (HEAD only) |
 | 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161) |
 | 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161) |
+| 1.7.5 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161, as `latest`) |
 | `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161), `latest` = 1.7.5 that day |
 
 That list is readable from a running application as `fastapi_better_auth.VERIFIED_BETTER_AUTH` — the
 canary matrix without its `latest` entry, which is a dist-tag rather than a version — and
 `tests/test_verified_better_auth.py` fails if this table, the canary workflow, the harness pin and
-the constant are ever edited out of sync.
+the constant are ever edited out of sync. Its newest entry is the version `latest` resolved to when
+the release was cut: the canary sweeps it as a pinned entry beside `latest`, so it stays tested after
+the tag moves on, and each release moves it to whatever `latest` names that day.
 
 The strict posture is what makes "`bearer({ requireSignature: true })` is the fix" a tested claim
 rather than a reading of the source: the default-permissive server and the strict one are driven
@@ -36,8 +39,13 @@ runs the same suite twice against the matrix above — once from the repository 
 against the wheel currently published on PyPI, with a guard that refuses to run unless the
 library under test really is that installed wheel. It fires weekly, and again on any day a watch
 of npm's registry sees a fresh better-auth release; if the watch itself cannot be answered, the
-sweep runs anyway rather than assuming upstream stood still. A failing version opens an issue in
-this repository automatically, named for the artifact that failed.
+sweep runs anyway rather than assuming upstream stood still. Before any test runs, every leg reads
+the better-auth version each of its four harness servers actually imports and writes it to the
+run's summary; a leg named for a concrete version fails if the servers run anything else, so the
+leg's name is always what it tested. A failing version on `main` opens an issue in this repository
+automatically, named for the artifact that failed — and, for `latest`, for the version the tag
+resolved to. A run dispatched on any other branch files nothing; its failures are for whoever
+dispatched it.
 
 Better Auth publishes no wire-format stability contract. Cookie signing, session-store layout and
 the JWT plugin's claims are internal details, and they have moved across minor releases. That is
@@ -48,6 +56,40 @@ The last column is written by hand from the post-release canary, never from a pr
 installed from PyPI is guard-verified to be the version named, and every posture above runs
 against it. The 2026-09-07 run was the first in which the Mode C live lane executed on a published
 wheel rather than on HEAD.
+
+### Between 1.7.1 and 1.7.5
+
+The gating lane pins 1.7.1 and the newest verified version is 1.7.5. Across that gap, three things a
+deployment of this library depends on or runs into, each read out of the published packages' `dist/`
+at the version cited:
+
+- **The wire format did not move.** The session and user field definitions are byte-identical at
+  1.7.1 and 1.7.5 (`@better-auth/core` `dist/db/schema/session.mjs`, `user.mjs`, `shared.mjs`), and
+  so are the admin plugin's (`better-auth` `dist/plugins/admin/schema.mjs`). The Redis document is
+  still the raw token as key and `JSON.stringify({ session, user })` as value (`better-auth@1.7.1`
+  `dist/db/internal-adapter.mjs:303-306`, `better-auth@1.7.5` `:302-305`). Cookie signing lives in
+  the peer package `better-call`, which both versions pin exactly to `1.4.0` (`package.json:470` in
+  each), and every cookie-mode leg ran green against 1.7.5 (run 35050080161, as `latest`).
+- **Schema validation is on by default from 1.7.3**, in every environment, unless
+  `advanced.database.validateSchema` is `false` (`@better-auth/core@1.7.5`
+  `dist/db/schema-check.mjs:4-9`; the option at `dist/types/init-options.d.mts:391-400`; neither
+  exists at 1.7.1). Drift is not a boot failure: the check at init only logs (`better-auth@1.7.5`
+  `dist/auth/base.mjs:15-18`), but every HTTP request awaits it (`dist/api/index.mjs:169-170`), so
+  does every `auth.api.*` call (`dist/api/to-auth-endpoints.mjs:41-42`), and a mismatch is kept and
+  rethrown without asking the database again (`@better-auth/core@1.7.5`
+  `dist/db/schema-check.mjs:60-77`) until Better Auth's own migrator clears it (`better-auth@1.7.5`
+  `dist/db/get-migration.mjs:668`, the only call site in either package). So the server starts, logs
+  one error and fails every auth request, and a schema repaired by another tool is not seen until
+  that process restarts. A deployment that owns its migrations (the README's "Who owns the database
+  schema") runs its drift check before the deploy, not after it.
+- **The rate limiter's client identity did not move.** `dist/api/rate-limiter/index.mjs` is
+  byte-identical at 1.7.1, 1.7.3 and 1.7.5. `x-forwarded-for` is still the one header read by default
+  (`@better-auth/core@1.7.1` `dist/utils/ip.mjs:194`, `@1.7.5` `:196`); a single-value header is
+  trusted with no configuration, and a multi-hop chain needs `advanced.ipAddress.trustedProxies`
+  (`@1.7.5` `:180-190`). A request with no usable address still keys on the shared `no-trusted-ip`
+  bucket (`rate-limiter/index.mjs:233`, `:245`), and the warning about it fires once per process, on
+  the first such request while the limiter is on, never at boot (`:241-244`, `:290`). The README's
+  "The shared rate-limit bucket" holds at 1.7.5 as written.
 
 ## Python
 

@@ -53,12 +53,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["1.6.30", "1.7.1", "latest"]
+        version: ["1.6.30", "1.7.1", "1.7.5", "latest"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Start harness (better-auth@${{ matrix.version }})
         run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled up --build -d --wait
+      - name: Echo the better-auth version the harness runs
+        id: echo
+        env:
+          MATRIX_VERSION: ${{ matrix.version }}
+        run: python3 .github/scripts/harness_better_auth_version.py --expected "$MATRIX_VERSION"
       - name: Sync (dev group)
         run: uv sync
       - name: Conformance lane
@@ -66,16 +71,23 @@ jobs:
       - name: Harness logs
         if: failure()
         run: docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled logs
+      # Only main files issues: a branch dispatch's failures are its dispatcher's to read.
       - name: Open issue on failure
-        if: failure() || cancelled()
+        if: (failure() || cancelled()) && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
+          MATRIX_VERSION: ${{ matrix.version }}
+          HARNESS_VERSION: ${{ steps.echo.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          TITLE="canary: conformance failure against better-auth@${{ matrix.version }}"
+          TARGET="better-auth@${MATRIX_VERSION}"
+          if [ "$MATRIX_VERSION" = "latest" ]; then TARGET="${TARGET} (${HARNESS_VERSION:-unresolved})"; fi
+          TITLE="canary: conformance failure against ${TARGET}"
+          BODY="The HEAD conformance leg against ${TARGET} failed or was cancelled; its harness servers ran better-auth ${HARNESS_VERSION:-(unread - see the version echo step)}. Run: ${RUN_URL}"
           gh label create canary --color D93F0B --description "automated conformance canary" 2>/dev/null || true
           EXISTING=$(gh issue list --state open --label canary --limit 100 --json title --jq ".[].title" | grep -Fx "$TITLE" || true)
           if [ -z "$EXISTING" ]; then
-            gh issue create --title "$TITLE" --label canary --body "The e2e conformance lane failed against better-auth@${{ matrix.version }}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            gh issue create --title "$TITLE" --label canary --body "$BODY"
           fi
 
   published-wheel:
@@ -91,7 +103,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["1.6.30", "1.7.1", "latest"]
+        version: ["1.6.30", "1.7.1", "1.7.5", "latest"]
     env:
       # Never `.venv`: uv adopts that name as the project environment.
       WHEEL_VENV: .venv-published-wheel
@@ -100,6 +112,11 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Start harness (better-auth@${{ matrix.version }})
         run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled up --build -d --wait
+      - name: Echo the better-auth version the harness runs
+        id: echo
+        env:
+          MATRIX_VERSION: ${{ matrix.version }}
+        run: python3 .github/scripts/harness_better_auth_version.py --expected "$MATRIX_VERSION"
       # The store drivers are installed by name rather than through the wheel's own
       # [sqlalchemy] / [redis] extras: those extras do not exist on releases before 0.2.0, and
       # this leg installs whatever is currently on PyPI. The store conformance module skips
@@ -123,19 +140,24 @@ jobs:
         if: failure()
         run: docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled logs
       - name: Open issue on failure
-        if: failure() || cancelled()
+        if: (failure() || cancelled()) && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
+          MATRIX_VERSION: ${{ matrix.version }}
+          HARNESS_VERSION: ${{ steps.echo.outputs.version }}
           WHEEL_VERSION: ${{ steps.guard.outputs.version || 'unknown' }}
           CONFORMANCE_OUTCOME: ${{ steps.conformance.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          TARGET="better-auth@${MATRIX_VERSION}"
+          if [ "$MATRIX_VERSION" = "latest" ]; then TARGET="${TARGET} (${HARNESS_VERSION:-unresolved})"; fi
+          RAN="its harness servers ran better-auth ${HARNESS_VERSION:-(unread - see the version echo step)}"
           if [ "$CONFORMANCE_OUTCOME" = "failure" ]; then
-            TITLE="canary: published wheel ${WHEEL_VERSION} fails conformance against better-auth@${{ matrix.version }}"
-            BODY="fastapi-better-auth-bridge ${WHEEL_VERSION}, installed from PyPI, failed the e2e conformance lane against better-auth@${{ matrix.version }}. This is the artifact users have, not HEAD. Run: ${RUN_URL}"
+            TITLE="canary: published wheel ${WHEEL_VERSION} fails conformance against ${TARGET}"
+            BODY="fastapi-better-auth-bridge ${WHEEL_VERSION}, installed from PyPI, failed the e2e conformance lane against ${TARGET}; ${RAN}. This is the artifact users have, not HEAD. Run: ${RUN_URL}"
           else
-            TITLE="canary: published-wheel lane cannot run against better-auth@${{ matrix.version }}"
-            BODY="The published-wheel lane failed before it tested anything - harness startup, the PyPI install, or the instrument-liveness guard. Until this is fixed the lane proves nothing about the shipped wheel. Run: ${RUN_URL}"
+            TITLE="canary: published-wheel lane cannot run against ${TARGET}"
+            BODY="The published-wheel lane failed before it tested anything - harness startup, the better-auth version echo, the PyPI install, or the instrument-liveness guard; ${RAN}. Until this is fixed the lane proves nothing about the shipped wheel. Run: ${RUN_URL}"
           fi
           gh label create canary --color D93F0B --description "automated conformance canary" 2>/dev/null || true
           EXISTING=$(gh issue list --state open --label canary --limit 100 --json title --jq ".[].title" | grep -Fx "$TITLE" || true)

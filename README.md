@@ -275,6 +275,14 @@ Mode B has no token, Mode C's readiness probe carries no cookie, and Mode A's st
 particular user — so a boot check would have to sign in with a real credential, which is exactly the
 smoke test above, and the smoke test belongs in your suite rather than in your `lifespan`.
 
+**One trap on the Node side.** A field your server sets itself (`input: false`) with no
+`defaultValue` must be declared `required: false`. `required` defaults to `true`
+(`@better-auth/core@1.7.5` `dist/db/type.d.mts:32-36`), so the generated column is `NOT NULL`
+(`better-auth@1.7.5` `dist/db/get-migration.mjs:616` and `:644`; `:607` and `:635` at 1.7.1), while
+sign-up's input check acts only on a `required` that is set explicitly (`dist/db/schema.mjs:103`,
+the same file at 1.7.1 and 1.7.5). Unless a hook writes the field before the insert, sign-up gets
+past that check and fails on the database's constraint rather than with a clean error.
+
 ## Quickstart (Mode A — session cookie)
 
 The mode to reach for when the browser talks to FastAPI directly, carrying the cookie Better Auth
@@ -783,7 +791,9 @@ Read this before Mode C sees real traffic. Better Auth rate-limits its own route
 keys the bucket means **every user of your FastAPI service shares one bucket for `/get-session`**,
 because they all reach your Node service from one address.
 
-The mechanism, read out of better-auth 1.7.1's own build:
+The mechanism, read out of better-auth 1.7.1's own build and unchanged through 1.7.5 (the limiter
+module `dist/api/rate-limiter/index.mjs` and `env-impl.mjs` are byte-identical at 1.7.3 and 1.7.5;
+the cited lines of `create-context.mjs` and `ip.mjs` read the same there, one and two lines lower):
 
 - The limiter is on when you have not set `rateLimit.enabled` and `NODE_ENV === "production"`
   (`dist/context/create-context.mjs:171`, `@better-auth/core/dist/env/env-impl.mjs:30-32`) — off in
@@ -1266,8 +1276,12 @@ awaits the check** (`dist/api/index.mjs:167-168`) and so does every `auth.api.*`
 finds anything (`@better-auth/core@1.7.3` `dist/db/schema-check.mjs:60-76`). None of it is
 `NODE_ENV`-gated. So a schema the Node side does not recognise stops that server serving rather
 than degrading quietly — which, on a database two tools have been fighting over, means the failure
-arrives during a deploy instead of during an incident. `better-auth@1.7.1` has none of this
-machinery: the same mismatch there is silent until something reads a missing column.
+arrives during a deploy instead of during an incident. All of it is unchanged at 1.7.5:
+`dist/auth/base.mjs`, `dist/api/to-auth-endpoints.mjs` and `@better-auth/core`'s
+`dist/db/schema-check.mjs` are byte-identical to 1.7.3's, the option's doc comment is still
+`dist/types/init-options.d.mts:391-400`, and the per-request await has only moved to
+`dist/api/index.mjs:169-170`. `better-auth@1.7.1` has none of this machinery: the same mismatch
+there is silent until something reads a missing column.
 
 This repository's harness is the exception that proves the rule — `harness/auth-server/Dockerfile`
 runs `auth migrate` on every start because nothing else owns that database, and a conformance

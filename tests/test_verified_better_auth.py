@@ -35,6 +35,7 @@ TAG = "latest"
 
 BETTER_AUTH_TABLE_HEADING = "## Better Auth"
 BETTER_AUTH_COLUMN = "better-auth"
+CANARY_LANE = "canary"
 CANARY_MATRICES = 2
 """Two lanes run the sweep - HEAD, and the wheel published on PyPI - and both list the same
 versions. Finding some other number means the workflow moved and this file is now reading half
@@ -78,11 +79,23 @@ def documented_versions() -> frozenset[str]:
     return frozenset(version for row in body for version in VERSION.findall(row[0]))
 
 
+def canary_rows() -> tuple[str, ...]:
+    """The first cell of every canary row in that table, backticks stripped, in file order."""
+    header, _rule, *body = better_auth_rows()
+    assert header[1] == "Lane", f"located the wrong table: {header!r}"
+    return tuple(row[0].strip("`") for row in body if CANARY_LANE in row[1])
+
+
 def harness_pin() -> str:
     """The better-auth version the conformance harness installs."""
     manifest = json.loads(HARNESS_PACKAGE.read_text(encoding="utf-8"))
     dependencies: dict[str, str] = manifest["dependencies"]
     return dependencies[BETTER_AUTH_COLUMN]
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    """`1.7.10` after `1.7.9`: the order a person means, which string order is not."""
+    return tuple(int(part) for part in version.split("."))
 
 
 def test_the_canary_matrices_are_found_and_agree() -> None:
@@ -108,6 +121,22 @@ def test_every_version_the_compatibility_table_names_is_in_the_constant() -> Non
 
     assert documented, "no version literal was found in the better-auth table"
     assert documented <= set(VERIFIED_BETTER_AUTH), documented - set(VERIFIED_BETTER_AUTH)
+
+
+def test_the_compatibility_table_has_one_canary_row_per_matrix_entry() -> None:
+    """The other direction: a version the canary sweeps with no row is a lane the page hides.
+
+    In matrix order, `latest` included, so the table reads the way the workflow runs.
+    """
+    assert canary_rows() == canary_matrices()[0]
+
+
+def test_the_constant_is_oldest_first_and_newest_last() -> None:
+    """The docstring promises newest last, so `VERIFIED_BETTER_AUTH[-1]` is the newest verified
+    version; strictly increasing, so no entry is listed twice."""
+    keys = [version_key(version) for version in VERIFIED_BETTER_AUTH]
+
+    assert keys == sorted(set(keys)), VERIFIED_BETTER_AUTH
 
 
 def test_the_harness_pin_is_one_of_the_verified_versions() -> None:
