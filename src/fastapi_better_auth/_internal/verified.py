@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-VERIFIED_BETTER_AUTH: tuple[str, ...] = ("1.6.30", "1.7.1", "1.7.5")
+VERIFIED_BETTER_AUTH: tuple[str, ...] = ("1.6.30", "1.7.1", "1.7.5", "1.7.6")
 """The Better Auth versions this release was **tested against**, oldest first, newest last.
 
 Not a support matrix and not a promise: Better Auth publishes no wire-format stability
@@ -14,9 +14,9 @@ absent from this tuple is untested here, which is not the same as broken.
 
 **The newest entry is the version `latest` resolved to when this release was cut.** The canary
 sweeps it as a pinned entry beside the `latest` tag itself, so it stays tested after the tag
-moves on, and each release moves that entry to whatever `latest` names on the day it is cut.
-A deployment that pins the Better Auth release current at that moment therefore finds its
-version here rather than a gap.
+moves on, and each release pins whatever `latest` names on the day it is cut. A deployment that
+pins the Better Auth release current at that moment therefore finds its version here rather
+than a gap.
 
 **Advisory, and it can only ever be advisory.** Nothing in Modes A or B has a path to the
 version the Node process is really running: Mode A reads a database or a Redis key, Mode B

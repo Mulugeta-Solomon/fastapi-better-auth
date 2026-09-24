@@ -19,6 +19,7 @@ posture asserted in only one direction is not asserted at all.
 | 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161) |
 | 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161) |
 | 1.7.5 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161, as `latest`) |
+| 1.7.6 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | — |
 | `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161), `latest` = 1.7.5 that day |
 
 That list is readable from a running application as `fastapi_better_auth.VERIFIED_BETTER_AUTH` — the
@@ -26,7 +27,7 @@ canary matrix without its `latest` entry, which is a dist-tag rather than a vers
 `tests/test_verified_better_auth.py` fails if this table, the canary workflow, the harness pin and
 the constant are ever edited out of sync. Its newest entry is the version `latest` resolved to when
 the release was cut: the canary sweeps it as a pinned entry beside `latest`, so it stays tested after
-the tag moves on, and each release moves it to whatever `latest` names that day.
+the tag moves on, and each release pins whatever `latest` names that day.
 
 The strict posture is what makes "`bearer({ requireSignature: true })` is the fix" a tested claim
 rather than a reading of the source: the default-permissive server and the strict one are driven
@@ -57,49 +58,67 @@ installed from PyPI is guard-verified to be the version named, and every posture
 against it. The 2026-09-07 run was the first in which the Mode C live lane executed on a published
 wheel rather than on HEAD.
 
-### Between 1.7.1 and 1.7.5
+### Between 1.7.1 and 1.7.6
 
-The gating lane pins 1.7.1 and the newest verified version is 1.7.5. Across that gap, three things a
+The gating lane pins 1.7.1 and the newest verified version is 1.7.6. Across that gap, three things a
 deployment of this library depends on or runs into, each read out of the published packages' `dist/`
-at the version cited:
+at the version cited. A file cited at 1.7.5 with no 1.7.6 line beside it is byte-identical at 1.7.6
+(compared by sha256).
 
 - **The wire format did not move.** The session and user field definitions are byte-identical at
-  1.7.1 and 1.7.5 (`@better-auth/core` `dist/db/schema/session.mjs`, `user.mjs`, `shared.mjs`), and
-  so are the admin plugin's (`better-auth` `dist/plugins/admin/schema.mjs`). The Redis document is
-  still the raw token as key and `JSON.stringify({ session, user })` as value (`better-auth@1.7.1`
-  `dist/db/internal-adapter.mjs:303-306`, `better-auth@1.7.5` `:302-305`). Cookie signing lives in
-  the peer package `better-call`, which both versions pin exactly to `1.4.0` (`package.json:470` in
-  each), and every cookie-mode leg ran green against 1.7.5 (run 35050080161, as `latest`).
+  1.7.1, 1.7.5 and 1.7.6 (`@better-auth/core` `dist/db/schema/session.mjs`, `user.mjs`,
+  `shared.mjs`), and so are the admin plugin's (`better-auth` `dist/plugins/admin/schema.mjs`). The
+  Redis document is still the raw token as key and `JSON.stringify({ session, user })` as value
+  (`better-auth@1.7.1` `dist/db/internal-adapter.mjs:303-306`, `better-auth@1.7.5` `:302-305`).
+  Cookie signing lives in the peer package `better-call`, which all three versions pin exactly to
+  `1.4.0` (`package.json:470` in each), and every cookie-mode leg ran green against 1.7.5 (run
+  35050080161, as `latest`).
 - **Schema validation is on by default from 1.7.3**, in every environment, unless
-  `advanced.database.validateSchema` is `false` (`@better-auth/core@1.7.5`
+  `advanced.database.validateSchema` is `false` (`@better-auth/core@1.7.5` and `@1.7.6`
   `dist/db/schema-check.mjs:4-9`; the option at `dist/types/init-options.d.mts:391-400`; neither
   exists at 1.7.1). Drift is not a boot failure: the check at init only logs (`better-auth@1.7.5`
   `dist/auth/base.mjs:15-18`), but every HTTP request awaits it (`dist/api/index.mjs:169-170`), so
-  does every `auth.api.*` call (`dist/api/to-auth-endpoints.mjs:41-42`), and a mismatch is kept and
-  rethrown without asking the database again (`@better-auth/core@1.7.5`
-  `dist/db/schema-check.mjs:60-77`) until Better Auth's own migrator clears it (`better-auth@1.7.5`
-  `dist/db/get-migration.mjs:668`, the only call site in either package). So the server starts, logs
-  one error and fails every auth request, and a schema repaired by another tool is not seen until
-  that process restarts. A database migrated under 1.7.1 meets this on upgrade: it keeps
-  `account.issuer`, required and uniquely indexed (`@better-auth/core@1.7.1`
-  `dist/db/get-tables.mjs:200-209`, created `NOT NULL` by `better-auth@1.7.1`
-  `dist/db/get-migration.mjs:607` and `:635`), which 1.7.3 and 1.7.5 no longer define; a required
-  column Better Auth never writes is a finding like a missing one (`@better-auth/core@1.7.5`
-  `dist/db/schema-diff.mjs:47-53`), the Kysely adapter's check returns every finding
-  (`@better-auth/kysely-adapter@1.7.5` `dist/index.mjs:250-261`, registered at `:712`) and any
-  finding throws (`schema-check.mjs:70`), so every auth request fails until you follow the
+  does every `auth.api.*` call (`dist/api/to-auth-endpoints.mjs:41-42`). At 1.7.6 the check those
+  three read is the one the adapter registered with runtime validation on (`better-auth@1.7.6`
+  `dist/context/create-context.mjs:231`; `@better-auth/core@1.7.6`
+  `dist/db/schema-check.mjs:37-40`), and the Kysely adapter turns that on exactly when validation is
+  enabled (`@better-auth/kysely-adapter@1.7.6` `dist/index.mjs:714`), so the default behaves as at
+  1.7.5. A mismatch is kept and rethrown without asking the database again
+  (`@better-auth/core@1.7.5` `dist/db/schema-check.mjs:60-77`, `@1.7.6` `:71-90`) until Better
+  Auth's own migrator clears it (`better-auth@1.7.5` `dist/db/get-migration.mjs:668`, the only call
+  site in either package). So the server starts, logs one error and fails every auth request, and a
+  schema repaired by another tool is not seen until that process restarts. A database migrated
+  under 1.7.1 meets this on upgrade: it keeps `account.issuer`, required and uniquely indexed
+  (`@better-auth/core@1.7.1` `dist/db/get-tables.mjs:200-209`, created `NOT NULL` by
+  `better-auth@1.7.1` `dist/db/get-migration.mjs:607` and `:635`), which 1.7.3, 1.7.5 and 1.7.6 no
+  longer define; a required column Better Auth never writes is a finding like a missing one
+  (`@better-auth/core@1.7.5` `dist/db/schema-diff.mjs:47-53`), the Kysely adapter's check returns
+  every finding on every dialect (`@better-auth/kysely-adapter@1.7.5` `dist/index.mjs:250-261`,
+  registered at `:712`; `@1.7.6` `:251-263`, registered at `:714`) and any finding throws
+  (`schema-check.mjs:70` at 1.7.5, `:81` at 1.7.6), so every auth request fails until you follow the
   [1.7 upgrade guide](https://www.better-auth.com/docs/guides/1-7-upgrade-guide) — the link the
   error message itself gives for this column, to follow before removing it
-  (`dist/db/schema-diff.mjs:81`). A deployment that owns its migrations (the README's "Who owns the
-  database schema") runs its drift check before the deploy, not after it.
+  (`dist/db/schema-diff.mjs:81`). At 1.7.6, SQLite is read by its own path, and only the way the
+  columns are read changes: the dialect's own introspector reads the tables, or, if that throws,
+  `PRAGMA table_info` reads each table Better Auth expects, and the findings are returned unfiltered
+  like every other dialect's (`@better-auth/kysely-adapter@1.7.6` `dist/index.mjs:253`,
+  `dist/sqlite-introspector-DSCAP82F.mjs:53-60`). A deployment that owns its migrations (the
+  README's "Who owns the database schema") runs its drift check before the deploy, not after it.
+  From 1.7.6 upstream ships one: `auth check schema` exits 0 when the schema passes, 1 on a
+  mismatch and 2 when it cannot validate (`auth@1.7.6` `dist/index.mjs:1308-1325`; the command at
+  `:1331-1332`), and it works with runtime validation off, because the Kysely adapter registers its
+  check either way and the CLI reads it separately (`better-auth@1.7.6`
+  `dist/context/create-context.mjs:232`; `auth@1.7.6` `dist/index.mjs:1307`).
 - **The rate limiter's client identity did not move.** `dist/api/rate-limiter/index.mjs` is
-  byte-identical at 1.7.1, 1.7.3 and 1.7.5. `x-forwarded-for` is still the one header read by default
-  (`@better-auth/core@1.7.1` `dist/utils/ip.mjs:194`, `@1.7.5` `:196`); a single-value header is
-  trusted with no configuration, and a multi-hop chain needs `advanced.ipAddress.trustedProxies`
-  (`@1.7.5` `:180-190`). A request with no usable address still keys on the shared `no-trusted-ip`
-  bucket (`rate-limiter/index.mjs:233`, `:245`), and the warning about it fires once per process, on
-  the first such request while the limiter is on, never at boot (`:241-244`, `:290`). The README's
-  "The shared rate-limit bucket" holds at 1.7.5 as written.
+  byte-identical at 1.7.1, 1.7.3, 1.7.5 and 1.7.6. `x-forwarded-for` is still the one header read by
+  default (`@better-auth/core@1.7.1` `dist/utils/ip.mjs:194`, `@1.7.5` `:196`); a single-value
+  header is trusted with no configuration, and a multi-hop chain needs
+  `advanced.ipAddress.trustedProxies` (`@1.7.5` `:180-190`). A request with no usable address still
+  keys on the shared `no-trusted-ip` bucket (`rate-limiter/index.mjs:233`, `:245`), and the warning
+  about it fires once per process, on the first such request while the limiter is on, never at boot
+  (`:241-244`, `:290`). The README's
+  "The shared rate-limit bucket" holds at 1.7.5 and 1.7.6 as written: its `create-context.mjs` lines
+  sit where they do at 1.7.5 (`better-auth@1.7.6` `dist/context/create-context.mjs:172-174`).
 
 ## Python
 
