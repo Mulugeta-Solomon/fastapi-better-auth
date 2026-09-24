@@ -93,7 +93,10 @@ line-length = 100
 extend-immutable-calls = ["fastapi.Depends", "fastapi.Security"]
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", ".github/scripts"]
+# Pyright's default exclude has `**/.*`, which drops `.github/scripts` even when included;
+# these are the other defaults, with the hidden-path rule kept for the other two roots.
+exclude = ["**/node_modules", "**/__pycache__", "src/**/.*", "tests/**/.*"]
 typeCheckingMode = "strict"
 reportUnnecessaryTypeIgnoreComment = true
 pythonVersion = "3.10"

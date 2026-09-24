@@ -80,8 +80,18 @@ at the version cited:
   `dist/db/schema-check.mjs:60-77`) until Better Auth's own migrator clears it (`better-auth@1.7.5`
   `dist/db/get-migration.mjs:668`, the only call site in either package). So the server starts, logs
   one error and fails every auth request, and a schema repaired by another tool is not seen until
-  that process restarts. A deployment that owns its migrations (the README's "Who owns the database
-  schema") runs its drift check before the deploy, not after it.
+  that process restarts. A database migrated under 1.7.1 meets this on upgrade: it keeps
+  `account.issuer`, required and uniquely indexed (`@better-auth/core@1.7.1`
+  `dist/db/get-tables.mjs:200-209`, created `NOT NULL` by `better-auth@1.7.1`
+  `dist/db/get-migration.mjs:607` and `:635`), which 1.7.3 and 1.7.5 no longer define; a required
+  column Better Auth never writes is a finding like a missing one (`@better-auth/core@1.7.5`
+  `dist/db/schema-diff.mjs:47-53`), the Kysely adapter's check returns every finding
+  (`@better-auth/kysely-adapter@1.7.5` `dist/index.mjs:250-261`, registered at `:712`) and any
+  finding throws (`schema-check.mjs:70`), so every auth request fails until you follow the
+  [1.7 upgrade guide](https://www.better-auth.com/docs/guides/1-7-upgrade-guide) — the link the
+  error message itself gives for this column, to follow before removing it
+  (`dist/db/schema-diff.mjs:81`). A deployment that owns its migrations (the README's "Who owns the
+  database schema") runs its drift check before the deploy, not after it.
 - **The rate limiter's client identity did not move.** `dist/api/rate-limiter/index.mjs` is
   byte-identical at 1.7.1, 1.7.3 and 1.7.5. `x-forwarded-for` is still the one header read by default
   (`@better-auth/core@1.7.1` `dist/utils/ip.mjs:194`, `@1.7.5` `:196`); a single-value header is
