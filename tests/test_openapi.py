@@ -18,23 +18,42 @@ WebSocket route — the one shape our dependencies exist to keep serving.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
-from fastapi import Depends, FastAPI, WebSocket
+from fastapi import Depends, FastAPI, Security, WebSocket
+from fastapi.security import APIKeyCookie
 
-from fastapi_better_auth import BetterAuth, ConfigurationError, Session, User
+from fastapi_better_auth import (
+    BetterAuth,
+    ConfigurationError,
+    CsrfDisabled,
+    JwtVerifier,
+    RemoteVerifier,
+    Session,
+    User,
+)
+from tests.cookies import verifier as cookie_verifier
 from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, client, session_app
+from tests.transports import ScriptedTransport
 
 BEARER_SOURCE = "header:authorization-bearer"
 COOKIE_SOURCE = "cookie:better-auth.session_token"
 BEARER_NAME = "BetterAuthBearer"
-COOKIE_NAME = "BetterAuthCookie-better-auth.session_token"
+COOKIE_NAME = "BetterAuthCookie"
+DERIVED_COOKIE_NAME = "BetterAuthCookie-better-auth.session_token"
 HEADER = "x-cred-a"
 HEADER_B = "x-cred-b"
 
+DEFAULT_COOKIE = "better-auth.session_token"
+SECURE_COOKIE = "__Secure-better-auth.session_token"
+PROD_COOKIE = "sorapredict-prod.session_token"
+STAGING_COOKIE = "sorapredict-staging.session_token"
+ORIGIN = "https://auth.example.com"
+
 BEARER_DEFINITION = {"type": "http", "scheme": "bearer"}
-COOKIE_DEFINITION = {"type": "apiKey", "in": "cookie", "name": "better-auth.session_token"}
+COOKIE_DEFINITION = {"type": "apiKey", "in": "cookie"}
+ABSENT = object()
 
 
 def bearer_auth() -> tuple[FakeVerifier, BetterAuth]:
@@ -70,6 +89,48 @@ def comparable_headers(headers: Any) -> dict[str, str]:
     return {key.lower(): value for key, value in headers.items() if key.lower() != "date"}
 
 
+def never_fetched() -> ScriptedTransport:
+    return ScriptedTransport(AssertionError("building a document must not fetch anything"))
+
+
+def remote_verifier(cookie: str, transport: ScriptedTransport) -> RemoteVerifier:
+    return RemoteVerifier(
+        base_url=ORIGIN,
+        csrf=CsrfDisabled(reason="only the published document is read here"),
+        transport=transport,
+        cookie_name=cookie,
+        secure_cookies=False,
+    )
+
+
+def leaves(node: object, path: tuple[str, ...] = ()) -> dict[tuple[str, ...], object]:
+    """Every leaf of a JSON document, keyed by its path. An empty container is a leaf too, or a
+    requirement such as `{"BetterAuthCookie": []}` would drop out of a diff along with its key."""
+    children: tuple[tuple[str, object], ...] = ()
+    if isinstance(node, dict):
+        children = tuple(cast("dict[str, object]", node).items())
+    elif isinstance(node, list):
+        items = cast("list[object]", node)
+        children = tuple((str(index), item) for index, item in enumerate(items))
+    if not children:
+        return {path: node}
+    return {
+        leaf: value
+        for key, child in children
+        for leaf, value in leaves(child, (*path, key)).items()
+    }
+
+
+def differing(first: object, second: object) -> dict[tuple[str, ...], tuple[object, object]]:
+    """Every path at which two documents disagree, with what each side holds there."""
+    left, right = leaves(first), leaves(second)
+    return {
+        path: (left.get(path, ABSENT), right.get(path, ABSENT))
+        for path in left.keys() | right.keys()
+        if left.get(path, ABSENT) != right.get(path, ABSENT)
+    }
+
+
 # --- the bearer scheme reaches the document ------------------------------------------
 
 
@@ -101,13 +162,42 @@ def test_both_dependencies_carry_the_requirement(path: str) -> None:
     assert security(auth, path) == [{BEARER_NAME: []}]
 
 
-def test_a_cookie_verifier_publishes_an_api_key_cookie_scheme() -> None:
-    """Phase 2's mode, documented today: the label already says where the credential lives."""
-    auth = BetterAuth(verifiers=[FakeVerifier(HEADER, source=COOKIE_SOURCE)])
+@pytest.mark.parametrize(
+    "cookie", [DEFAULT_COOKIE, SECURE_COOKIE], ids=["plain", "secure-prefixed"]
+)
+def test_a_cookie_verifier_publishes_an_api_key_cookie_scheme(cookie: str) -> None:
+    """The label already says where the credential lives. The application's only cookie is
+    published under the one stable key, and the scheme's `name` is that cookie, verbatim - the
+    `__Secure-` form included, since a cookie name is case- and prefix-exact."""
+    auth = BetterAuth(verifiers=[FakeVerifier(HEADER, source=f"cookie:{cookie}")])
     published = schemes(auth)
 
     assert set(published) == {COOKIE_NAME}
     assert {key: published[COOKIE_NAME][key] for key in COOKIE_DEFINITION} == COOKIE_DEFINITION
+    assert published[COOKIE_NAME]["name"] == cookie
+    assert cookie in published[COOKIE_NAME]["description"]
+
+
+@pytest.mark.parametrize("sole", [True, False], ids=["sole-cookie", "one-of-two"])
+def test_only_the_key_differs_from_what_fastapis_own_api_key_cookie_publishes(sole: bool) -> None:
+    """Choosing the key must not hand-assemble the definition: it stays byte-for-byte what a
+    plain FastAPI application publishes for `APIKeyCookie` on the same cookie."""
+    others = [] if sole else [FakeVerifier(HEADER_B, source=f"cookie:{SECURE_COOKIE}")]
+    auth = BetterAuth(verifiers=[FakeVerifier(HEADER, source=COOKIE_SOURCE), *others])
+    key = COOKIE_NAME if sole else DERIVED_COOKIE_NAME
+    published = schemes(auth)[key]
+    reference = APIKeyCookie(
+        name=DEFAULT_COOKIE, description=published["description"], auto_error=False
+    )
+
+    async def plain(_credential: str | None = Security(reference)) -> None:
+        return None
+
+    app = FastAPI()
+    app.add_api_route("/plain", plain, methods=["GET"])
+    (expected,) = app.openapi()["components"]["securitySchemes"].values()
+
+    assert published == expected
 
 
 def test_two_verifiers_publish_two_schemes_as_alternatives() -> None:
@@ -175,18 +265,104 @@ def test_a_label_is_read_the_way_the_collision_check_reads_it(source: str) -> No
 
 
 def test_the_cookie_name_survives_into_the_scheme_name() -> None:
-    """Two cookie verifiers on different cookies must not collapse onto one definition."""
+    """Two cookie verifiers on different cookies must not collapse onto one definition, so each
+    keeps a key derived from its own cookie."""
     auth = BetterAuth(
         verifiers=[
             FakeVerifier(HEADER, source=COOKIE_SOURCE),
-            FakeVerifier(HEADER_B, source="cookie:__Secure-better-auth.session_token"),
+            FakeVerifier(HEADER_B, source=f"cookie:{SECURE_COOKIE}"),
         ]
     )
 
     assert set(schemes(auth)) == {
-        COOKIE_NAME,
+        DERIVED_COOKIE_NAME,
         "BetterAuthCookie-__Secure-better-auth.session_token",
     }
+
+
+# --- one cookie, one stable key --------------------------------------------------------
+
+
+def test_one_cookie_publishes_one_contract_whatever_the_cookie_is_called() -> None:
+    """#70: a per-environment `cookiePrefix` must not make the contract per-environment.
+
+    Two deployments that differ only in the cookie's name publish the same component key and the
+    same requirement on every operation. Diffed leaf by leaf, the documents disagree in exactly
+    two places, the scheme's `name` and its description: the two that must name the cookie."""
+    prod = document(BetterAuth(verifiers=[cookie_verifier(cookie_name=PROD_COOKIE)]))
+    staging = document(BetterAuth(verifiers=[cookie_verifier(cookie_name=STAGING_COOKIE)]))
+    scheme = ("components", "securitySchemes", COOKIE_NAME)
+
+    assert set(prod["components"]["securitySchemes"]) == {COOKIE_NAME}
+    assert set(staging["components"]["securitySchemes"]) == {COOKIE_NAME}
+    for path in ("/required", "/optional"):
+        assert prod["paths"][path]["get"]["security"] == [{COOKIE_NAME: []}]
+        assert staging["paths"][path]["get"]["security"] == [{COOKIE_NAME: []}]
+    diff = differing(prod, staging)
+    assert set(diff) == {(*scheme, "name"), (*scheme, "description")}
+    assert diff[(*scheme, "name")] == (PROD_COOKIE, STAGING_COOKIE)
+    prod_description, staging_description = diff[(*scheme, "description")]
+    assert PROD_COOKIE in str(prod_description)
+    assert STAGING_COOKIE in str(staging_description)
+
+
+@pytest.mark.parametrize(
+    "order", [("cookie", "bearer"), ("bearer", "cookie")], ids=["cookie-first", "bearer-first"]
+)
+def test_mode_a_beside_mode_b_publishes_both_stable_keys_in_declaration_order(
+    order: tuple[str, str],
+) -> None:
+    """A bearer is not a cookie: Mode A + Mode B is still one cookie, so its key stays stable."""
+    transport = never_fetched()
+    modes = {
+        "cookie": (cookie_verifier(), COOKIE_NAME),
+        "bearer": (JwtVerifier(base_url=ORIGIN, transport=transport), BEARER_NAME),
+    }
+    auth = BetterAuth(verifiers=[modes[mode][0] for mode in order])
+
+    assert set(schemes(auth)) == {COOKIE_NAME, BEARER_NAME}
+    assert security(auth, "/required") == [{modes[mode][1]: []} for mode in order]
+    assert transport.calls == 0
+
+
+def test_two_distinct_cookies_each_keep_a_key_derived_from_their_name() -> None:
+    """The one case a single key cannot name: two different cookies. Each is published as
+    `BetterAuthCookie-<name>`, which means a second cookie verifier renames the first one's key."""
+    transport = never_fetched()
+    alone = BetterAuth(verifiers=[cookie_verifier(cookie_name=PROD_COOKIE)])
+    together = BetterAuth(
+        verifiers=[
+            cookie_verifier(cookie_name=PROD_COOKIE),
+            remote_verifier(STAGING_COOKIE, transport),
+        ]
+    )
+    published = schemes(together)
+
+    assert set(schemes(alone)) == {COOKIE_NAME}
+    assert security(together, "/required") == [
+        {f"BetterAuthCookie-{PROD_COOKIE}": []},
+        {f"BetterAuthCookie-{STAGING_COOKIE}": []},
+    ]
+    assert {key: published[key]["name"] for key in published} == {
+        f"BetterAuthCookie-{PROD_COOKIE}": PROD_COOKIE,
+        f"BetterAuthCookie-{STAGING_COOKIE}": STAGING_COOKIE,
+    }
+    assert transport.calls == 0
+
+
+def test_one_cookie_behind_two_labels_is_still_refused_at_construction() -> None:
+    """Two labels, one cookie. They are distinct `credential_source` values, so the duplicate
+    label check lets them through; counted as two cookie declarations, each takes the derived key,
+    the keys collide, and construction refuses with the message it always gave."""
+    with pytest.raises(ConfigurationError) as caught:
+        BetterAuth(
+            verifiers=[
+                FakeVerifier(HEADER, source="cookie:session"),
+                FakeVerifier(HEADER_B, source="cookie: session"),
+            ]
+        )
+
+    assert "'BetterAuthCookie-session'" in str(caught.value)
 
 
 # --- a label nothing recognizes documents nothing --------------------------------------

@@ -75,6 +75,7 @@ from .conftest import (
     sign_out,
     sign_up,
 )
+from .cookie_scheme import cookie_scheme
 
 try:
     # Every name Mode C added after 0.1.0 belongs in here, not above: the canary's
@@ -99,7 +100,6 @@ except ImportError:
 
 pytestmark = pytest.mark.e2e
 
-COOKIE_SCHEME = "BetterAuthCookie-better-auth.session_token"
 BEARER_SCHEME = "BetterAuthBearer"
 CSRF_REASON = "a GET carries no CSRF risk; the rung is unit-tested"
 PROBE_CALLS = 2
@@ -524,17 +524,18 @@ class TestComposition:
                 document = (await client.get("/openapi.json")).json()
                 docs = await client.get("/docs")
 
+        cookie_key = cookie_scheme()
         schemes = document["components"]["securitySchemes"]
         assert schemes[BEARER_SCHEME]["type"] == "http"
-        assert schemes[COOKIE_SCHEME]["type"] == "apiKey"
-        assert schemes[COOKIE_SCHEME]["in"] == "cookie"
-        assert schemes[COOKIE_SCHEME]["name"] == SESSION_COOKIE
+        assert schemes[cookie_key]["type"] == "apiKey"
+        assert schemes[cookie_key]["in"] == "cookie"
+        assert schemes[cookie_key]["name"] == SESSION_COOKIE
         declared = document["paths"]["/required"]["get"]["security"]
         assert len(declared) == 2
         assert all(len(requirement) == 1 for requirement in declared), "an AND fold merged them"
         assert {name for requirement in declared for name in requirement} == {
             BEARER_SCHEME,
-            COOKIE_SCHEME,
+            cookie_key,
         }
         assert docs.status_code == 200
 
