@@ -233,13 +233,15 @@ class JwksClient:
             response = await self._transport.get(self._uri, max_bytes=self._max_bytes)
         except (BetterAuthError, SessionError):
             raise
-        except Exception as exc:  # noqa: BLE001 - `from None`: a Transport's error may carry the request
-            # The type name is already in the reason; `from None` keeps a third-party
-            # Transport's exception (which may carry what it failed on) off the chain.
-            raise AuthServiceUnavailable(
+        except Exception as exc:  # noqa: BLE001 - a Transport's error may carry the request
+            failure = AuthServiceUnavailable(
                 reason=f"jwks fetch failed [{type(exc).__name__}] {self._uri}"
-            ) from None
-        return self._parsed(response)
+            )
+        else:
+            return self._parsed(response)
+        # Raised outside the handler: in there, even `from None` would keep a third-party
+        # Transport's exception - and what it failed on - on __context__.
+        raise failure from None
 
     def _parsed(self, response: TransportResponse) -> Mapping[str, Jwk]:
         self._check_answer(response)
@@ -322,7 +324,8 @@ class JwksClient:
         try:
             return loader.from_jwk(dict(published))
         except Exception:  # noqa: BLE001 - every library failure here means the same thing
-            raise self._unusable(f"key {safe_label(kid)} did not load") from None
+            failure = self._unusable(f"key {safe_label(kid)} did not load")
+        raise failure from None  # outside the handler, as in `_fetched`
 
     def _unusable(self, why: str) -> AuthServiceUnavailable:
         return AuthServiceUnavailable(reason=f"jwks at {self._uri} is unusable: {why}")

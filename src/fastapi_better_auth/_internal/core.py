@@ -547,7 +547,15 @@ def _extracted(verifier: Verifier, connection: HTTPConnection) -> object | None:
     except BetterAuthError:
         raise
     except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-        raise _resolved(exc, verifier, "extract", (BetterAuthError,)) from None
+        failure = _resolved(exc, verifier, "extract", (BetterAuthError,))
+    else:
+        return _presence(credential, verifier)
+    # Decided inside the handler (so _contained logs the escape), raised outside it: raised in
+    # there, even `from None` keeps the verifier's exception - and what it quotes - on __context__.
+    raise failure from None
+
+
+def _presence(credential: object, verifier: Verifier) -> object | None:
     if inspect.isawaitable(credential):
         if inspect.iscoroutine(credential):
             credential.close()
@@ -565,17 +573,19 @@ async def _verified(verifier: Verifier, credential: object, user_model: type[Use
     # in a parameter: a parameter is a frame local, and a locals-capturing reporter reads it
     # (D-094, D-180). Scrubbed in `finally`, so no path can skip it.
     try:
-        answer = verifier.verify(credential, user_model)
-        if not inspect.isawaitable(answer):
-            raise ConfigurationError(
-                f"{type(verifier).__name__}.verify() did not return an awaitable. Declare it"
-                " with `async def`."
-            )
-        return await answer
-    except (BetterAuthError, SessionError):
-        raise
-    except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-        raise _resolved(exc, verifier, "verify", (BetterAuthError, SessionError)) from None
+        try:
+            answer = verifier.verify(credential, user_model)
+            if not inspect.isawaitable(answer):
+                raise ConfigurationError(
+                    f"{type(verifier).__name__}.verify() did not return an awaitable. Declare"
+                    " it with `async def`."
+                )
+            return await answer
+        except (BetterAuthError, SessionError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
+            failure = _resolved(exc, verifier, "verify", (BetterAuthError, SessionError))
+        raise failure from None  # outside the handler, as in `_extracted`
     finally:
         credential = None
 
