@@ -49,6 +49,8 @@ from .parsing import parse_user
 from .reasons import fingerprint, safe_label
 from .shared_secret import SharedSecret
 from .signing import verify_signature
+from .stores.diagnostics import lookup_failed
+from .stores.outage import FailureKind, OutageLatch, failure_kind
 from .stores.protocol import SessionStore
 from .stores.records import StoredSession, StoredUser
 
@@ -191,6 +193,8 @@ class CookieVerifier:
         # own first session_data cookie, so a second deployment's CVE-2026-67337 warning is not
         # eaten by the first (D-197).
         self._session_data_once = Once()
+        self._session_outage = OutageLatch()
+        self._user_outage = OutageLatch()
         self.credential_source = f"{COOKIE_SOURCE_PREFIX}{self._cookie_name}"
 
     @property
@@ -270,7 +274,9 @@ class CookieVerifier:
             CsrfFailure: For a cross-site unsafe request, decided before the signature.
             SessionRevoked: For a valid signature whose session or user is not in the store.
             SessionExpired: For a session past its expiry.
-            AuthServiceUnavailable: When the store could not be reached.
+            AuthServiceUnavailable: When the store could not be reached. A failure the store
+                did not translate itself is logged once, as a WARNING naming its class and
+                SQLSTATE, per kind of failure until a call of that lookup returns again.
         """
         if not isinstance(credential, CookieCredential):
             raise InvalidCredential(reason="cookie credential snapshot is not this verifier's")
@@ -319,29 +325,33 @@ class CookieVerifier:
     async def _looked_up(self, token: str, marker: str) -> StoredSession | None:
         try:
             try:
-                return await self._store.fetch_session_by_token(token)
+                found = await self._store.fetch_session_by_token(token)
             except (BetterAuthError, SessionError):
                 raise
-            except Exception:  # noqa: BLE001 - a raw store failure becomes the uniform refusal
-                failure = _store_unavailable(marker)
-            # Raised outside the handler so no __context__ links to the store's exception, and
-            # `from None` clears __cause__ (WP10 A1). The two shipped stores answer alike after this
-            # - SQL already translates to this, Redis propagated its connection error untranslated.
-            raise failure from None
+            except Exception as exc:  # noqa: BLE001 - a raw store failure becomes the uniform refusal
+                kind = failure_kind(exc)
+            else:
+                self._session_outage.rearm()
+                return found
+            # Reported and raised outside the handler, so no __context__ links to the store's
+            # exception (it can embed the token), and `from None` clears __cause__ (WP10 A1).
+            raise _contained(self._session_outage, kind, marker, marker) from None
         finally:
             token = ""
 
     async def _looked_up_user(self, user_id: str, marker: str) -> StoredUser | None:
         # No token here, and `user_id` is not a credential (it is in StoredSession's own repr), so
-        # this frame needs no scrub - only the store-parity translation the two stores' divergence
-        # requires, raised outside the handler with `from None` as in `_looked_up`.
+        # this frame needs no scrub; the contained failure is handled exactly as in `_looked_up`.
         try:
-            return await self._store.fetch_user_by_id(user_id)
+            found = await self._store.fetch_user_by_id(user_id)
         except (BetterAuthError, SessionError):
             raise
-        except Exception:  # noqa: BLE001 - as _looked_up
-            failure = _store_unavailable(marker)
-        raise failure from None
+        except Exception as exc:  # noqa: BLE001 - as _looked_up
+            kind = failure_kind(exc)
+        else:
+            self._user_outage.rearm()
+            return found
+        raise _contained(self._user_outage, kind, fingerprint(user_id), marker) from None
 
     def _observe_session_data(self, pairs: tuple[tuple[str, str], ...]) -> None:
         observed = next((name for name, _ in pairs if name in self._data_names), None)
@@ -360,6 +370,21 @@ def _joined_cookie_header(connection: HTTPConnection) -> str:
 
 def _store_unavailable(marker: str) -> AuthServiceUnavailable:
     return AuthServiceUnavailable(reason=f"session store lookup could not complete [{marker}]")
+
+
+def _contained(
+    latch: OutageLatch, kind: FailureKind, subject: str, marker: str
+) -> AuthServiceUnavailable:
+    """A store failure nothing translated, told to the operator once per kind (R47a).
+
+    One latch per lookup, so a user lookup that keeps failing is not re-armed by the session
+    lookup that keeps succeeding before it on every request. `subject` is the fingerprint of what
+    the store was asked about - the token, or the user id - exactly as a SQL store takes it;
+    `marker` is the token's, for the refusal. A store that translated its failure never gets here.
+    """
+    if latch.first(kind):
+        lookup_failed(kind.driver_error, kind.sqlstate, subject)
+    return _store_unavailable(marker)
 
 
 def _check_expiry(record: StoredSession, marker: str) -> None:

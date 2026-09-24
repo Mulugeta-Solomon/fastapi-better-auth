@@ -47,6 +47,7 @@ from fastapi_better_auth._internal.jwks import JwksClient
 from fastapi_better_auth._internal.once import Once
 from fastapi_better_auth._internal.reasons import REDACTED, fingerprint
 from fastapi_better_auth._internal.remote_backoff import BackoffLatch
+from tests.cookies import COOKIE, FakeStore, http, run, sign, verifier
 from tests.fakes import connection, resolver_of
 from tests.log_hygiene import (
     COVERED_BY,
@@ -55,6 +56,7 @@ from tests.log_hygiene import (
     LEAKY_SECRET,
     LIBRARY_LOGGER,
     ORIGIN,
+    SHARED_LOG_FUNCTIONS,
     SIGNER,
     STORE_TOKEN,
     STORED_USER_ID,
@@ -279,6 +281,45 @@ async def test_a_store_lookup_failure_warning_carries_no_token(
     (line,) = [record for record in ours if record.msg == site.template]
     assert line.exc_info is None
     assert line.args == ("DeniedError", "42501", fingerprint(STORE_TOKEN))
+
+
+class LeakyStoreError(Exception):
+    """A deployment's own store error that puts the token in its message and its args."""
+
+
+@pytest.mark.anyio
+async def test_a_contained_store_failure_warning_carries_no_token(
+    records: list[logging.LogRecord],
+) -> None:
+    """R47a's caller: the same line, reached from `CookieVerifier` with an error this library did
+    not write - its message and its `args` both carry the raw token. The operator gets the class,
+    `none` for a SQLSTATE and the token's fingerprint; the refusal carries no chain to it."""
+    store = FakeStore(session_error=LeakyStoreError(f"no session for {STORE_TOKEN}", STORE_TOKEN))
+    cookie = f"{COOKIE}={sign(STORE_TOKEN)}"
+
+    with pytest.raises(AuthServiceUnavailable) as caught:
+        await run(verifier(store=store), http(cookie=cookie))
+
+    carried = STORE_TOKEN in str(store.session_error)
+    assert carried, "the store error no longer carries the token; this proves nothing"
+    site = manifest_site("session store lookup could not complete")
+    assert_template_fired(records, site)
+    ours = [record for record in records if record.name == LIBRARY_LOGGER]
+    assert_no_leak(ours, STORE_TOKEN)
+    (line,) = [record for record in ours if record.msg == site.template]
+    assert line.exc_info is None
+    assert line.args == ("LeakyStoreError", "none", fingerprint(STORE_TOKEN))
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "test_name",
+    sorted({name for callers in SHARED_LOG_FUNCTIONS.values() for name in callers.values()}),
+)
+def test_the_caller_manifest_names_tests_that_exist(test_name: str) -> None:
+    """The same rule as `COVERED_BY`'s, for the scenarios that drive each caller of a shared site."""
+    assert callable(getattr(sys.modules[__name__], test_name, None))
 
 
 def test_a_session_data_observation_logs_no_cookie_value(

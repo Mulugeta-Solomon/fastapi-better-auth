@@ -257,6 +257,38 @@ COVERED_BY: Mapping[LogSite, str] = {
 }
 
 
+SHARED_LOG_FUNCTIONS: Mapping[str, Mapping[str, str]] = {
+    "lookup_failed": {
+        "sqlalchemy_store": "test_a_store_lookup_failure_warning_carries_no_token",
+        "cookie_verifier": "test_a_contained_store_failure_warning_carries_no_token",
+    },
+}
+"""A log function with more than one caller, and the scenario that drives each calling module.
+
+`COVERED_BY` keys a *site*, and one site can be reached from two places that hand it different
+material - R47's line takes a store's error in one and a verifier-contained one in the other - so
+each caller is enumerated from `src/` by AST and driven by a scenario of its own (R47a).
+"""
+
+
+def _called_name(func: ast.expr) -> str | None:
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def callers_of(function: str) -> frozenset[str]:
+    """Every module in `src/` that calls `function`, however it was imported."""
+    return frozenset(
+        module
+        for module, tree in parsed_src()
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _called_name(node.func) == function
+    )
+
+
 # ---------------------------------------------------------------- capture and assertion
 
 

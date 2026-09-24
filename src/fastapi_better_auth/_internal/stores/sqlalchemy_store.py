@@ -149,7 +149,7 @@ class _CoreStore(ABC):
         """The refusal a lookup's database error becomes, the operator told once per kind (R47)."""
         kind = failure_kind(error)
         if self._outage.first(kind):
-            lookup_failed(kind.driver_error, kind.sqlstate, self._sql.lookup_subject(params))
+            lookup_failed(kind.driver_error, kind.sqlstate, self._sql.lookup_marker(params))
         return self._sql.lookup_unavailable(params)
 
     @abstractmethod

@@ -26,11 +26,13 @@ def unusable(kind: str, why: str, subject: str) -> None:
     )
 
 
-def lookup_failed(driver_error: str, sqlstate: str | None, subject: str) -> None:
-    """A lookup the database refused or could not answer, reported once per kind (R47).
+def lookup_failed(driver_error: str, sqlstate: str | None, marker: str) -> None:
+    """A lookup the store could not complete, reported once per kind (R47, R47a).
 
-    Everything on the line is chosen here: a class name, a validated SQLSTATE and a fingerprint.
-    The error's own text never reaches it - SQLAlchemy puts the bound token there (A1).
+    Two callers: the SQL stores, for a statement the database refused, and `CookieVerifier`, for
+    anything else a store raised untranslated. Everything on the line is chosen here or by them -
+    a class name, a validated SQLSTATE and the subject's fingerprint (`marker`, never the subject).
+    The error's own text never reaches it: SQLAlchemy puts the bound token there (A1).
     """
     logger.warning(
         "session store lookup could not complete (%s, SQLSTATE %s); every lookup failing"
@@ -38,7 +40,7 @@ def lookup_failed(driver_error: str, sqlstate: str | None, subject: str) -> None
         " a lookup completes [%s]",
         safe_label(driver_error),
         "none" if sqlstate is None else sqlstate,
-        fingerprint(subject),
+        marker,
     )
 
 

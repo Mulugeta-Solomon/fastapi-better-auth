@@ -35,8 +35,12 @@ class FailureKind:
 
 
 def failure_kind(error: BaseException) -> FailureKind:
-    """The kind of `error`, read off the driver's own exception where SQLAlchemy wrapped one."""
-    driver: object = getattr(error, "orig", None)
+    """The kind of `error`, read off the driver's own exception where SQLAlchemy wrapped one.
+
+    Never raises: the verifier reads this off whatever a deployment's own store threw, and an
+    attribute that raises while it is read must not replace the refusal being built.
+    """
+    driver = _attribute(error, "orig")
     source = error if driver is None else driver
     return FailureKind(driver_error=type(source).__name__, sqlstate=_sqlstate(source))
 
@@ -44,10 +48,17 @@ def failure_kind(error: BaseException) -> FailureKind:
 def _sqlstate(driver: object) -> str | None:
     """A five-character SQLSTATE, or `None`: a driver attribute is still text from outside."""
     for name in SQLSTATE_ATTRIBUTES:
-        value = getattr(driver, name, None)
+        value = _attribute(driver, name)
         if isinstance(value, str) and SQLSTATE.fullmatch(value):
             return value
     return None
+
+
+def _attribute(value: object, name: str) -> object:
+    try:
+        return getattr(value, name, None)
+    except Exception:  # noqa: BLE001 - third-party code; an attribute that raises carries nothing
+        return None
 
 
 class OutageLatch:

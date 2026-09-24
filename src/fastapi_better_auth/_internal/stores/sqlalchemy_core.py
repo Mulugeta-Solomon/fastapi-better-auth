@@ -475,13 +475,13 @@ def lookup_unavailable(params: Mapping[str, Any]) -> AuthServiceUnavailable:
     verifier answer the uniform 401.
     """
     return AuthServiceUnavailable(
-        reason=f"session store lookup could not complete [{fingerprint(lookup_subject(params))}]"
+        reason=f"session store lookup could not complete [{lookup_marker(params)}]"
     )
 
 
-def lookup_subject(params: Mapping[str, Any]) -> str:
-    """What a lookup was asked about - the token or the user id - for a fingerprint, never a line."""
-    return next((value for value in params.values() if isinstance(value, str)), "")
+def lookup_marker(params: Mapping[str, Any]) -> str:
+    """The fingerprint of what a lookup was asked about - the token or the user id."""
+    return fingerprint(next((value for value in params.values() if isinstance(value, str)), ""))
 
 
 def validated_async_engine(engine: object) -> AsyncEngine:

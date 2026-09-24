@@ -18,7 +18,9 @@ import pytest
 from tests.log_hygiene import (
     COVERED_BY,
     NON_LITERAL,
+    SHARED_LOG_FUNCTIONS,
     LogSite,
+    callers_of,
     collect_log_sites,
     log_sites,
     logger_binding_violations,
@@ -138,3 +140,16 @@ def test_the_collector_finds_a_synthetic_site_in_a_planted_file(tmp_path: pathli
     sites = collect_log_sites(ast.parse(planted.read_text(encoding="utf-8")), planted.stem)
 
     assert LogSite("planted", "info", "hi %s") in sites
+
+
+@pytest.mark.parametrize("function", sorted(SHARED_LOG_FUNCTIONS))
+def test_every_caller_of_a_shared_log_function_is_driven(function: str) -> None:
+    """A site with two callers is two sets of material reaching one line (R47a): each calling
+    module is enumerated from `src/`, so a third caller fails here until a scenario drives it."""
+    assert callers_of(function) == frozenset(SHARED_LOG_FUNCTIONS[function])
+
+
+def test_the_caller_enumeration_is_not_reading_nothing() -> None:
+    """Guards that scan nothing pass by vacuum: the shipped store must be found as a caller."""
+    assert "sqlalchemy_store" in callers_of("lookup_failed")
+    assert callers_of("a_function_nobody_defines") == frozenset()
