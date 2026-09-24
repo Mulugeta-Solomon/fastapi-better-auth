@@ -68,6 +68,23 @@ def no_transport(verifier: str) -> Transport:
     return cast("Transport", None)
 
 
+class ShapedButBroken:
+    """The two names the `Transport` Protocol checks for, neither of them callable."""
+
+    get = "not a coroutine function"
+    post = 0
+
+
+def shaped_but_broken(verifier: str) -> Transport:
+    return cast("Transport", ShapedButBroken())
+
+
+BROKEN_DEFAULTS: dict[str, Callable[[str], Transport]] = {
+    "NoneType": no_transport,
+    "ShapedButBroken": shaped_but_broken,
+}
+
+
 def refusal_without_httpx(name: str, monkeypatch: pytest.MonkeyPatch) -> ConfigurationError:
     monkeypatch.setitem(sys.modules, "httpx", None)
     with pytest.raises(ConfigurationError) as caught:
@@ -121,21 +138,24 @@ def test_the_second_remedy_works_with_httpx_absent(
     assert VERIFIERS[name](Httpx2Transport()) is not None
 
 
+@pytest.mark.parametrize("built", sorted(BROKEN_DEFAULTS))
 @pytest.mark.parametrize("name", sorted(VERIFIERS))
 def test_a_default_that_is_not_a_transport_is_refused_by_the_verifier(
-    name: str, monkeypatch: pytest.MonkeyPatch
+    name: str, built: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """G18's eager-transport invariant may not rest on one call raising: whatever the default
-    builder hands back is checked by the verifier that will fetch with it, and refused in its name."""
+    builder hands back is checked by the verifier that will fetch with it, and refused in its name.
+    A shaped-but-broken object passes the runtime `Transport` Protocol, which checks only that the
+    two names are present, so the default is held to the library's own transport family."""
     for module in (jwt_verifier_module, remote_config_module):
-        monkeypatch.setattr(module, "default_transport", no_transport)
+        monkeypatch.setattr(module, "default_transport", BROKEN_DEFAULTS[built])
 
     with pytest.raises(ConfigurationError) as caught:
         VERIFIERS[name](None)
 
     message = str(caught.value)
     assert message.startswith(f"{name} "), message
-    assert "NoneType" in message, message
+    assert built in message, message
 
 
 @pytest.mark.parametrize("library", sorted(ADAPTERS))

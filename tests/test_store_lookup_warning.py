@@ -23,7 +23,8 @@ from collections.abc import AsyncIterator, Iterator
 import pytest
 
 from fastapi_better_auth import AuthServiceUnavailable, SqlAlchemySessionStore, SyncStoreAdapter
-from tests.log_hygiene import LIBRARY_LOGGER, capturing
+from fastapi_better_auth._internal.stores.outage import MAX_REPORTED_KINDS
+from tests.log_hygiene import LIBRARY_LOGGER, broken_log_filter, capturing
 from tests.stores import (
     FLAVOURS,
     TOKEN,
@@ -31,11 +32,13 @@ from tests.stores import (
     DeniedError,
     DriverFault,
     ForgedStateError,
+    ShiftingStateError,
     StalledError,
     StoreFixture,
 )
 
 TEMPLATE_HEAD = "session store lookup could not complete"
+SUPPRESSED_HEAD = "session store lookups are failing in more than"
 FAILURES = 5
 
 Store = SqlAlchemySessionStore | SyncStoreAdapter
@@ -174,3 +177,39 @@ async def test_a_sqlstate_that_is_not_one_is_never_reported(
     (line,) = outage_lines(warnings)
     assert tuple(line.args or ())[:2] == ("ForgedStateError", "none")
     assert "forged" not in line.getMessage()
+
+
+@pytest.mark.anyio
+async def test_a_store_whose_failures_never_repeat_still_cannot_flood(
+    build: StoreFixture, monkeypatch: pytest.MonkeyPatch, warnings: list[logging.LogRecord]
+) -> None:
+    """A SQLSTATE that differs on every read is a new kind every time: the latch reports at most
+    `MAX_REPORTED_KINDS` of them, says once that it is holding the rest back, and then is quiet
+    until a lookup completes - after which a kind is news again."""
+    store, fault = await broken(build, monkeypatch)
+
+    await fail(store, fault, ShiftingStateError, MAX_REPORTED_KINDS * 3)
+    fault.error = None
+    assert await store.fetch_user_by_id("no-such-user") is None
+    await fail(store, fault, ShiftingStateError, 1)
+
+    suppressed = [r for r in warnings if str(r.msg).startswith(SUPPRESSED_HEAD)]
+    assert len(outage_lines(warnings)) == MAX_REPORTED_KINDS + 1
+    assert [record.args for record in suppressed] == [(MAX_REPORTED_KINDS,)]
+
+
+@pytest.mark.anyio
+async def test_a_report_that_raises_never_changes_the_refusal(
+    build: StoreFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reporting is best effort. A log filter that raises inside `logger.warning` must neither
+    replace `AuthServiceUnavailable` nor chain it to the `DBAPIError` - whose `str()` carries the
+    bound token - as its `__context__`."""
+    store, fault = await broken(build, monkeypatch)
+    fault.error = DeniedError
+
+    with broken_log_filter(), pytest.raises(AuthServiceUnavailable) as caught:
+        await store.fetch_session_by_token(TOKEN)
+
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None

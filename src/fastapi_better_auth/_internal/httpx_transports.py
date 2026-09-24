@@ -401,9 +401,11 @@ def usable_default(built: object, verifier: str) -> Transport:
     """What a default builder handed back, refused in the verifier's name unless it can fetch.
 
     Checked by the verifier rather than trusted, so no verifier is ever built without a transport
-    whatever the builder becomes - the eager invariant does not rest on one call raising.
+    whatever the builder becomes - the eager invariant does not rest on one call raising. Held to
+    this module's own family, not to the runtime `Transport` Protocol: that checks only that the
+    two names exist, and a default is always one of the adapters defined here.
     """
-    if not isinstance(built, Transport):
+    if not isinstance(built, _HttpxFamilyTransport):
         raise ConfigurationError(
             NOT_A_TRANSPORT.format(verifier=verifier, actual=type(built).__name__)
         )

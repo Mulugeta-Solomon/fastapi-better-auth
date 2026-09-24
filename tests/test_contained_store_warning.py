@@ -19,10 +19,11 @@ import logging
 import pathlib
 import socket
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, cast
 
 import anyio
 import pytest
+from anyio.from_thread import BlockingPortal
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -37,20 +38,24 @@ from fastapi_better_auth import (
     SyncStoreAdapter,
 )
 from fastapi_better_auth._internal.reasons import fingerprint
+from fastapi_better_auth._internal.stores.outage import MAX_REPORTED_KINDS
 from tests.cookies import (
     CAPTURED_TOKEN,
     COOKIE,
     SECRET,
     USER_ID,
     FakeStore,
+    http,
+    run,
     sign,
     stored_session,
+    verifier,
 )
 from tests.fakes import client, session_app
-from tests.log_hygiene import LIBRARY_LOGGER, capturing
-from tests.stores import DeniedError, DriverFault, StoreFixture
+from tests.log_hygiene import LIBRARY_LOGGER, broken_log_filter, capturing
+from tests.stores import DeniedError, DriverFault, ShiftingStateError, StoreFixture
 
-TEMPLATE_HEAD = "session store lookup could not complete"
+TEMPLATE_HEAD = "session store lookup"
 REQUESTS = 3
 HEADERS = {"Cookie": f"{COOKIE}={sign(CAPTURED_TOKEN)}"}
 
@@ -245,23 +250,33 @@ def test_a_translated_error_does_not_re_arm_the_latch(
     assert kinds(records) == [("StoreDown", "none")]
 
 
-@pytest.mark.parametrize("backend", ["asyncio", "trio"])
+@pytest.mark.parametrize(
+    ("flavour", "backend"),
+    [("async", "asyncio"), ("sync", "asyncio"), ("sync", "trio")],
+)
 def test_a_refused_statement_is_one_line_in_total(
+    flavour: str,
     backend: str,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     records: list[logging.LogRecord],
 ) -> None:
     """The store reports a refused statement and hands the verifier a translated error, so the
-    verifier adds nothing: the store's line is the only one."""
-    build = StoreFixture(tmp_path, "sync")
+    verifier adds nothing: the store's line is the only one. The first request discovers the
+    schema on the app's own loop and completes (a miss); only then does the driver refuse."""
+    build = StoreFixture(tmp_path, flavour)
     store, _ = build()
-    anyio.run(store.connect, backend=backend)
-    DriverFault(build.engines[-1], monkeypatch).error = DeniedError
+    fault = DriverFault(build.engines[-1], monkeypatch)
+    app = session_app(BetterAuth(verifiers=[cookie_verifier(store)]))
 
-    answered = statuses(cookie_verifier(store), backend)
-    anyio.run(build.aclose)
+    with client(app, backend) as http:
+        discovered = http.get("/required", headers=HEADERS).status_code
+        fault.error = DeniedError
+        answered = [http.get("/required", headers=HEADERS).status_code for _ in range(REQUESTS)]
+        portal = cast("BlockingPortal", http.portal)  # pyright: ignore[reportUnknownMemberType]
+        portal.call(build.aclose)
 
+    assert discovered == 401
     assert answered == [401] * REQUESTS
     assert kinds(records) == [("DeniedError", "42501")]
 
@@ -284,3 +299,57 @@ def test_a_failure_whose_attributes_raise_is_still_reported_and_refused(
 
     assert answered == [401] * REQUESTS
     assert kinds(records) == [("HostileSqlstate", "none")]
+
+
+class HostileName(type):
+    """A metaclass whose `__name__` raises - so does reading the class name of its instances."""
+
+    @property
+    def __name__(cls) -> str:  # type: ignore[override]
+        raise RuntimeError("the class name cannot be read")
+
+
+class NamelessStoreDown(Exception, metaclass=HostileName):
+    """A deployment's own store error whose class name cannot even be read."""
+
+
+@pytest.mark.anyio
+async def test_a_class_whose_name_cannot_be_read_is_still_refused_and_reported(
+    records: list[logging.LogRecord],
+) -> None:
+    store = FakeStore(session_error=NamelessStoreDown("down"))
+
+    escaped = ""
+    try:
+        await run(verifier(store=store), http(cookie=HEADERS["Cookie"]))
+    except AuthServiceUnavailable as refusal:
+        assert refusal.__context__ is None
+    except Exception:  # noqa: BLE001 - pytest's own reporter reads the class name and would crash
+        escaped = "an exception other than AuthServiceUnavailable escaped the verifier"
+
+    assert escaped == ""
+    assert kinds(records) == [("UnnamedError", "none")]
+
+
+@pytest.mark.anyio
+async def test_a_report_that_raises_never_changes_the_refusal() -> None:
+    """Reporting is best effort at this caller too: a raising log filter leaves the refusal
+    `AuthServiceUnavailable`, unchained, and raised as it always was."""
+    store = FakeStore(session_error=StoreDown("down"))
+
+    with broken_log_filter(), pytest.raises(AuthServiceUnavailable) as caught:
+        await run(verifier(store=store), http(cookie=HEADERS["Cookie"]))
+
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+def test_a_store_whose_failures_never_repeat_still_cannot_flood(
+    client_backend: str, records: list[logging.LogRecord]
+) -> None:
+    store = FakeStore(session_error=ShiftingStateError("down"))
+
+    answered = statuses(cookie_verifier(store), client_backend, requests=MAX_REPORTED_KINDS * 3)
+
+    assert answered == [401] * (MAX_REPORTED_KINDS * 3)
+    assert len(outage_lines(records)) == MAX_REPORTED_KINDS + 1

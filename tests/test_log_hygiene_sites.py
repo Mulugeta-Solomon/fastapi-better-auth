@@ -1,7 +1,7 @@
 """Every log line this library emits, driven, and the record it produced read for a credential.
 
 One scenario per `COVERED_BY` entry: the contained-verifier traceback, the two JWKS warnings, the
-three store-side lines, the cookie verifier's session-data warning, the 429 latch and the advisory
+four store-side lines, the cookie verifier's session-data warning, the 429 latch and the advisory
 bearer probe. Each asserts that its own template fired - so the manifest is a record of what ran,
 not a declaration - and then that nothing a client chose, and no credential, reached the line.
 `test_the_manifest_names_tests_that_exist` pins that every name in the manifest resolves to a
@@ -47,6 +47,7 @@ from fastapi_better_auth._internal.jwks import JwksClient
 from fastapi_better_auth._internal.once import Once
 from fastapi_better_auth._internal.reasons import REDACTED, fingerprint
 from fastapi_better_auth._internal.remote_backoff import BackoffLatch
+from fastapi_better_auth._internal.stores.outage import MAX_REPORTED_KINDS
 from tests.cookies import COOKIE, FakeStore, http, run, sign, verifier
 from tests.fakes import connection, resolver_of
 from tests.log_hygiene import (
@@ -70,7 +71,14 @@ from tests.log_hygiene import (
     manifest_site,
     rendered,
 )
-from tests.stores import DeniedError, DriverFault, RecordingRedis, build_schema, sync_engine
+from tests.stores import (
+    DeniedError,
+    DriverFault,
+    RecordingRedis,
+    ShiftingStateError,
+    build_schema,
+    sync_engine,
+)
 from tests.tokens import Clock, claims
 from tests.transports import ScriptedTransport, json_reply
 
@@ -311,6 +319,29 @@ async def test_a_contained_store_failure_warning_carries_no_token(
     assert line.args == ("LeakyStoreError", "none", fingerprint(STORE_TOKEN))
     assert caught.value.__context__ is None
     assert caught.value.__cause__ is None
+
+
+@pytest.mark.anyio
+async def test_the_suppressed_kinds_notice_carries_no_token(
+    records: list[logging.LogRecord],
+) -> None:
+    """The cap's one notice (D-411). Every failure here is a new kind, and each carries the token
+    in its message; the notice itself is constant text and one constant number."""
+    store = FakeStore(session_error=ShiftingStateError(f"down while reading {STORE_TOKEN}"))
+    refused = verifier(store=store)
+    cookie = f"{COOKIE}={sign(STORE_TOKEN)}"
+
+    for _ in range(MAX_REPORTED_KINDS + 2):
+        with pytest.raises(AuthServiceUnavailable):
+            await run(refused, http(cookie=cookie))
+
+    site = manifest_site("session store lookups are failing in more than")
+    assert_template_fired(records, site)
+    ours = [record for record in records if record.name == LIBRARY_LOGGER]
+    assert_no_leak(ours, STORE_TOKEN)
+    (notice,) = [record for record in ours if record.msg == site.template]
+    assert notice.args == (MAX_REPORTED_KINDS,)
+    assert notice.exc_info is None
 
 
 @pytest.mark.parametrize(

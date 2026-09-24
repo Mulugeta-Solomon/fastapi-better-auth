@@ -19,6 +19,7 @@ same reason every case runs through both `FLAVOURS`.
 
 from __future__ import annotations
 
+import itertools
 import json
 import pathlib
 import sqlite3
@@ -306,6 +307,17 @@ class ForgedStateError(sqlite3.OperationalError):
     """A `sqlstate` that is not one: five characters and then a forged second log line."""
 
     sqlstate = "42501\n2026-09-25 CRITICAL forged"
+
+
+class ShiftingStateError(sqlite3.OperationalError):
+    """A driver error whose SQLSTATE is different every time it is read - a new failure kind on
+    every lookup, the shape that would defeat a per-kind latch with no cap on kinds."""
+
+    _states = itertools.count()
+
+    @property
+    def sqlstate(self) -> str:
+        return f"{next(self._states) % 100_000:05d}"
 
 
 class DriverFault:

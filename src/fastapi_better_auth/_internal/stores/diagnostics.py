@@ -1,4 +1,4 @@
-"""The three things a store tells an operator, and the shape that keeps a credential out of all."""
+"""The four things a store tells an operator, and the shape that keeps a credential out of all."""
 
 from __future__ import annotations
 
@@ -41,6 +41,19 @@ def lookup_failed(driver_error: str, sqlstate: str | None, marker: str) -> None:
         safe_label(driver_error),
         "none" if sqlstate is None else sqlstate,
         marker,
+    )
+
+
+def lookup_kinds_suppressed(limit: int) -> None:
+    """The one notice that a latch has reached its cap and is holding further kinds back.
+
+    Constant text and one constant number: nothing from the failure that tripped it reaches the
+    line, because the kinds past the cap are exactly the ones this line exists not to report.
+    """
+    logger.warning(
+        "session store lookups are failing in more than %d distinct ways since the last lookup"
+        " that completed; further kinds are not reported until a lookup completes",
+        limit,
     )
 
 

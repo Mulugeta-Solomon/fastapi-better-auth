@@ -151,5 +151,37 @@ def test_every_caller_of_a_shared_log_function_is_driven(function: str) -> None:
 
 def test_the_caller_enumeration_is_not_reading_nothing() -> None:
     """Guards that scan nothing pass by vacuum: the shipped store must be found as a caller."""
-    assert "sqlalchemy_store" in callers_of("lookup_failed")
+    assert "sqlalchemy_store" in callers_of("report_once")
     assert callers_of("a_function_nobody_defines") == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("source", "calls"),
+    [
+        ("from .diagnostics import lookup_failed\nlookup_failed(1, 2, 3)", True),
+        ("from .diagnostics import lookup_failed as warn\nwarn(1, 2, 3)", True),
+        ("from . import diagnostics as d\nd.lookup_failed(1, 2, 3)", True),
+        ("import pkg.stores.diagnostics as d\nd.lookup_failed(1, 2, 3)", True),
+        ("from .diagnostics import lookup_failed as warn\nnotify = warn\nnotify(1, 2, 3)", True),
+        ("# lookup_failed(1, 2, 3)\nx = 'lookup_failed(1, 2, 3)'", False),
+        ("from .diagnostics import lookup_failed as warn\nprint(warn)", False),
+        ("from .other import warn\nwarn(1, 2, 3)", False),
+    ],
+    ids=[
+        "plain",
+        "aliased",
+        "module-alias",
+        "import-as",
+        "rebound",
+        "text",
+        "uncalled",
+        "stranger",
+    ],
+)
+def test_the_caller_enumeration_resolves_every_way_of_naming_the_function(
+    source: str, calls: bool
+) -> None:
+    """An import alias is a call site the enumeration must see - `as warn` was once invisible to
+    it, and a real third caller spelled that way left the manifest green. A comment, a string, a
+    reference that is never called, and some other module's `warn` are not callers."""
+    assert (callers_of("lookup_failed", [("probe", ast.parse(source))]) == {"probe"}) is calls

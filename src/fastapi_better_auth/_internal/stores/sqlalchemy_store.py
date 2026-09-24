@@ -10,8 +10,7 @@ import anyio
 from anyio.to_thread import run_sync
 
 from ..errors import ConfigurationError
-from .diagnostics import lookup_failed
-from .outage import OutageLatch, failure_kind
+from .outage import OutageLatch, report_once
 from .records import StoredSession, StoredUser
 
 if TYPE_CHECKING:
@@ -147,9 +146,7 @@ class _CoreStore(ABC):
         self, error: BaseException, params: Mapping[str, Any]
     ) -> AuthServiceUnavailable:
         """The refusal a lookup's database error becomes, the operator told once per kind (R47)."""
-        kind = failure_kind(error)
-        if self._outage.first(kind):
-            lookup_failed(kind.driver_error, kind.sqlstate, self._sql.lookup_marker(params))
+        report_once(self._outage, error, self._sql.lookup_marker(params))
         return self._sql.lookup_unavailable(params)
 
     @abstractmethod
