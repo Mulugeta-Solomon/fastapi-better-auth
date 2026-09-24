@@ -501,8 +501,9 @@ The scheme's component key is `BetterAuthCookie` whatever the cookie is called, 
 OpenAPI snapshot does not change with a per-environment cookie prefix; its `name` is still the
 configured cookie name (the description names it too), so a snapshot that diffs `name` pins its
 exporter's prefix; and an application that reads two different cookies publishes one key per
-cookie, `BetterAuthCookie-<cookie name>`, so adding a second cookie verifier renames the first
-one's key.
+cookie, `BetterAuthCookie-<cookie name>` with each character outside `A-Za-z0-9._-` replaced by `-`
+(`session+id` → `BetterAuthCookie-session-id`), so adding a second cookie verifier renames the
+first one's key.
 
 ### Deploying across two origins
 

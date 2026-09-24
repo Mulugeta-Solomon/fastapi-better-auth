@@ -325,6 +325,37 @@ def test_mode_a_beside_mode_b_publishes_both_stable_keys_in_declaration_order(
     assert transport.calls == 0
 
 
+@pytest.mark.parametrize("cookie_first", [True, False], ids=["cookie-first", "gateway-first"])
+def test_a_verifier_that_publishes_nothing_does_not_count_against_the_stable_key(
+    cookie_first: bool,
+) -> None:
+    """What decides the key is the number of cookies, not the number of verifiers: a label this
+    module cannot read publishes nothing, so it cannot be what a single key fails to name."""
+    cookie = FakeVerifier(HEADER, source=COOKIE_SOURCE)
+    gateway = FakeVerifier(HEADER_B, source="header:x-gateway-assertion")
+    auth = BetterAuth(verifiers=[cookie, gateway] if cookie_first else [gateway, cookie])
+
+    assert set(schemes(auth)) == {COOKIE_NAME}
+    assert security(auth, "/required") == [{COOKIE_NAME: []}]
+
+
+def test_a_derived_key_carries_the_cookie_name_sanitized_to_a_component_key() -> None:
+    """An OpenAPI component key is `[A-Za-z0-9._-]+`; a cookie name may hold more. The derived key
+    replaces each other character with `-`, while the scheme's `name` keeps the cookie verbatim."""
+    auth = BetterAuth(
+        verifiers=[
+            FakeVerifier(HEADER, source="cookie:session+id"),
+            FakeVerifier(HEADER_B, source=COOKIE_SOURCE),
+        ]
+    )
+    published = schemes(auth)
+
+    assert {key: published[key]["name"] for key in published} == {
+        "BetterAuthCookie-session-id": "session+id",
+        DERIVED_COOKIE_NAME: DEFAULT_COOKIE,
+    }
+
+
 def test_two_distinct_cookies_each_keep_a_key_derived_from_their_name() -> None:
     """The one case a single key cannot name: two different cookies. Each is published as
     `BetterAuthCookie-<name>`, which means a second cookie verifier renames the first one's key."""
