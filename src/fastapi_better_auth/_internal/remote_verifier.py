@@ -503,6 +503,7 @@ class RemoteVerifier:
         cancelled attempt rolls back its stamp so it does not spend the retry window (D-196)."""
         previous = self._probe_attempted_at
         self._probe_attempted_at = self._clock()
+        cancelled = anyio.get_cancelled_exc_class()
         try:
             await run_probe(
                 self._transport,
@@ -513,7 +514,7 @@ class RemoteVerifier:
         except ConfigurationError as contract:
             self._contract_failure = str(contract)
             raise
-        except anyio.get_cancelled_exc_class():
+        except cancelled:
             self._probe_attempted_at = previous
             raise
         self._probed_ok = True

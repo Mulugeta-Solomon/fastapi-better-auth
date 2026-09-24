@@ -10,6 +10,8 @@ place with `from None`, *inside* the `except`. That clears `__cause__`, but Pyth
 * a base64 error whose traceback frames hold the signature;
 * a JWKS transport's own exception, quoting whatever it failed on;
 * the key library's refusal of a published key; the limiter's `TimeoutError`;
+* an HTTP client's error, request and all, behind the import the httpx adapters made *while
+  matching it* to learn the library's timeout type - now resolved at construction;
 * at construction, redis-py's rejection of a URL that can carry a password, the probe's
   unreachability, and `ipaddress`'s rejection of a configured host.
 
@@ -21,7 +23,8 @@ neither `__context__` nor `__cause__`.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable
+import sys
+from collections.abc import AsyncGenerator, Callable
 
 import anyio
 import pytest
@@ -30,12 +33,15 @@ from fastapi_better_auth import (
     AuthServiceUnavailable,
     ConfigurationError,
     CsrfDisabled,
+    Httpx2Transport,
+    HttpxTransport,
     InvalidCredential,
     RedisSessionStore,
     RemoteVerifier,
     normalize_base_url,
 )
 from fastapi_better_auth._internal.cookie_parsing import parse_signed_value
+from fastapi_better_auth._internal.transport import TransportFailure
 from fastapi_better_auth._internal.urls import ip_literal
 from tests.jwks_fixtures import client as jwks_client
 from tests.remote_fixtures import ORIGIN, RecordingTransport, run, verifier, with_cookie
@@ -122,6 +128,56 @@ async def test_a_published_key_that_does_not_load_is_refused_with_no_chain() -> 
 
     assert "did not load" in caught.value.reason
     assert not chained(caught.value), "the refusal carries the key library's exception"
+
+
+class LeakyStreamError(Exception):
+    """Stands in for a client library's error, which carries the outbound request - headers,
+    and so any cookie the transport was forwarding."""
+
+
+class _Jar:
+    def set_policy(self, policy: object) -> None:
+        return None
+
+    def clear(self) -> None:
+        return None
+
+
+class _Cookies:
+    jar = _Jar()
+
+
+class DuckTypedClient:
+    """Satisfies the adapters' client protocol structurally, with the library itself absent."""
+
+    cookies = _Cookies()
+
+    @contextlib.asynccontextmanager
+    async def stream(self, *args: object, **kwargs: object) -> AsyncGenerator[object, None]:
+        raise LeakyStreamError(f"connection reset while sending cookie={NEEDLE}")
+        yield
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("adapter", [HttpxTransport, Httpx2Transport], ids=["httpx", "httpx2"])
+async def test_a_client_error_is_translated_with_no_chain_when_the_library_is_absent(
+    adapter: type[HttpxTransport | Httpx2Transport], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The adapter's timeout type came from an import made *while matching* the client's error:
+    with the library absent, that import failed with the client's error - request and all - as
+    its `__context__`. The type is resolved at construction now, and a missing library simply has
+    no timeout type of its own to catch."""
+    monkeypatch.setitem(sys.modules, "httpx" if adapter is HttpxTransport else "httpx2", None)
+    transport = adapter(client=DuckTypedClient())  # pyright: ignore[reportArgumentType]
+
+    with pytest.raises(TransportFailure) as caught:
+        await transport.get(f"{ORIGIN}/api/auth/jwks", max_bytes=1024)
+
+    assert NEEDLE not in str(caught.value)
+    assert not chained(caught.value), "the translation carries the client's error on its chain"
 
 
 # --- construction and startup ------------------------------------------------------------------

@@ -183,6 +183,7 @@ class JwksClient:
         # limited (D-084/D-196). Only the cancellation exception rolls back - never a refusal.
         previous = self._attempted_at
         self._attempted_at = self._clock()
+        cancelled = anyio.get_cancelled_exc_class()
         try:
             keys = await self._fetched()
         except AuthServiceUnavailable:
@@ -190,7 +191,7 @@ class JwksClient:
                 raise
             logger.warning("jwks refresh failed for %s; serving the key set on hand", self._uri)
             return
-        except anyio.get_cancelled_exc_class():
+        except cancelled:
             self._attempted_at = previous
             raise
         self._keys = keys
