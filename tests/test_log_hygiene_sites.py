@@ -1,7 +1,7 @@
 """Every log line this library emits, driven, and the record it produced read for a credential.
 
 One scenario per `COVERED_BY` entry: the contained-verifier traceback, the two JWKS warnings, the
-two store-side lines, the cookie verifier's session-data warning, the 429 latch and the advisory
+three store-side lines, the cookie verifier's session-data warning, the 429 latch and the advisory
 bearer probe. Each asserts that its own template fired - so the manifest is a record of what ran,
 not a declaration - and then that nothing a client chose, and no credential, reached the line.
 `test_the_manifest_names_tests_that_exist` pins that every name in the manifest resolves to a
@@ -23,6 +23,8 @@ from typing import Any
 import anyio
 import pytest
 from pydantic import SecretStr, create_model
+from sqlalchemy import text as sqla_text
+from sqlalchemy.exc import DBAPIError
 
 from fastapi_better_auth import (
     AuthServiceUnavailable,
@@ -51,6 +53,7 @@ from tests.log_hygiene import (
     HOSTILE_KID,
     KEY_SET,
     LEAKY_SECRET,
+    LIBRARY_LOGGER,
     ORIGIN,
     SIGNER,
     STORE_TOKEN,
@@ -65,7 +68,7 @@ from tests.log_hygiene import (
     manifest_site,
     rendered,
 )
-from tests.stores import RecordingRedis, build_schema, sync_engine
+from tests.stores import DeniedError, DriverFault, RecordingRedis, build_schema, sync_engine
 from tests.tokens import Clock, claims
 from tests.transports import ScriptedTransport, json_reply
 
@@ -243,6 +246,39 @@ async def test_a_schema_drift_warning_carries_only_operator_owned_names(
     written = rendered(records)
     assert "ipAddress" in written
     assert STORED_USER_ID not in written
+
+
+@pytest.mark.anyio
+async def test_a_store_lookup_failure_warning_carries_no_token(
+    records: list[logging.LogRecord], tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R47's line, over exactly the error A1 is about: a `DBAPIError` whose `str()` embeds the
+    bound token, wrapping a driver error whose own message repeats it. The operator gets the
+    driver's class, the SQLSTATE and a fingerprint - no message, no args, no parameters and no
+    traceback. The instrument is proven live first: the error the store meets does carry it."""
+    path = tmp_path / "outage.sqlite"
+    build_schema(path)
+    engine = sync_engine(path)
+    store = SyncStoreAdapter(engine=engine)
+    try:
+        await store.connect()
+        DriverFault(engine, monkeypatch).error = DeniedError
+        with engine.connect() as probe, pytest.raises(DBAPIError) as raw:
+            probe.execute(sqla_text("SELECT :token"), {"token": STORE_TOKEN})
+        carried = STORE_TOKEN in str(raw.value)
+        with pytest.raises(AuthServiceUnavailable):
+            await store.fetch_session_by_token(STORE_TOKEN)
+    finally:
+        engine.dispose()
+
+    assert carried, "the fault no longer puts the token in the error; this proves nothing"
+    site = manifest_site("session store lookup could not complete")
+    assert_template_fired(records, site)
+    ours = [record for record in records if record.name == LIBRARY_LOGGER]
+    assert_no_leak(ours, STORE_TOKEN)
+    (line,) = [record for record in ours if record.msg == site.template]
+    assert line.exc_info is None
+    assert line.args == ("DeniedError", "42501", fingerprint(STORE_TOKEN))
 
 
 def test_a_session_data_observation_logs_no_cookie_value(

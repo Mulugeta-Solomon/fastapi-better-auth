@@ -212,6 +212,15 @@ COVERED_BY: Mapping[LogSite, str] = {
         ),
     ): "test_a_schema_drift_warning_carries_only_operator_owned_names",
     LogSite(
+        module="diagnostics",
+        level="warning",
+        template=(
+            "session store lookup could not complete (%s, SQLSTATE %s); every lookup failing"
+            " this way answers AuthServiceUnavailable, and this line is not repeated for it until"
+            " a lookup completes [%s]"
+        ),
+    ): "test_a_store_lookup_failure_warning_carries_no_token",
+    LogSite(
         module="cookie_verifier",
         level="warning",
         template=(

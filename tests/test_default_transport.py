@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable
+from typing import cast
 
 import pytest
 
@@ -28,6 +29,8 @@ from fastapi_better_auth import (
     RemoteVerifier,
     Transport,
 )
+from fastapi_better_auth._internal import jwt_verifier as jwt_verifier_module
+from fastapi_better_auth._internal import remote_config as remote_config_module
 
 ORIGIN = "https://auth.example.com"
 FRONT_END = "https://app.example.com"
@@ -58,6 +61,11 @@ ADAPTERS: dict[str, tuple[Callable[[], Transport], str, str]] = {
     "httpx2": (Httpx2Transport, "HttpxTransport", INSTALL_HTTPX),
 }
 """Library -> (the adapter over it, its sibling adapter, the install line of the sibling's extra)."""
+
+
+def no_transport(verifier: str) -> Transport:
+    """A default builder gone wrong: it swallowed its own refusal and built nothing."""
+    return cast("Transport", None)
 
 
 def refusal_without_httpx(name: str, monkeypatch: pytest.MonkeyPatch) -> ConfigurationError:
@@ -111,6 +119,23 @@ def test_the_second_remedy_works_with_httpx_absent(
     monkeypatch.setitem(sys.modules, "httpx", None)
 
     assert VERIFIERS[name](Httpx2Transport()) is not None
+
+
+@pytest.mark.parametrize("name", sorted(VERIFIERS))
+def test_a_default_that_is_not_a_transport_is_refused_by_the_verifier(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G18's eager-transport invariant may not rest on one call raising: whatever the default
+    builder hands back is checked by the verifier that will fetch with it, and refused in its name."""
+    for module in (jwt_verifier_module, remote_config_module):
+        monkeypatch.setattr(module, "default_transport", no_transport)
+
+    with pytest.raises(ConfigurationError) as caught:
+        VERIFIERS[name](None)
+
+    message = str(caught.value)
+    assert message.startswith(f"{name} "), message
+    assert "NoneType" in message, message
 
 
 @pytest.mark.parametrize("library", sorted(ADAPTERS))

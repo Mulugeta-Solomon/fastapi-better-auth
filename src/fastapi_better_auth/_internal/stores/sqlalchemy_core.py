@@ -474,10 +474,14 @@ def lookup_unavailable(params: Mapping[str, Any]) -> AuthServiceUnavailable:
     a refusal, the same family as a JWKS fetch that could not complete - which is what lets the
     verifier answer the uniform 401.
     """
-    subject = next((value for value in params.values() if isinstance(value, str)), "")
     return AuthServiceUnavailable(
-        reason=f"session store lookup could not complete [{fingerprint(subject)}]"
+        reason=f"session store lookup could not complete [{fingerprint(lookup_subject(params))}]"
     )
+
+
+def lookup_subject(params: Mapping[str, Any]) -> str:
+    """What a lookup was asked about - the token or the user id - for a fingerprint, never a line."""
+    return next((value for value in params.values() if isinstance(value, str)), "")
 
 
 def validated_async_engine(engine: object) -> AsyncEngine:

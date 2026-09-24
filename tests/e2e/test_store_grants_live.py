@@ -5,7 +5,7 @@ module makes that a database fact: a LOGIN role holding `SELECT` on `session` an
 nothing else connects, discovers the schema and resolves a real signed-in session, while every
 INSERT, UPDATE and DELETE it attempts on either table is refused by Postgres itself. A second role
 holding `SELECT` on `session` alone is the under-grant, and what it gets is pinned exactly - the
-answer the README documents.
+answer the README documents: the uniform 401, and one WARNING naming SQLSTATE 42501 (R47).
 
 Both roles are created per test under random names and passwords by the harness superuser, and
 dropped in a `finally`. The password never reaches a log, a reason, an assertion or a repr: it
@@ -15,7 +15,8 @@ Every write attempted as the role carries `WHERE false`, so even a wrongly grant
 nothing; privileges are checked when the statement starts, before any row is considered.
 
 Names only 0.5.0 publishes, and the Mode A ones under the post-0.1.0 guard, so the module runs on
-the published wheel too. Asyncio only: asyncpg drives the event loop directly.
+the published wheel too; the one leg about R47's warning skips on a build that predates it.
+Asyncio only: asyncpg drives the event loop directly.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import secrets
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from importlib.util import find_spec
 
 import httpx
 import pytest
@@ -65,9 +67,14 @@ except ImportError:
 
 pytestmark = pytest.mark.e2e
 
+# The store's lookup warning (R47) is post-0.5.0; the published-wheel lane skips that one leg.
+WARNS_ON_LOOKUP_FAILURE = find_spec("fastapi_better_auth._internal.stores.outage") is not None
+
 FRONT_END = "https://app.example.com"
 UNAUTHENTICATED = {"detail": "Not authenticated"}
 INSUFFICIENT_PRIVILEGE = "42501"
+LIBRARY_LOGGER = "fastapi_better_auth"
+FORMATTER = logging.Formatter("%(name)s %(levelname)s %(message)s")
 LOOKUP_UNAVAILABLE = "session store lookup could not complete ["
 
 READ_BOTH = 'GRANT SELECT ON "session", "user" TO "{role}"'
@@ -192,6 +199,11 @@ def recording_app(store: SqlAlchemySessionStore, refusals: list[SessionError]) -
     return app
 
 
+def written(records: list[logging.LogRecord]) -> str:
+    """Every record as a handler writes it - message, arguments and any traceback."""
+    return "\n".join(f"{FORMATTER.format(record)} {record.args!r}" for record in records)
+
+
 async def post_with(app: FastAPI, cookie: str) -> httpx.Response:
     headers = {"Cookie": f"{SESSION_COOKIE}={cookie}", "Origin": FRONT_END}
     async with httpx.AsyncClient(
@@ -240,27 +252,24 @@ async def test_every_write_the_role_attempts_is_refused_by_postgres(
 
 
 @pytest.mark.anyio
-async def test_select_on_session_alone_is_the_uniform_401_and_logs_nothing(
-    signed_in_user: tuple[str, str], caplog: pytest.LogCaptureFixture
+async def test_select_on_session_alone_is_the_uniform_401(
+    signed_in_user: tuple[str, str],
 ) -> None:
     """The under-grant, as it really answers: not a 500 and not a startup failure.
 
     `connect()` succeeds - discovery reads the system catalog, which needs no grant - so the
     missing `SELECT` on `user` surfaces on the first lookup, where the joined statement is refused
-    and the store turns the database error into `AuthServiceUnavailable`. The client sees the
-    uniform 401, and this library logs nothing: the reason is on the exception, for a handler of
-    the deployment's own to log.
+    and the store turns the database error into `AuthServiceUnavailable`: the uniform 401.
     """
     _, cookie = signed_in_user
     refusals: list[SessionError] = []
 
-    with caplog.at_level(logging.DEBUG, logger="fastapi_better_auth"):
-        async with login_granted(READ_SESSION_ONLY) as login, engine_as(login) as engine:
-            store = SqlAlchemySessionStore(engine=engine)
-            await store.connect()
-            answer = await post_with(recording_app(store, refusals), cookie)
-            with pytest.raises(AuthServiceUnavailable) as underneath:
-                await store.fetch_session_by_token(raw_token(cookie))
+    async with login_granted(READ_SESSION_ONLY) as login, engine_as(login) as engine:
+        store = SqlAlchemySessionStore(engine=engine)
+        await store.connect()
+        answer = await post_with(recording_app(store, refusals), cookie)
+        with pytest.raises(AuthServiceUnavailable) as underneath:
+            await store.fetch_session_by_token(raw_token(cookie))
 
     assert answer.status_code == 401
     assert answer.json() == UNAUTHENTICATED
@@ -269,5 +278,34 @@ async def test_select_on_session_alone_is_the_uniform_401_and_logs_nothing(
     assert refusals[0].reason.startswith(LOOKUP_UNAVAILABLE)
     assert underneath.value.reason.startswith(LOOKUP_UNAVAILABLE)
     assert underneath.value.__cause__ is None
-    logged = len(caplog.records)
-    assert logged == 0, f"{logged} log records"
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(not WARNS_ON_LOOKUP_FAILURE, reason="this build predates R47's lookup warning")
+async def test_the_under_grant_is_one_warning_naming_its_sqlstate(
+    signed_in_user: tuple[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """R47, live: two refused lookups, one WARNING, and the SQLSTATE Postgres really sent.
+
+    The line names the driver's class and `42501`; the raw token the lookups were keyed by and the
+    role's password - both in play while the statement was refused - are nowhere in any record.
+    """
+    _, cookie = signed_in_user
+    token = raw_token(cookie)
+
+    with caplog.at_level(logging.DEBUG, logger=LIBRARY_LOGGER):
+        async with login_granted(READ_SESSION_ONLY) as login, engine_as(login) as engine:
+            store = SqlAlchemySessionStore(engine=engine)
+            await store.connect()
+            await post_with(recording_app(store, []), cookie)
+            with pytest.raises(AuthServiceUnavailable):
+                await store.fetch_session_by_token(token)
+            password_logged = login.password in written(caplog.records)
+
+    ours = [record for record in caplog.records if record.name == LIBRARY_LOGGER]
+    token_logged = token in written(caplog.records)
+    assert [record.levelno for record in ours] == [logging.WARNING]
+    assert f"SQLSTATE {INSUFFICIENT_PRIVILEGE}" in ours[0].getMessage()
+    assert ours[0].exc_info is None
+    assert not token_logged, "the raw session token reached a log record"
+    assert not password_logged, "the role's password reached a log record"

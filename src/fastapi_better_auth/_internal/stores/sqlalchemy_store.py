@@ -10,12 +10,15 @@ import anyio
 from anyio.to_thread import run_sync
 
 from ..errors import ConfigurationError
+from .diagnostics import lookup_failed
+from .outage import OutageLatch, failure_kind
 from .records import StoredSession, StoredUser
 
 if TYPE_CHECKING:
     from sqlalchemy import Connection, Engine, Select
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+    from ..errors import AuthServiceUnavailable
     from .sqlalchemy_core import Columns, Plan
 
 Row = Mapping[str, Any]
@@ -77,6 +80,7 @@ class _CoreStore(ABC):
         )
         self._lock = anyio.Lock()
         self._plan: Plan | None = None
+        self._outage = OutageLatch()
 
     async def connect(self) -> None:
         """Read the live schema now, rather than on whichever request arrives first.
@@ -100,6 +104,7 @@ class _CoreStore(ABC):
             return None
         plan = await self._ready()
         found = await self._select(plan.session_statement, {self._sql.TOKEN_PARAM: token})
+        self._outage.rearm()
         return self._sql.session_from(found, plan, token)
 
     async def fetch_user_by_id(self, user_id: str) -> StoredUser | None:
@@ -108,6 +113,7 @@ class _CoreStore(ABC):
             return None
         plan = await self._ready()
         found = await self._select(plan.user_statement, {self._sql.USER_ID_PARAM: user_id})
+        self._outage.rearm()
         return self._sql.user_from(found, plan, user_id, check_identity=True)
 
     async def _ready(self) -> Plan:
@@ -136,6 +142,15 @@ class _CoreStore(ABC):
 
     def _reflected(self, connection: Connection) -> dict[str, tuple[str, ...] | None]:
         return self._sql.reflected(connection, self._names, self._schema)
+
+    def _unavailable(
+        self, error: BaseException, params: Mapping[str, Any]
+    ) -> AuthServiceUnavailable:
+        """The refusal a lookup's database error becomes, the operator told once per kind (R47)."""
+        kind = failure_kind(error)
+        if self._outage.first(kind):
+            lookup_failed(kind.driver_error, kind.sqlstate, self._sql.lookup_subject(params))
+        return self._sql.lookup_unavailable(params)
 
     @abstractmethod
     async def _columns(self) -> Columns:
@@ -171,7 +186,9 @@ class SqlAlchemySessionStore(_CoreStore):
     which `PUBLIC` holds on `public` by default, so only a non-default `schema=` needs it granted.
     Granting no more is what turns the read-only property into a database guarantee. A role
     granted less (`SELECT` on `session` alone) still passes `connect()`, since discovery reads the
-    system catalog, and then answers every lookup with `AuthServiceUnavailable` - the uniform 401.
+    system catalog, and then answers every lookup with `AuthServiceUnavailable` - the uniform 401 -
+    logging one WARNING per kind of failure (driver error class and SQLSTATE, never its text)
+    until a lookup completes again.
 
     **The session and its user arrive together**, joined in one statement, so the happy path is
     a single round trip and the record's `user` is already populated. `fetch_user_by_id` is
@@ -257,8 +274,8 @@ class SqlAlchemySessionStore(_CoreStore):
         try:
             async with self._engine.connect() as connection:
                 return self._sql.rows(await connection.execute(statement, dict(params)))
-        except self._sql.SQLAlchemyError:
-            failure = self._sql.lookup_unavailable(params)
+        except self._sql.SQLAlchemyError as exc:
+            failure = self._unavailable(exc, params)
         # Raised outside the `except` so no `__context__` links back to the DBAPIError whose
         # str() embeds the token; `from None` clears `__cause__` as well (A1).
         raise failure from None
@@ -375,8 +392,8 @@ class SyncStoreAdapter(_CoreStore):
         try:
             with self._engine.connect() as connection:
                 return self._sql.rows(connection.execute(statement, dict(params)))
-        except self._sql.SQLAlchemyError:
-            failure = self._sql.lookup_unavailable(params)
+        except self._sql.SQLAlchemyError as exc:
+            failure = self._unavailable(exc, params)
         raise failure from None
 
 

@@ -1,4 +1,4 @@
-"""The two things a store tells an operator, and the shape that keeps a credential out of both."""
+"""The three things a store tells an operator, and the shape that keeps a credential out of all."""
 
 from __future__ import annotations
 
@@ -22,6 +22,22 @@ def unusable(kind: str, why: str, subject: str) -> None:
         "stored %s is unusable (%s); answering a miss [%s]",
         safe_label(kind),
         why,
+        fingerprint(subject),
+    )
+
+
+def lookup_failed(driver_error: str, sqlstate: str | None, subject: str) -> None:
+    """A lookup the database refused or could not answer, reported once per kind (R47).
+
+    Everything on the line is chosen here: a class name, a validated SQLSTATE and a fingerprint.
+    The error's own text never reaches it - SQLAlchemy puts the bound token there (A1).
+    """
+    logger.warning(
+        "session store lookup could not complete (%s, SQLSTATE %s); every lookup failing"
+        " this way answers AuthServiceUnavailable, and this line is not repeated for it until"
+        " a lookup completes [%s]",
+        safe_label(driver_error),
+        "none" if sqlstate is None else sqlstate,
         fingerprint(subject),
     )
 

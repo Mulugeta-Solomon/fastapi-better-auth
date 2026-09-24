@@ -406,9 +406,9 @@ schema is one `PUBLIC` holds on `public` by default — only a non-default `sche
 granted. Granting no more is what turns the read-only property into a database guarantee: Postgres
 itself refuses every `INSERT`, `UPDATE` and `DELETE` the role attempts. Grant less — `SELECT` on
 `session` alone — and `connect()` still succeeds (discovery reads the system catalog, which needs no
-grant), then every lookup answers the uniform `401` as `AuthServiceUnavailable`, which this library
-does not log; its `reason` says the store lookup could not complete, so log it from your own
-`SessionError` handler ([Errors](#errors)) to see the misconfiguration.
+grant), then every lookup answers the uniform `401` as `AuthServiceUnavailable`, and the store logs
+one `WARNING` naming the driver error and its SQLSTATE (`42501`, insufficient privilege) — once per
+kind of failure until a lookup completes again, never the token.
 `tests/e2e/test_store_grants_live.py` proves the grant, the refused writes and that answer against a
 live Postgres.
 
@@ -524,7 +524,7 @@ safe to log, and not reversible into the secret.
 ```python
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 
 from fastapi import FastAPI
 
@@ -537,7 +537,7 @@ secret = SharedSecret("replace-this-with-your-own-32-plus-character-secret")
 
 
 @contextlib.asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     logger.info("better-auth secret %s", secret.fingerprint)
     logger.info("better-auth verified against %s", VERIFIED_BETTER_AUTH)
     yield

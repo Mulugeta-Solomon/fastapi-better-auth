@@ -15,6 +15,7 @@ from .errors import ConfigurationError
 from .transport import (
     ContentEncodingRejected,
     ResponseTooLarge,
+    Transport,
     TransportFailure,
     TransportResponse,
     UntrustedResponse,
@@ -45,6 +46,10 @@ DEFAULT_MISSING = (
     " its first request - and the httpx package is not installed. Install it with:"
     ' pip install "fastapi-better-auth-bridge[httpx]", or pass transport=Httpx2Transport() and'
     ' install that extra instead: pip install "fastapi-better-auth-bridge[httpx2]".'
+)
+NOT_A_TRANSPORT = (
+    "{verifier} built a default transport that is a {actual}, not a Transport, so nothing could"
+    " fetch with it. Pass transport=HttpxTransport(), Httpx2Transport(), or an adapter of your own."
 )
 
 TransportT = TypeVar("TransportT", bound="_HttpxFamilyTransport")
@@ -390,6 +395,19 @@ def default_transport(verifier: str) -> HttpxTransport:
     """
     _import_httpx(DEFAULT_MISSING.format(verifier=verifier))
     return HttpxTransport()
+
+
+def usable_default(built: object, verifier: str) -> Transport:
+    """What a default builder handed back, refused in the verifier's name unless it can fetch.
+
+    Checked by the verifier rather than trusted, so no verifier is ever built without a transport
+    whatever the builder becomes - the eager invariant does not rest on one call raising.
+    """
+    if not isinstance(built, Transport):
+        raise ConfigurationError(
+            NOT_A_TRANSPORT.format(verifier=verifier, actual=type(built).__name__)
+        )
+    return built
 
 
 class Httpx2Transport(_HttpxFamilyTransport):
