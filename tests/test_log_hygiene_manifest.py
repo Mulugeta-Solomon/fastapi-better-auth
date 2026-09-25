@@ -18,7 +18,9 @@ import pytest
 from tests.log_hygiene import (
     COVERED_BY,
     NON_LITERAL,
+    SHARED_LOG_FUNCTIONS,
     LogSite,
+    callers_of,
     collect_log_sites,
     log_sites,
     logger_binding_violations,
@@ -138,3 +140,48 @@ def test_the_collector_finds_a_synthetic_site_in_a_planted_file(tmp_path: pathli
     sites = collect_log_sites(ast.parse(planted.read_text(encoding="utf-8")), planted.stem)
 
     assert LogSite("planted", "info", "hi %s") in sites
+
+
+@pytest.mark.parametrize("function", sorted(SHARED_LOG_FUNCTIONS))
+def test_every_caller_of_a_shared_log_function_is_driven(function: str) -> None:
+    """A site with two callers is two sets of material reaching one line (R47a): each calling
+    module is enumerated from `src/`, so a third caller fails here until a scenario drives it."""
+    assert callers_of(function) == frozenset(SHARED_LOG_FUNCTIONS[function])
+
+
+def test_the_caller_enumeration_is_not_reading_nothing() -> None:
+    """Guards that scan nothing pass by vacuum: the shipped store must be found as a caller."""
+    assert "sqlalchemy_store" in callers_of("report_once")
+    assert callers_of("a_function_nobody_defines") == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("source", "calls"),
+    [
+        ("from .diagnostics import lookup_failed\nlookup_failed(1, 2, 3)", True),
+        ("from .diagnostics import lookup_failed as warn\nwarn(1, 2, 3)", True),
+        ("from . import diagnostics as d\nd.lookup_failed(1, 2, 3)", True),
+        ("import pkg.stores.diagnostics as d\nd.lookup_failed(1, 2, 3)", True),
+        ("from .diagnostics import lookup_failed as warn\nnotify = warn\nnotify(1, 2, 3)", True),
+        ("# lookup_failed(1, 2, 3)\nx = 'lookup_failed(1, 2, 3)'", False),
+        ("from .diagnostics import lookup_failed as warn\nprint(warn)", False),
+        ("from .other import warn\nwarn(1, 2, 3)", False),
+    ],
+    ids=[
+        "plain",
+        "aliased",
+        "module-alias",
+        "import-as",
+        "rebound",
+        "text",
+        "uncalled",
+        "stranger",
+    ],
+)
+def test_the_caller_enumeration_resolves_every_way_of_naming_the_function(
+    source: str, calls: bool
+) -> None:
+    """An import alias is a call site the enumeration must see - `as warn` was once invisible to
+    it, and a real third caller spelled that way left the manifest green. A comment, a string, a
+    reference that is never called, and some other module's `warn` are not callers."""
+    assert (callers_of("lookup_failed", [("probe", ast.parse(source))]) == {"probe"}) is calls

@@ -15,6 +15,7 @@ from .errors import ConfigurationError
 from .transport import (
     ContentEncodingRejected,
     ResponseTooLarge,
+    Transport,
     TransportFailure,
     TransportResponse,
     UntrustedResponse,
@@ -30,8 +31,25 @@ REQUEST_HEADERS: Mapping[str, str] = MappingProxyType({"accept-encoding": "ident
 
 MISSING = (
     "{adapter} needs the {library} package, which is not installed. Install it with:"
-    ' pip install "fastapi-better-auth-bridge[{library}]" - or build the client yourself'
-    " and pass it as client=."
+    ' pip install "fastapi-better-auth-bridge[{library}]" - or use {sibling}() instead, which'
+    ' needs the other extra: pip install "fastapi-better-auth-bridge[{sibling_library}]".'
+)
+HTTPX_MISSING = MISSING.format(
+    adapter="HttpxTransport", library="httpx", sibling="Httpx2Transport", sibling_library="httpx2"
+)
+HTTPX2_MISSING = MISSING.format(
+    adapter="Httpx2Transport", library="httpx2", sibling="HttpxTransport", sibling_library="httpx"
+)
+DEFAULT_MISSING = (
+    "{verifier} was given no transport=, so it builds its default HttpxTransport at construction"
+    " - on purpose: a missing HTTP client stops the application from starting instead of failing"
+    " its first request - and the httpx package is not installed. Install it with:"
+    ' pip install "fastapi-better-auth-bridge[httpx]", or pass transport=Httpx2Transport() and'
+    ' install that extra instead: pip install "fastapi-better-auth-bridge[httpx2]".'
+)
+NOT_A_TRANSPORT = (
+    "{verifier} built a default transport that is a {actual}, not a Transport, so nothing could"
+    " fetch with it. Pass transport=HttpxTransport(), Httpx2Transport(), or an adapter of your own."
 )
 
 TransportT = TypeVar("TransportT", bound="_HttpxFamilyTransport")
@@ -79,11 +97,11 @@ class _Client(Protocol):
     async def aclose(self) -> None: ...
 
 
-def _import_httpx():
+def _import_httpx(missing: str = HTTPX_MISSING):
     try:
         import httpx
     except ImportError as exc:
-        raise ConfigurationError(MISSING.format(adapter="HttpxTransport", library="httpx")) from exc
+        raise ConfigurationError(missing) from exc
     return httpx
 
 
@@ -91,9 +109,7 @@ def _import_httpx2():
     try:
         import httpx2
     except ImportError as exc:
-        raise ConfigurationError(
-            MISSING.format(adapter="Httpx2Transport", library="httpx2")
-        ) from exc
+        raise ConfigurationError(HTTPX2_MISSING) from exc
     return httpx2
 
 
@@ -384,6 +400,31 @@ class HttpxTransport(_HttpxFamilyTransport):
             module = _import_httpx()
             client = module.AsyncClient(timeout=module.Timeout(checked), follow_redirects=False)
         super().__init__(client, timeout=checked, timeout_error=_httpx_timeout_error, owned=owned)
+
+
+def default_transport(verifier: str) -> HttpxTransport:
+    """The transport a verifier builds when it is handed none - eagerly, at its construction.
+
+    Eager so that a Mode B or Mode C deployment missing `httpx` never finishes starting, and the
+    refusal names the verifier that needed it, since that is the line the operator wrote.
+    """
+    _import_httpx(DEFAULT_MISSING.format(verifier=verifier))
+    return HttpxTransport()
+
+
+def usable_default(built: object, verifier: str) -> Transport:
+    """What a default builder handed back, refused in the verifier's name unless it can fetch.
+
+    Checked by the verifier rather than trusted, so no verifier is ever built without a transport
+    whatever the builder becomes - the eager invariant does not rest on one call raising. Held to
+    this module's own family, not to the runtime `Transport` Protocol: that checks only that the
+    two names exist, and a default is always one of the adapters defined here.
+    """
+    if not isinstance(built, _HttpxFamilyTransport):
+        raise ConfigurationError(
+            NOT_A_TRANSPORT.format(verifier=verifier, actual=type(built).__name__)
+        )
+    return built
 
 
 class Httpx2Transport(_HttpxFamilyTransport):

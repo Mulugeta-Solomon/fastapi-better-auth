@@ -11,7 +11,7 @@ import jwt
 from starlette.requests import HTTPConnection
 
 from .errors import ConfigurationError, InvalidCredential, SessionExpired
-from .httpx_transports import HttpxTransport
+from .httpx_transports import default_transport, usable_default
 from .jwks import CACHE_TTL, SUPPORTED_ALGORITHMS, Jwk, JwksClient
 from .models import Session, User
 from .parsing import parse_user
@@ -32,6 +32,7 @@ MAX_LIFETIME = 86400.0
 MAX_TOKEN_BYTES = 8192
 DOT_SEPARATORS = 2
 AUTHORIZATION = "authorization"
+VERIFIER = "JwtVerifier"
 
 
 class _AmbiguousBearer:
@@ -111,8 +112,9 @@ class JwtVerifier:
             for a loopback host.
         transport: The HTTP client used for the key set. Defaults to a `HttpxTransport`
             built here - so a missing `httpx` stops the application from starting rather
-            than surfacing on the first request. An injected one is used as it is, and its
-            lifetime stays with whoever built it.
+            than surfacing on the first request; with only `httpx2` installed, pass
+            `Httpx2Transport()`. An injected one is used as it is, and its lifetime stays
+            with whoever built it.
         algorithms: The signature algorithms this deployment accepts, defaulting to
             `("EdDSA",)`, which is what better-auth's `jwt` plugin issues. Every entry must
             be one this library can verify asymmetrically.
@@ -143,7 +145,11 @@ class JwtVerifier:
         self._algorithms = _validated_algorithms(algorithms)
         self._leeway = _validated_leeway(leeway)
         self._max_token_lifetime = _validated_lifetime(max_token_lifetime, self._leeway)
-        self._transport = HttpxTransport() if transport is None else transport
+        self._transport = (
+            usable_default(default_transport(VERIFIER), VERIFIER)
+            if transport is None
+            else transport
+        )
         self._keys = JwksClient(
             base_url=self._origin,
             transport=self._transport,

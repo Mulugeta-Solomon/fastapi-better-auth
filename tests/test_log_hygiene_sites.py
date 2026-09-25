@@ -1,7 +1,7 @@
 """Every log line this library emits, driven, and the record it produced read for a credential.
 
 One scenario per `COVERED_BY` entry: the contained-verifier traceback, the two JWKS warnings, the
-two store-side lines, the cookie verifier's session-data warning, the 429 latch and the advisory
+four store-side lines, the cookie verifier's session-data warning, the 429 latch and the advisory
 bearer probe. Each asserts that its own template fired - so the manifest is a record of what ran,
 not a declaration - and then that nothing a client chose, and no credential, reached the line.
 `test_the_manifest_names_tests_that_exist` pins that every name in the manifest resolves to a
@@ -23,6 +23,8 @@ from typing import Any
 import anyio
 import pytest
 from pydantic import SecretStr, create_model
+from sqlalchemy import text as sqla_text
+from sqlalchemy.exc import DBAPIError
 
 from fastapi_better_auth import (
     AuthorizationRefused,
@@ -46,13 +48,17 @@ from fastapi_better_auth._internal.jwks import JwksClient
 from fastapi_better_auth._internal.once import Once
 from fastapi_better_auth._internal.reasons import REDACTED, fingerprint
 from fastapi_better_auth._internal.remote_backoff import BackoffLatch
+from fastapi_better_auth._internal.stores.outage import MAX_REPORTED_KINDS
+from tests.cookies import COOKIE, FakeStore, http, run, sign, verifier
 from tests.fakes import connection, resolver_of
 from tests.log_hygiene import (
     COVERED_BY,
     HOSTILE_KID,
     KEY_SET,
     LEAKY_SECRET,
+    LIBRARY_LOGGER,
     ORIGIN,
+    SHARED_LOG_FUNCTIONS,
     SIGNER,
     STORE_TOKEN,
     STORED_USER_ID,
@@ -66,7 +72,14 @@ from tests.log_hygiene import (
     manifest_site,
     rendered,
 )
-from tests.stores import RecordingRedis, build_schema, sync_engine
+from tests.stores import (
+    DeniedError,
+    DriverFault,
+    RecordingRedis,
+    ShiftingStateError,
+    build_schema,
+    sync_engine,
+)
 from tests.tokens import Clock, claims
 from tests.transports import ScriptedTransport, json_reply
 
@@ -274,6 +287,101 @@ async def test_a_schema_drift_warning_carries_only_operator_owned_names(
     written = rendered(records)
     assert "ipAddress" in written
     assert STORED_USER_ID not in written
+
+
+@pytest.mark.anyio
+async def test_a_store_lookup_failure_warning_carries_no_token(
+    records: list[logging.LogRecord], tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R47's line, over exactly the error A1 is about: a `DBAPIError` whose `str()` embeds the
+    bound token, wrapping a driver error whose own message repeats it. The operator gets the
+    driver's class, the SQLSTATE and a fingerprint - no message, no args, no parameters and no
+    traceback. The instrument is proven live first: the error the store meets does carry it."""
+    path = tmp_path / "outage.sqlite"
+    build_schema(path)
+    engine = sync_engine(path)
+    store = SyncStoreAdapter(engine=engine)
+    try:
+        await store.connect()
+        DriverFault(engine, monkeypatch).error = DeniedError
+        with engine.connect() as probe, pytest.raises(DBAPIError) as raw:
+            probe.execute(sqla_text("SELECT :token"), {"token": STORE_TOKEN})
+        carried = STORE_TOKEN in str(raw.value)
+        with pytest.raises(AuthServiceUnavailable):
+            await store.fetch_session_by_token(STORE_TOKEN)
+    finally:
+        engine.dispose()
+
+    assert carried, "the fault no longer puts the token in the error; this proves nothing"
+    site = manifest_site("session store lookup could not complete")
+    assert_template_fired(records, site)
+    ours = [record for record in records if record.name == LIBRARY_LOGGER]
+    assert_no_leak(ours, STORE_TOKEN)
+    (line,) = [record for record in ours if record.msg == site.template]
+    assert line.exc_info is None
+    assert line.args == ("DeniedError", "42501", fingerprint(STORE_TOKEN))
+
+
+class LeakyStoreError(Exception):
+    """A deployment's own store error that puts the token in its message and its args."""
+
+
+@pytest.mark.anyio
+async def test_a_contained_store_failure_warning_carries_no_token(
+    records: list[logging.LogRecord],
+) -> None:
+    """R47a's caller: the same line, reached from `CookieVerifier` with an error this library did
+    not write - its message and its `args` both carry the raw token. The operator gets the class,
+    `none` for a SQLSTATE and the token's fingerprint; the refusal carries no chain to it."""
+    store = FakeStore(session_error=LeakyStoreError(f"no session for {STORE_TOKEN}", STORE_TOKEN))
+    cookie = f"{COOKIE}={sign(STORE_TOKEN)}"
+
+    with pytest.raises(AuthServiceUnavailable) as caught:
+        await run(verifier(store=store), http(cookie=cookie))
+
+    carried = STORE_TOKEN in str(store.session_error)
+    assert carried, "the store error no longer carries the token; this proves nothing"
+    site = manifest_site("session store lookup could not complete")
+    assert_template_fired(records, site)
+    ours = [record for record in records if record.name == LIBRARY_LOGGER]
+    assert_no_leak(ours, STORE_TOKEN)
+    (line,) = [record for record in ours if record.msg == site.template]
+    assert line.exc_info is None
+    assert line.args == ("LeakyStoreError", "none", fingerprint(STORE_TOKEN))
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.anyio
+async def test_the_suppressed_kinds_notice_carries_no_token(
+    records: list[logging.LogRecord],
+) -> None:
+    """The cap's one notice (D-411). Every failure here is a new kind, and each carries the token
+    in its message; the notice itself is constant text and one constant number."""
+    store = FakeStore(session_error=ShiftingStateError(f"down while reading {STORE_TOKEN}"))
+    refused = verifier(store=store)
+    cookie = f"{COOKIE}={sign(STORE_TOKEN)}"
+
+    for _ in range(MAX_REPORTED_KINDS + 2):
+        with pytest.raises(AuthServiceUnavailable):
+            await run(refused, http(cookie=cookie))
+
+    site = manifest_site("session store lookups are failing in more than")
+    assert_template_fired(records, site)
+    ours = [record for record in records if record.name == LIBRARY_LOGGER]
+    assert_no_leak(ours, STORE_TOKEN)
+    (notice,) = [record for record in ours if record.msg == site.template]
+    assert notice.args == (MAX_REPORTED_KINDS,)
+    assert notice.exc_info is None
+
+
+@pytest.mark.parametrize(
+    "test_name",
+    sorted({name for callers in SHARED_LOG_FUNCTIONS.values() for name in callers.values()}),
+)
+def test_the_caller_manifest_names_tests_that_exist(test_name: str) -> None:
+    """The same rule as `COVERED_BY`'s, for the scenarios that drive each caller of a shared site."""
+    assert callable(getattr(sys.modules[__name__], test_name, None))
 
 
 def test_a_session_data_observation_logs_no_cookie_value(

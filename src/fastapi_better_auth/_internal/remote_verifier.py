@@ -172,7 +172,8 @@ class RemoteVerifier:
             loopback. Keyword-only, required.
         csrf: The cross-site request forgery policy. Required, keyword-only, no default.
         transport: The HTTP boundary. Defaults to a `HttpxTransport` built here, so a missing
-            `httpx` stops the application from starting rather than surfacing on the first request.
+            `httpx` stops the application from starting rather than surfacing on the first request;
+            with only `httpx2` installed, pass `Httpx2Transport()`.
         secret: A single `SharedSecret` for the optional local signature pre-check. At most one of
             this and `secrets`; neither is legal.
         secrets: A keyring of `SharedSecret`s for a rotation. At most one of this and `secret`.

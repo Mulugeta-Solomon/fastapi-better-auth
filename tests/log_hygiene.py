@@ -46,7 +46,7 @@ import ast
 import contextlib
 import logging
 import pathlib
-from collections.abc import Generator, Iterator, Mapping
+from collections.abc import Generator, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -217,6 +217,23 @@ COVERED_BY: Mapping[LogSite, str] = {
         ),
     ): "test_a_schema_drift_warning_carries_only_operator_owned_names",
     LogSite(
+        module="diagnostics",
+        level="warning",
+        template=(
+            "session store lookup could not complete (%s, SQLSTATE %s); every lookup failing"
+            " this way answers AuthServiceUnavailable, and this line is not repeated for it until"
+            " a lookup completes [%s]"
+        ),
+    ): "test_a_store_lookup_failure_warning_carries_no_token",
+    LogSite(
+        module="diagnostics",
+        level="warning",
+        template=(
+            "session store lookups are failing in more than %d distinct ways since the last lookup"
+            " that completed; further kinds are not reported until a lookup completes"
+        ),
+    ): "test_the_suppressed_kinds_notice_carries_no_token",
+    LogSite(
         module="cookie_verifier",
         level="warning",
         template=(
@@ -253,6 +270,81 @@ COVERED_BY: Mapping[LogSite, str] = {
 }
 
 
+SHARED_LOG_FUNCTIONS: Mapping[str, Mapping[str, str]] = {
+    "report_once": {
+        "sqlalchemy_store": "test_a_store_lookup_failure_warning_carries_no_token",
+        "cookie_verifier": "test_a_contained_store_failure_warning_carries_no_token",
+    },
+    "lookup_failed": {
+        "outage": "test_a_store_lookup_failure_warning_carries_no_token",
+    },
+    "lookup_kinds_suppressed": {
+        "outage": "test_the_suppressed_kinds_notice_carries_no_token",
+    },
+}
+"""The report path's functions, each calling module, and the scenario that drives it.
+
+`COVERED_BY` keys a *site*, and one site can be reached from two places that hand it different
+material - R47's line takes a store's error in one and a verifier-contained one in the other - so
+each caller is enumerated from `src/` by AST and driven by a scenario of its own (R47a). Both go
+through `outage.report_once`, and the two log functions behind it are pinned to that one caller,
+so nothing can reach either line around the best-effort guard (D-410).
+"""
+
+
+def _called_name(func: ast.expr) -> str | None:
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def callers_of(
+    function: str, trees: Iterable[tuple[str, ast.Module]] | None = None
+) -> frozenset[str]:
+    """Every module in `src/` (or in `trees`) that calls `function`, however it was imported."""
+    return frozenset(
+        module
+        for module, tree in (parsed_src() if trees is None else trees)
+        if _calls(tree, _names_for(tree, function))
+    )
+
+
+def _names_for(tree: ast.Module, function: str) -> frozenset[str]:
+    """Every local name bound to `function`: itself, an `import ... as` alias, and a rebinding.
+
+    A module alias needs nothing here - `d.lookup_failed(...)` is an attribute call on the
+    function's own name. Rebindings are followed to a fixed point, so `a = warn; b = a` counts.
+    """
+    names = {function} | {
+        alias.asname
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if alias.name == function and alias.asname
+    }
+    while True:
+        rebound = {
+            target.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in names
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        if rebound <= names:
+            return frozenset(names)
+        names |= rebound
+
+
+def _calls(tree: ast.Module, names: frozenset[str]) -> bool:
+    return any(
+        isinstance(node, ast.Call) and _called_name(node.func) in names for node in ast.walk(tree)
+    )
+
+
 # ---------------------------------------------------------------- capture and assertion
 
 
@@ -263,6 +355,24 @@ class _Collector(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self._into.append(record)
+
+
+class _BrokenFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        raise RuntimeError("a deployment's log filter is broken")
+
+
+@contextlib.contextmanager
+def broken_log_filter() -> Generator[None, None, None]:
+    """A filter on this library's logger that raises: `Logger.handle` does not contain it, so it
+    is the one way a report can raise out of `logger.warning` itself."""
+    library = logging.getLogger(LIBRARY_LOGGER)
+    broken = _BrokenFilter()
+    library.addFilter(broken)
+    try:
+        yield
+    finally:
+        library.removeFilter(broken)
 
 
 @contextlib.contextmanager

@@ -19,13 +19,16 @@ same reason every case runs through both `FLAVOURS`.
 
 from __future__ import annotations
 
+import itertools
 import json
 import pathlib
+import sqlite3
 import threading
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import pytest
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -287,6 +290,55 @@ class StoreFixture:
                 await engine.dispose()
             else:
                 engine.dispose()
+
+
+class DeniedError(sqlite3.OperationalError):
+    """A driver error carrying a SQLSTATE, where psycopg's own and asyncpg's (as SQLAlchemy
+    adapts it) carry theirs."""
+
+    sqlstate = "42501"
+
+
+class StalledError(sqlite3.OperationalError):
+    """A driver error carrying no SQLSTATE at all, as SQLite's own errors do."""
+
+
+class ForgedStateError(sqlite3.OperationalError):
+    """A `sqlstate` that is not one: five characters and then a forged second log line."""
+
+    sqlstate = "42501\n2026-09-25 CRITICAL forged"
+
+
+class ShiftingStateError(sqlite3.OperationalError):
+    """A driver error whose SQLSTATE is different every time it is read - a new failure kind on
+    every lookup, the shape that would defeat a per-kind latch with no cap on kinds."""
+
+    _states = itertools.count()
+
+    @property
+    def sqlstate(self) -> str:
+        return f"{next(self._states) % 100_000:05d}"
+
+
+class DriverFault:
+    """Makes an engine's driver raise `error` on every statement while one is set.
+
+    Patched at `dialect.do_execute`, inside the `try` SQLAlchemy wraps in a `DBAPIError`, so the
+    store meets exactly what a real refusal gives it: `orig` set, and the bound parameters - the
+    raw token - in `str(exc)`. The driver's own message echoes them too, as some drivers do.
+    """
+
+    def __init__(self, engine: Engine | AsyncEngine, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.error: type[sqlite3.Error] | None = None
+        dialect = (engine.sync_engine if isinstance(engine, AsyncEngine) else engine).dialect
+        original = dialect.do_execute
+
+        def do_execute(cursor: Any, statement: str, parameters: Any, context: Any = None) -> None:
+            if self.error is not None:
+                raise self.error(f"permission denied while matching {parameters!r} ({TOKEN})")
+            original(cursor, statement, parameters, context)
+
+        monkeypatch.setattr(dialect, "do_execute", do_execute)
 
 
 class RecordingRedis:

@@ -1,4 +1,4 @@
-"""The two things a store tells an operator, and the shape that keeps a credential out of both."""
+"""The four things a store tells an operator, and the shape that keeps a credential out of all."""
 
 from __future__ import annotations
 
@@ -23,6 +23,37 @@ def unusable(kind: str, why: str, subject: str) -> None:
         safe_label(kind),
         why,
         fingerprint(subject),
+    )
+
+
+def lookup_failed(driver_error: str, sqlstate: str | None, marker: str) -> None:
+    """A lookup the store could not complete, reported once per kind (R47, R47a).
+
+    Two callers: the SQL stores, for a statement the database refused, and `CookieVerifier`, for
+    anything else a store raised untranslated. Everything on the line is chosen here or by them -
+    a class name, a validated SQLSTATE and the subject's fingerprint (`marker`, never the subject).
+    The error's own text never reaches it: SQLAlchemy puts the bound token there (A1).
+    """
+    logger.warning(
+        "session store lookup could not complete (%s, SQLSTATE %s); every lookup failing"
+        " this way answers AuthServiceUnavailable, and this line is not repeated for it until"
+        " a lookup completes [%s]",
+        safe_label(driver_error),
+        "none" if sqlstate is None else sqlstate,
+        marker,
+    )
+
+
+def lookup_kinds_suppressed(limit: int) -> None:
+    """The one notice that a latch has reached its cap and is holding further kinds back.
+
+    Constant text and one constant number: nothing from the failure that tripped it reaches the
+    line, because the kinds past the cap are exactly the ones this line exists not to report.
+    """
+    logger.warning(
+        "session store lookups are failing in more than %d distinct ways since the last lookup"
+        " that completed; further kinds are not reported until a lookup completes",
+        limit,
     )
 
 

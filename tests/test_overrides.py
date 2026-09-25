@@ -345,3 +345,24 @@ def test_the_override_is_confined_to_the_application_it_was_written_on(
 
     assert answer.status_code == 401
     assert verifier.verify_calls == 1
+
+
+def test_a_key_taken_off_another_instance_overrides_nothing(client_backend: str) -> None:
+    """The application-factory case (#69): memoization is per `BetterAuth`, not per process.
+
+    A factory builds a new `BetterAuth` per application, so a test that takes its key off some
+    other instance - a module-level one left over from before the factory, or the one a second
+    `create_app` call built - writes a key the routes do not hold. It fails closed: the route
+    verifies for real and a forged credential is still a 401.
+    """
+    verifier, auth = one_verifier()
+    _, other = one_verifier()
+    app = read_session(auth)
+    app.dependency_overrides[other.current_session(user_model=Member)] = fake_session_of("editor")
+
+    with client(app, client_backend) as http:
+        answer = http.get("/me", headers={HEADER: BAD_CREDENTIAL})
+
+    assert answer.status_code == 401
+    assert answer.json() == UNAUTHENTICATED
+    assert verifier.verify_calls == 1

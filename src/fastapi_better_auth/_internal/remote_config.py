@@ -14,7 +14,7 @@ from typing import cast
 
 from .cookie_verifier import ILLEGAL_IN_A_COOKIE_NAME
 from .errors import ConfigurationError
-from .httpx_transports import HttpxTransport
+from .httpx_transports import default_transport, usable_default
 from .negative_cache import (
     MAX_NEGATIVE_TTL,
     MAX_REMEMBERED,
@@ -29,6 +29,7 @@ MIN_CONCURRENCY = 1
 MAX_CONCURRENCY = 256
 QUEUE_TIMEOUT = 2.0
 MIN_QUEUE_TIMEOUT = 0.1
+VERIFIER = "RemoteVerifier"
 
 _BASE_PATH_MESSAGE = (
     "RemoteVerifier(base_path=...) must be the path Better Auth is mounted at, starting with '/'"
@@ -39,7 +40,7 @@ _BASE_PATH_MESSAGE = (
 
 def validated_transport(transport: object) -> Transport:
     if transport is None:
-        return HttpxTransport()
+        return usable_default(default_transport(VERIFIER), VERIFIER)
     if not isinstance(transport, Transport):
         raise ConfigurationError(
             f"RemoteVerifier(transport=...) is a {type(transport).__name__}, which does not"
