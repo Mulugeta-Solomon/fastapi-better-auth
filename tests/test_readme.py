@@ -29,6 +29,7 @@ import json
 import pathlib
 import re
 import sys
+import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple, cast
@@ -43,7 +44,19 @@ from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 import fastapi_better_auth
-from fastapi_better_auth import BetterAuth, Session, SessionError, SharedSecret, User
+from fastapi_better_auth import (
+    BetterAuth,
+    CookieVerifier,
+    OriginCheck,
+    Session,
+    SessionError,
+    SharedSecret,
+    User,
+)
+from tests.cookies import COOKIE, FakeStore, sign, stored_session
+from tests.cookies import SECRET as COOKIE_SECRET
+from tests.cookies import http as cookie_request
+from tests.cookies import run as run_cookie_mode
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
@@ -605,8 +618,16 @@ SESSION_FACTS = "## What a verified session carries"
 FORWARD = "revoke_upstream"
 FORWARDED_NAME = "__Secure-better-auth.session_token"
 FORWARDED_VALUE = "forwarded-session-token.c2lnbmF0dXJl%2Bc2lnbmF0dXJl%3D"
-"""The value as a verifier accepted it: still percent-encoded, so the recipe must not decode it."""
 FORWARDED_TOKEN = "forwarded-session-token"
+RECIPE_ORIGINS = (ALLOWED_ORIGIN, "https://admin.example.com", "http://localhost:5173")
+"""The allowlist a real verifier admits the forwarded sessions under. More than one entry, so a
+recipe that sent any one literal would send the wrong `Origin` for every other position."""
+ADMITTED_TOKEN = "Kd7Qm2Xv9Lp4Rt1Yw6Nb3Hs8Cj5Fg0Az"
+ADMITTED_COOKIE = urllib.parse.quote(sign(ADMITTED_TOKEN), safe="")
+"""The browser's cookie as Better Auth sets it, percent-encoded - a recipe that decoded it would
+forward something the verifier never accepted."""
+EXPECTED_COOKIE = SecretStr(f"{COOKIE}={ADMITTED_COOKIE}")
+EXPECTED_TOKEN = SecretStr(ADMITTED_TOKEN)
 
 Forward = Callable[[httpx.AsyncClient, Session[User], SecretStr], Awaitable[httpx.Response | None]]
 
@@ -646,18 +667,57 @@ async def forwarded(session: Session[User]) -> tuple[httpx.Response | None, list
     return response, sent
 
 
-def test_the_forwarding_recipe_sends_exactly_what_revoke_session_reads() -> None:
-    """The cookie as accepted, the matched origin, and `{token}` - nothing re-read, nothing more."""
-    answer, sent = anyio.run(forwarded, verified())
+async def admitted_at(position: int) -> Session[User]:
+    """The session a real `CookieVerifier` builds for a POST from `RECIPE_ORIGINS[position]`."""
+    built = CookieVerifier(
+        secret=COOKIE_SECRET,
+        store=FakeStore(sessions={ADMITTED_TOKEN: stored_session(ADMITTED_TOKEN)}),
+        csrf=OriginCheck(allowed_origins=list(RECIPE_ORIGINS)),
+        secure_cookies=False,
+    )
+    connection = cookie_request(
+        "POST", cookie=f"{COOKIE}={ADMITTED_COOKIE}", origin=RECIPE_ORIGINS[position]
+    )
+    session = await run_cookie_mode(built, connection)
+    assert session is not None
+    return session
 
+
+async def admitted_and_forwarded(
+    position: int,
+) -> tuple[Session[User], httpx.Response | None, list[httpx.Request]]:
+    session = await admitted_at(position)
+    answer, sent = await forwarded(session)
+    return session, answer, sent
+
+
+def secrets_sent(request: httpx.Request) -> tuple[SecretStr, list[str], SecretStr]:
+    """The forwarded cookie, the body's keys and its token - the two credentials masked, so a
+    failing comparison renders `**********` rather than either value."""
+    body = json.loads(request.content)
+    return SecretStr(request.headers["cookie"]), sorted(body), SecretStr(body["token"])
+
+
+@pytest.mark.parametrize("position", range(len(RECIPE_ORIGINS)), ids=RECIPE_ORIGINS)
+def test_the_forwarding_recipe_sends_what_revoke_session_reads(position: int) -> None:
+    """The cookie as accepted, the `Origin` the request matched, and `{token}` - nothing re-read.
+
+    The session comes from a real verifier over a multi-entry allowlist, one request per entry,
+    so a recipe that forwarded a literal instead of `session.origin` is wrong at every position
+    but one.
+    """
+    session, answer, sent = anyio.run(admitted_and_forwarded, position)
+
+    assert session.origin == RECIPE_ORIGINS[position], "the verifier matched another entry"
     assert answer is not None and answer.status_code == 200
     (request,) = sent
     assert request.method == "POST"
     assert str(request.url) == f"{BASE_URL}/api/auth/revoke-session"
-    assert SecretStr(request.headers["cookie"]) == SecretStr(f"{FORWARDED_NAME}={FORWARDED_VALUE}")
-    assert request.headers["origin"] == ALLOWED_ORIGIN
-    assert sorted(json.loads(request.content)) == ["token"]
-    assert SecretStr(json.loads(request.content)["token"]) == SecretStr(FORWARDED_TOKEN)
+    assert request.headers["origin"] == RECIPE_ORIGINS[position]
+    cookie, keys, token = secrets_sent(request)
+    assert cookie == EXPECTED_COOKIE
+    assert keys == ["token"]
+    assert token == EXPECTED_TOKEN
 
 
 @pytest.mark.parametrize(

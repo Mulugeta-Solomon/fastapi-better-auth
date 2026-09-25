@@ -81,9 +81,8 @@ def base_user() -> User:
 
 
 def live_row_without_an_id() -> dict[str, Any]:
-    """A session row that has not expired and has no id. Built here so no test local holds its
-    token."""
-    return {**SESSION_ROW, "id": None, "expiresAt": FAR_FUTURE}
+    """The seeded (live) session row with no id. Built here so no test local holds its token."""
+    return {**SESSION_ROW, "id": None}
 
 
 def upstream_with_id(value: object) -> dict[str, Any]:
@@ -213,19 +212,35 @@ class TestTheSqlStore:
         assert all(TOKEN not in message for message in messages)
 
     @pytest.mark.anyio
+    async def test_the_seeded_row_verifies_and_its_id_is_the_session_id(
+        self, sql: StoreFixture
+    ) -> None:
+        """The shared fixture row is a live session, so a test that drives it through a verifier
+        is refused only for the reason it plants - never for an expiry nobody chose."""
+        store, _log = sql()
+
+        session = await run(sql_verifier(store), http(cookie=f"{COOKIE}={sign(TOKEN)}"))
+
+        assert session is not None
+        assert session.id == SESSION_ID
+
+    @pytest.mark.anyio
     async def test_through_the_verifier_that_row_is_the_uniform_401(
         self, sql: StoreFixture
     ) -> None:
         store, _log = sql(sessions=(live_row_without_an_id(),), relax_session_columns=("id",))
-        guarded = CookieVerifier(
-            secret=SECRET,
-            store=store,
-            csrf=CsrfDisabled(reason="this suite is about the stored session id"),
-            secure_cookies=False,
-        )
 
         with pytest.raises(SessionRevoked):
-            await run(guarded, http(cookie=f"{COOKIE}={sign(TOKEN)}"))
+            await run(sql_verifier(store), http(cookie=f"{COOKIE}={sign(TOKEN)}"))
+
+
+def sql_verifier(store: Any) -> CookieVerifier:
+    return CookieVerifier(
+        secret=SECRET,
+        store=store,
+        csrf=CsrfDisabled(reason="this suite is about the stored session id"),
+        secure_cookies=False,
+    )
 
 
 # ---------------------------------------------------------------- the document: optional

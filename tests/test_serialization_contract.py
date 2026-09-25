@@ -21,6 +21,7 @@ from pydantic import SecretStr
 from fastapi_better_auth import Session, User
 
 SECRET_TOKEN = "raw-session-token-9f3ab21ce4"
+EXPECTED_TOKEN = SecretStr(SECRET_TOKEN)
 RAW_MARKER = "203.0.113.7"
 MASK = "**********"
 IMPERSONATOR = "admin-9f3ab21c"
@@ -120,7 +121,12 @@ def test_the_secret_is_still_reachable_on_purpose() -> None:
     token = a_session().token
 
     assert token is not None
-    assert token.get_secret_value() == SECRET_TOKEN
+    assert reveals(token, EXPECTED_TOKEN)
+
+
+def reveals(secret: SecretStr, expected: SecretStr) -> bool:
+    """`.get_secret_value()` reads the value back; compared here so a failure renders masks."""
+    return secret.get_secret_value() == expected.get_secret_value()
 
 
 def test_a_route_returning_a_session_leaks_neither_token_nor_raw() -> None:

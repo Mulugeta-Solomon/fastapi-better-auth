@@ -21,7 +21,6 @@ from typing import Any
 import pytest
 from fastapi import Depends, FastAPI
 from fastapi.encoders import jsonable_encoder
-from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from fastapi_better_auth import (
@@ -35,6 +34,7 @@ from fastapi_better_auth import (
 )
 from tests import remote_fixtures as remote
 from tests.cookies import CAPTURED_TOKEN, FakeStore, run, sign, stored_session, verifier
+from tests.fakes import client
 from tests.jwt_fixtures import SIGNER, build
 from tests.tokens import claims
 from tests.transports import json_reply
@@ -94,6 +94,16 @@ async def accepted_by(built: CookieVerifier | RemoteVerifier, *cookies: str) -> 
     return session
 
 
+def forwarded_cookies(transport: remote.RecordingTransport) -> list[SecretStr]:
+    """Each `cookie:` header Mode C sent upstream, masked, so a mismatch renders no value."""
+    return [SecretStr((sent or {})["cookie"]) for sent in transport.sent]
+
+
+def header_for(pair: tuple[str, SecretStr]) -> SecretStr:
+    """`Session.cookie` as the `Cookie: {name}={value}` it forwards as, masked."""
+    return SecretStr(f"{pair[0]}={pair[1].get_secret_value()}")
+
+
 def blank_beside_the_real_one(where: str) -> tuple[str, str]:
     """Two `Cookie` lines: a planted blank, and the real cookie, in the order asked for."""
     lines = (f"{PLAIN}=", f"{PLAIN}={ENCODED}")
@@ -142,7 +152,9 @@ class TestTheField:
         assert dumped == (PLAIN, ACCEPTED)
         assert isinstance(dumped[1], SecretStr)
 
-    def test_a_route_that_returns_the_session_serves_only_the_mask(self) -> None:
+    def test_a_route_that_returns_the_session_serves_only_the_mask(
+        self, client_backend: str
+    ) -> None:
         auth = BetterAuth(verifiers=[mode_a()])
         app = FastAPI()
         required = auth.current_session()
@@ -151,8 +163,8 @@ class TestTheField:
             return session
 
         app.add_api_route("/echo", echo, methods=["GET"])
-        with TestClient(app) as client:
-            served = client.get("/echo", headers={"Cookie": f"{PLAIN}={ENCODED}"})
+        with client(app, client_backend) as browser:
+            served = browser.get("/echo", headers={"Cookie": f"{PLAIN}={ENCODED}"})
 
         assert served.status_code == 200
         assert served.json()["cookie"] == [PLAIN, MASK]
@@ -266,9 +278,7 @@ class TestTheAcceptedPair:
 
         assert session.cookie is not None
         assert [sorted(sent or {}) for sent in transport.sent] == [["accept", "cookie"]]
-        assert [SecretStr((sent or {})["cookie"]) for sent in transport.sent] == [
-            SecretStr(f"{session.cookie[0]}={session.cookie[1].get_secret_value()}")
-        ]
+        assert forwarded_cookies(transport) == [header_for(session.cookie)]
 
 
 class TestModeB:

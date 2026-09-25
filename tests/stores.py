@@ -26,7 +26,7 @@ import pathlib
 import sqlite3
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, cast
 
 import aiosqlite
@@ -37,7 +37,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from fastapi_better_auth import SqlAlchemySessionStore, SyncStoreAdapter
 
 NOW = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
-EXPIRES_AT = NOW + timedelta(days=7)
+EXPIRES_AT = datetime(2999, 1, 1, 12, 0, tzinfo=timezone.utc)
+"""Far in the future on purpose: a seeded row is a live session, so a test that drives it through
+a verifier is refused only for the reason it plants. A week after `NOW` went stale on 2026-09-05."""
 
 TOKEN = "wBNhqX3M2CKkT7bmDTmeEMA1S1qCcWnn"
 SESSION_ID = "QOzpVhyGW3v9C3i0m5xB4Xgyby1adidd"

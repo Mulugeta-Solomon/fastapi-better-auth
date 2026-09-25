@@ -124,7 +124,8 @@ class TestFetchSessionByToken:
         answers a naive ISO string; `as_moment` still reads it as UTC. Reachable, so pinned - the
         alternative reading (leave it naive) would fail `StoredSession`'s aware-only contract."""
         # Same instant as EXPIRES_AT, but written without the trailing `Z` fromisoformat needs.
-        value = stored(session=wire_session(expiresAt="2026-09-05T12:00:00.000"))
+        naive = EXPIRES_AT.replace(tzinfo=None).isoformat(timespec="milliseconds")
+        value = stored(session=wire_session(expiresAt=naive))
         store, _client = store_over(**{TOKEN: value})
 
         record = await store.fetch_session_by_token(TOKEN)
