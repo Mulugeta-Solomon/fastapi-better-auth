@@ -62,13 +62,33 @@ header at all, because Better Auth never emits one and no extension is supported
   name together let a sibling subdomain plant the *other* name and be authenticated as itself, a
   cross-name session fixation. Prefer `secure_prefix="__Host-"` where you can harden Better Auth to
   emit `__Host-` cookies — `__Host-` is the only prefix a sibling subdomain cannot set; `__Secure-`
-  does not stop one. The residual same-name risk is bounded: CSRF is required in cookie mode and
-  covers every state-changing request, so a planted same-name cookie is at worst a read-only
-  exposure or the duplicate-cookie lockout below, never a silent takeover of writes.
-- **Duplicate session cookies are refused, not resolved.** A sibling subdomain that plants a
-  cookie of the same name locks the victim out of this API until that cookie is gone — a denial
-  of service, never a login as someone else. Better Auth uses the `__Secure-` prefix, which does
-  not prevent this; only a `__Host-` cookie would, and that is an upstream choice.
+  does not stop one.
+- **A planted same-name cookie can sign a signed-out victim in as the attacker, and CSRF does not
+  stop it.** CSRF is required in cookie mode: `OriginCheck` and `SignedDoubleSubmit` check every
+  unsafe method and WebSocket handshake on a request that reaches a cookie verifier — a route that
+  depends on a session dependency, carrying that verifier's cookie (README, *Where the CSRF check
+  runs*). A route that changes state on a `GET`, or one no verifier runs for, is outside that
+  check. And the check does not help against this attack. A sibling that plants the attacker's own
+  signed session under the name this side reads makes a signed-out victim's browser present it, so
+  the victim's writes through your real front end arrive from an allowed `Origin`, verify, and land
+  in the attacker's account, where the attacker can read them: login CSRF. The signature is no
+  defence, because the cookie is a genuine one replayed (RFC 6265bis §8.6). Nor is
+  `SignedDoubleSubmit`: its token is bound to whichever session the request carries
+  (`SignedDoubleSubmit.token_for`), so a front end that mints it from a session-gated route mints
+  it for the planted session. The same holds for a signed-in victim whose own cookie is
+  `Domain`-scoped, as `crossSubDomainCookies` makes it, because a sibling server's `Set-Cookie`
+  with the same name, domain, host-only flag and path replaces that cookie outright (RFC 6265bis
+  §5.7 step 23); both cookies are `Domain`-scoped, so the flag matches too.
+  What bounds it is the cookie's name: a `__Host-` cookie is host-only (RFC 6265bis §4.1.3.2, §5.7
+  step 21), so a sibling cannot set one for this API's host. Under `secure_prefix="__Host-"` a
+  planted `__Secure-` cookie is not the one read: a signed-out victim's request is anonymous, and a
+  signed-in victim's own cookie is the only one that counts.
+- **Duplicate session cookies are refused, not resolved.** A planted cookie that arrives *beside*
+  the victim's own — a host-only cookie, which a sibling's `Domain`-scoped one cannot replace —
+  puts the name on the request twice, and the request is refused. The victim is locked out of this
+  API until that cookie is gone: a denial of service rather than a login as someone else. Better
+  Auth uses the `__Secure-` prefix, which does not prevent this; only a `__Host-` cookie would, and
+  that is an upstream choice.
 - **A wrong shared secret that is well *shaped* stays invisible until a request fails.**
   `SharedSecret` refuses what it can see is unusable — empty, whitespace-edged, a known placeholder,
   under 32 characters, a short repetition — but nothing on this side can know whether a validly

@@ -316,8 +316,8 @@ class SignedDoubleSubmit:
     """`OriginCheck`, plus a header carrying a token bound to this very session.
 
     For deployments that cannot rely on `Origin` alone - a front end and an API on sibling
-    subdomains with `SameSite=None` cookies, where a compromised sibling is inside the origin
-    story:
+    subdomains, where every sibling's requests are same-site and so carry the cookie whatever its
+    `SameSite` says, and a compromised sibling is inside the origin story:
 
         csrf = SignedDoubleSubmit(
             secret=SharedSecret(os.environ["BETTER_AUTH_SECRET"]),
