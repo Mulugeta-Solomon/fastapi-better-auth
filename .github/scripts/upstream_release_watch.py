@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 REGISTRY_URL = "https://registry.npmjs.org/better-auth"
 USER_AGENT = "fastapi-better-auth-bridge-canary"
@@ -66,7 +66,7 @@ def fetch_packument(url: str, timeout: float, attempts: int) -> dict[str, Any]:
             continue
         if not isinstance(document, dict):
             fail(f"{url} returned a JSON {type(document).__name__}, not an object")
-        return document
+        return cast("dict[str, Any]", document)
     fail(f"{url} could not be read in {attempts} attempts: {last_error}")
 
 
@@ -85,7 +85,7 @@ def latest_release(document: dict[str, Any]) -> tuple[str, dt.datetime]:
     tags = document.get("dist-tags")
     if not isinstance(tags, dict):
         fail("registry document carries no dist-tags object")
-    latest = tags.get("latest")
+    latest = cast("dict[str, object]", tags).get("latest")
     if not isinstance(latest, str) or not latest:
         fail("registry dist-tags carries no latest version")
     # Everything downstream - annotations, the summary, step outputs - embeds this string.
@@ -94,7 +94,7 @@ def latest_release(document: dict[str, Any]) -> tuple[str, dt.datetime]:
     times = document.get("time")
     if not isinstance(times, dict):
         fail("registry document carries no time map")
-    published = times.get(latest)
+    published = cast("dict[str, object]", times).get(latest)
     if not isinstance(published, str) or not published:
         fail(f"registry time map carries no publish timestamp for {latest}")
     return latest, parse_timestamp(published)

@@ -45,7 +45,7 @@ jobs:
           python-version: "3.13"
       - name: Sync (dev group)
         run: uv sync
-      - name: Pyright (strict, src + tests)
+      - name: Pyright (strict, src + tests + .github/scripts)
         run: uv run pyright
 
   os:
