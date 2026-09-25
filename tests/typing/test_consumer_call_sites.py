@@ -19,8 +19,9 @@ nothing ever loads.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 import pytest
@@ -32,8 +33,11 @@ from fastapi_better_auth import (
     AdminUser,
     AuthorizationRefused,
     BetterAuth,
+    CookieVerifier,
+    CsrfDisabled,
     JwtVerifier,
     Membership,
+    RemoteVerifier,
     Session,
     SessionError,
     SharedSecret,
@@ -42,6 +46,7 @@ from fastapi_better_auth import (
     normalize_base_url,
     parse_user,
 )
+from tests.cookies import FakeStore
 from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, client
 
 HEADER = "x-cred-a"
@@ -248,6 +253,25 @@ def read_the_secret_types() -> None:
     assert_type(secret.get_secret_value(), SecretStr)  # pyright: ignore[reportAssertTypeFailure]
 
 
+def moved(minutes: int = 31) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(minutes=minutes)
+
+
+def read_the_clock_types() -> None:
+    """`now=` is the wall clock and `clock=` the monotonic one: each refuses the other's shape."""
+    policy = CsrfDisabled(reason="typing call sites, no request is verified")
+    secret = SharedSecret(SECRET)
+    origin = "https://auth.example.com"
+
+    assert_type(
+        CookieVerifier(secret=secret, store=FakeStore(), csrf=policy, now=moved), CookieVerifier
+    )
+    assert_type(RemoteVerifier(base_url=origin, csrf=policy, now=moved), RemoteVerifier)
+    CookieVerifier(secret=secret, store=FakeStore(), csrf=policy, now=time.monotonic)  # pyright: ignore[reportArgumentType]
+    RemoteVerifier(base_url=origin, csrf=policy, now=time.monotonic)  # pyright: ignore[reportArgumentType]
+    RemoteVerifier(base_url=origin, csrf=policy, clock=moved)  # pyright: ignore[reportArgumentType]
+
+
 # --- the routes are real ------------------------------------------------------------------
 
 app = FastAPI()
@@ -314,3 +338,4 @@ def test_the_surrounding_types_are_exercised_too() -> None:
     assert takes_a_base_session(admin) == "u1"
     read_the_admin_user_types(admin)
     read_the_secret_types()
+    read_the_clock_types()

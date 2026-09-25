@@ -36,14 +36,23 @@ from tests.wall_clock import INSTANT, freeze_wall_clock, wire
 MILLISECOND = timedelta(milliseconds=1)
 
 
-def answering(body: dict[str, Any]) -> RecordingTransport:
-    return RecordingTransport(json_reply(body))
+def upstream(**fields: Any) -> RecordingTransport:
+    """A get-session answer carrying `document(**fields)`. The document carries the session token,
+    so it is built here, inline, and no frame in this file ever binds it."""
+    return RecordingTransport(json_reply(document(**fields)))
+
+
+def without_ban_fields() -> RecordingTransport:
+    """A deployment with no admin plugin: the user carries no ban fields at all."""
+    return RecordingTransport(
+        json_reply({**document(), "user": {"id": USER_ID, "email": "seed@example.com"}})
+    )
 
 
 class TestExpiry:
     @pytest.mark.anyio
     async def test_an_expired_session_is_refused(self) -> None:
-        transport = answering(document(expires=FAR_PAST))
+        transport = upstream(expires=FAR_PAST)
 
         with pytest.raises(SessionExpired) as caught:
             await run(verifier(transport), with_cookie())
@@ -57,7 +66,7 @@ class TestExpiry:
     ) -> None:
         """`expiresAt <= now`: a session expiring at EXACTLY the check instant is expired."""
         freeze_wall_clock(monkeypatch)
-        transport = answering(document(expires=wire(INSTANT)))
+        transport = upstream(expires=wire(INSTANT))
 
         with pytest.raises(SessionExpired):
             await run(verifier(transport), with_cookie())
@@ -67,7 +76,7 @@ class TestExpiry:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         freeze_wall_clock(monkeypatch)
-        transport = answering(document(expires=wire(INSTANT + MILLISECOND)))
+        transport = upstream(expires=wire(INSTANT + MILLISECOND))
 
         session = await run(verifier(transport), with_cookie())
 
@@ -80,7 +89,7 @@ class TestBans:
     @pytest.mark.anyio
     @pytest.mark.parametrize("ban_expires", [None, FAR_FUTURE], ids=["permanent", "not-yet-lapsed"])
     async def test_a_banned_user_is_refused(self, ban_expires: str | None) -> None:
-        transport = answering(document(banned=True, banExpires=ban_expires))
+        transport = upstream(banned=True, banExpires=ban_expires)
 
         with pytest.raises(SessionRevoked) as caught:
             await run(verifier(transport), with_cookie())
@@ -96,7 +105,7 @@ class TestBans:
     async def test_an_unbanned_or_lapsed_user_is_let_through(
         self, banned: bool | None, ban_expires: str | None
     ) -> None:
-        transport = answering(document(banned=banned, banExpires=ban_expires))
+        transport = upstream(banned=banned, banExpires=ban_expires)
 
         session = await run(verifier(transport), with_cookie())
 
@@ -106,10 +115,7 @@ class TestBans:
     @pytest.mark.anyio
     async def test_a_user_with_no_ban_fields_at_all_is_let_through(self) -> None:
         """No admin plugin, no ban columns: `banned` is unknown, which is not banned."""
-        body = document()
-        del body["user"]["banned"], body["user"]["banExpires"]
-
-        session = await run(verifier(answering(body)), with_cookie())
+        session = await run(verifier(without_ban_fields()), with_cookie())
 
         assert session is not None
 
@@ -119,7 +125,7 @@ class TestBans:
     ) -> None:
         """`banExpires <= now` has lapsed, the boundary included - the same `<=` as expiry."""
         freeze_wall_clock(monkeypatch)
-        transport = answering(document(banned=True, banExpires=wire(INSTANT)))
+        transport = upstream(banned=True, banExpires=wire(INSTANT))
 
         session = await run(verifier(transport), with_cookie())
 
@@ -130,7 +136,7 @@ class TestBans:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         freeze_wall_clock(monkeypatch)
-        transport = answering(document(banned=True, banExpires=wire(INSTANT + MILLISECOND)))
+        transport = upstream(banned=True, banExpires=wire(INSTANT + MILLISECOND))
 
         with pytest.raises(SessionRevoked):
             await run(verifier(transport), with_cookie())

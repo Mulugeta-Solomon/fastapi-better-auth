@@ -40,6 +40,7 @@ from __future__ import annotations
 import hmac
 import time
 from collections.abc import Callable, Sequence
+from datetime import datetime
 from typing import Any, TypeVar, cast
 
 import anyio
@@ -70,7 +71,7 @@ from .models import Session, User
 from .negative_cache import MAX_REMEMBERED_MISSES, NEGATIVE_TTL, NegativeCache
 from .parsing import parse_user
 from .reasons import fingerprint
-from .refusal_clock import check_ban, check_expiry
+from .refusal_clock import RefusalClock, check_ban, check_expiry
 from .remote_backoff import BackoffLatch
 from .remote_config import (
     MAX_OUTBOUND_CONCURRENCY,
@@ -202,7 +203,18 @@ class RemoteVerifier:
             request. Either way it reads only whether a `set-cookie` came back, never its value,
             and never replays a real credential.
         clock: A monotonic clock, injected so the cache TTL, the backoff latch and the probe-retry
-            window are testable without sleeping.
+            window are testable without sleeping. It never decides a refusal; `now` does.
+        now: The wall clock the expiry and ban checks read, for a test to move; `None`, the
+            default, is the real time. Not `clock`: that one counts monotonic seconds for caches
+            and back-off, while this one is a date and decides only the two refusals. A callable
+            returning an aware `datetime`, read once per check, which can only make this verifier
+            stricter: expiry is checked against the later of the real time and `now()`, a ban's
+            lapse against the earlier. Moving it forward expires sessions sooner, moving it back
+            changes nothing, and it never shortens a ban - so left wired in production, the worst
+            it can do is expire sessions early. For the same reason it cannot show a ban lapsing:
+            have upstream answer a past `banExpires` for that. A `now()` that raises, or returns
+            anything but an aware `datetime`, refuses the request (the uniform 401, with the
+            exception logged at ERROR).
 
     Raises:
         ConfigurationError: For any unusable configuration, at construction: a `base_url` that is
@@ -211,7 +223,7 @@ class RemoteVerifier:
             `cookie_name`/`secure_prefix`, a non-bool `secure_cookies` or `refuse_unsigned_bearer`,
             a malformed `base_path`, a
             `concurrency`/`queue_timeout`/`negative_ttl`/`max_remembered`/`max_bytes` out of range,
-            or a non-callable `clock`.
+            a non-callable `clock`, or a `now` that is neither `None` nor callable.
     """
 
     def __init__(
@@ -233,6 +245,7 @@ class RemoteVerifier:
         max_bytes: int = MAX_SESSION_BYTES,
         refuse_unsigned_bearer: bool = False,
         clock: Callable[[], float] = time.monotonic,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self._origin = normalize_base_url(base_url)
         self._csrf = validated_policy(csrf, where="RemoteVerifier(csrf=...)")
@@ -253,6 +266,7 @@ class RemoteVerifier:
         self._max_bytes = validated_cap(max_bytes)
         self._refuse_unsigned_bearer = validated_refuse_unsigned_bearer(refuse_unsigned_bearer)
         self._clock = validated_clock(clock)
+        self._refusal_clock = RefusalClock(now, owner="RemoteVerifier")
         self._uri = f"{self._origin}{self._base_path}{GET_SESSION_PATH}{GET_SESSION_QUERY}"
         self.credential_source = cookie_source(self._base)
         self._cache = NegativeCache(
@@ -616,8 +630,8 @@ class RemoteVerifier:
                 raise InvalidCredential(
                     reason=f"upstream answered a session naming a different token [{marker}]"
                 )
-            check_expiry(record, marker, subject=UPSTREAM_SESSION)
-            check_ban(stored, marker)
+            check_expiry(record, marker, self._refusal_clock, subject=UPSTREAM_SESSION)
+            check_ban(stored, marker, self._refusal_clock)
             return _build_session(record, stored, token, user_model)
         finally:
             token = ""
