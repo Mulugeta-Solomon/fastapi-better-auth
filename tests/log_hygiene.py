@@ -189,6 +189,11 @@ COVERED_BY: Mapping[LogSite, str] = {
         template="the %s raised",
     ): "test_an_escaped_authorization_callback_logs_no_credential",
     LogSite(
+        module="authz",
+        level="error",
+        template="the %s refused with %s, but %s; answered as the uniform refusal",
+    ): "test_a_refusal_the_gate_will_not_honour_logs_no_header_no_detail_and_no_credential",
+    LogSite(
         module="jwks",
         level="warning",
         template="jwks refresh failed for %s; serving the key set on hand",

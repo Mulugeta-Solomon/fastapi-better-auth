@@ -22,6 +22,7 @@ from .errors import (
     MissingCredential,
     SessionError,
 )
+from .labels import collision_key
 from .models import Session, User
 from .openapi import declaring, schemes_for
 from .verifiers import PreparedVerifier, Verifier
@@ -129,7 +130,8 @@ class BetterAuth:
             exists: the sequence is empty or is not a sequence; an entry does not implement
             `Verifier`, has a non-callable `extract`/`verify`, declares an `async def extract`,
             or declares a blank `credential_source`; the same verifier appears twice; two
-            verifiers declare the same `credential_source`, so every request carrying it would
+            verifiers declare the same `credential_source` - or cookie labels naming one cookie
+            plain and behind `__Secure-` or `__Host-` - so every request carrying it would
             be ambiguous; or two `credential_source` labels would be published under one
             OpenAPI security-scheme name, where one definition would silently replace the
             other.
@@ -370,7 +372,9 @@ class BetterAuth:
         **A predicate that raises fails closed.** The traceback is logged and the request is
         answered `NotAuthorized`, because a `500` is the one request-time answer a client can
         tell apart from every other. A `SessionError` or a `BetterAuthError` the predicate
-        raised on purpose is re-raised as itself, so a refusal you chose keeps its own shape.
+        raised on purpose is re-raised as itself, so a refusal you chose keeps its own shape -
+        and an `AuthorizationRefused` reaches the client with the status and body you built it
+        with, which is how a rule explains why it refused.
 
         Args:
             predicate: A synchronous callable taking the `Session` and answering `True` to
@@ -392,6 +396,7 @@ class BetterAuth:
                 being called; at request time, if `predicate` answers with an awaitable.
             NotAuthorized: At request time, when the predicate does not answer `True`, or
                 raises anything this library does not honour.
+            AuthorizationRefused: At request time, when the predicate raises one on purpose.
         """
         current = self.current_session(user_model=user_model)
         built = require_dependency(current, predicate, reason)
@@ -433,7 +438,9 @@ class BetterAuth:
 
         **Membership is your query.** This library owns no database, so `member` is a coroutine
         you write; whatever it returns other than `None` or `False` is the grant - a role, a
-        row, a set of scopes - and it reaches the route on `Membership.grant`, typed.
+        row, a set of scopes - and it reaches the route on `Membership.grant`, typed. To refuse
+        with a body that explains - naming what the user does cover, from the rows you just
+        read - raise an `AuthorizationRefused` from `member`; it reaches the client as built.
 
         Build it once at module level, like `require`. Composed on
         `current_session(user_model=...)`, so authentication happens first and exactly once.
@@ -461,6 +468,7 @@ class BetterAuth:
             NotAuthorized: At request time, when the resource id is not a usable identifier,
                 when `member` answers `None` or `False`, or when it raises anything this
                 library does not honour.
+            AuthorizationRefused: At request time, when `member` raises one on purpose.
         """
         current = self.current_session(user_model=user_model)
         built = membership_dependency(current, id_param, member, reason)
@@ -541,7 +549,15 @@ def _extracted(verifier: Verifier, connection: HTTPConnection) -> object | None:
     except BetterAuthError:
         raise
     except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-        raise _resolved(exc, verifier, "extract", (BetterAuthError,)) from None
+        failure = _resolved(exc, verifier, "extract", (BetterAuthError,))
+    else:
+        return _presence(credential, verifier)
+    # Decided inside the handler (so _contained logs the escape), raised outside it: raised in
+    # there, even `from None` keeps the verifier's exception - and what it quotes - on __context__.
+    raise failure from None
+
+
+def _presence(credential: object, verifier: Verifier) -> object | None:
     if inspect.isawaitable(credential):
         if inspect.iscoroutine(credential):
             credential.close()
@@ -559,17 +575,19 @@ async def _verified(verifier: Verifier, credential: object, user_model: type[Use
     # in a parameter: a parameter is a frame local, and a locals-capturing reporter reads it
     # (D-094, D-180). Scrubbed in `finally`, so no path can skip it.
     try:
-        answer = verifier.verify(credential, user_model)
-        if not inspect.isawaitable(answer):
-            raise ConfigurationError(
-                f"{type(verifier).__name__}.verify() did not return an awaitable. Declare it"
-                " with `async def`."
-            )
-        return await answer
-    except (BetterAuthError, SessionError):
-        raise
-    except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-        raise _resolved(exc, verifier, "verify", (BetterAuthError, SessionError)) from None
+        try:
+            answer = verifier.verify(credential, user_model)
+            if not inspect.isawaitable(answer):
+                raise ConfigurationError(
+                    f"{type(verifier).__name__}.verify() did not return an awaitable. Declare"
+                    " it with `async def`."
+                )
+            return await answer
+        except (BetterAuthError, SessionError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
+            failure = _resolved(exc, verifier, "verify", (BetterAuthError, SessionError))
+        raise failure from None  # outside the handler, as in `_extracted`
     finally:
         credential = None
 
@@ -678,15 +696,16 @@ def _validated(verifiers: object) -> tuple[Verifier, ...]:
 
 def _reject_collision(verifier: Verifier, seen: Sequence[Verifier]) -> None:
     """Two *different* verifiers reading one credential — what identity cannot see."""
-    source = verifier.credential_source.strip().casefold()
-    clash = next((s for s in seen if s.credential_source.strip().casefold() == source), None)
+    key = collision_key(verifier.credential_source)
+    clash = next((s for s in seen if collision_key(s.credential_source) == key), None)
     if clash is None:
         return
     raise ConfigurationError(
         f"BetterAuth(verifiers=...) has two verifiers on one credential:"
-        f" {type(clash).__name__} and {type(verifier).__name__} both declare"
-        f" credential_source={verifier.credential_source!r}. Both would find it, so every"
-        " request carrying that credential would be ambiguous."
+        f" {type(clash).__name__} declares credential_source={clash.credential_source!r} and"
+        f" {type(verifier).__name__} declares credential_source={verifier.credential_source!r}."
+        " Both would find it (a cookie and its __Secure- or __Host- form count as one), so"
+        " every request carrying it would be ambiguous."
     )
 
 

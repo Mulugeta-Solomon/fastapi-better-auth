@@ -20,6 +20,7 @@ from ._internal.csrf import (
 from ._internal.errors import (
     BEARER_CHALLENGE,
     AmbiguousCredentials,
+    AuthorizationRefused,
     AuthServiceUnavailable,
     BetterAuthError,
     ConfigurationError,
@@ -62,6 +63,7 @@ __all__ = [
     "AdminUser",
     "AmbiguousCredentials",
     "AuthServiceUnavailable",
+    "AuthorizationRefused",
     "BetterAuth",
     "BetterAuthError",
     "ConfigurationError",

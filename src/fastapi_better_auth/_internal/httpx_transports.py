@@ -114,7 +114,7 @@ def _import_httpx2():
 
 
 def _httpx_timeout_error() -> type[BaseException]:
-    """Resolved lazily, at translation time: an injected client must never force an import."""
+    """The library's own timeout type; asked once, at construction, by `_timeout_types`."""
     import httpx
 
     return httpx.TimeoutException
@@ -124,6 +124,21 @@ def _httpx2_timeout_error() -> type[BaseException]:
     import httpx2
 
     return httpx2.TimeoutException
+
+
+def _timeout_types(
+    load: Callable[[], type[BaseException]],
+) -> tuple[type[BaseException], ...]:
+    """The builtin timeout and the client library's, resolved before any request is in flight.
+
+    A library that cannot be imported has no timeout type of its own to catch - the client is
+    duck-typed - so that is the builtin alone, never an import attempted while matching a failure
+    (whose `__context__` would then be the client's error, request and all).
+    """
+    try:
+        return (TimeoutError, load())
+    except ImportError:
+        return (TimeoutError,)
 
 
 def _validated_timeout(timeout: object) -> float:
@@ -226,7 +241,7 @@ class _HttpxFamilyTransport:
     ) -> None:
         self._client = client
         self._timeout = timeout
-        self._timeout_error = timeout_error
+        self._timeouts = _timeout_types(timeout_error)
         self._owned = owned
         _shut_the_cookie_jar(client)
 
@@ -258,7 +273,7 @@ class _HttpxFamilyTransport:
                     )
         except UntrustedResponse:
             raise
-        except (TimeoutError, self._timeout_error()):
+        except self._timeouts:
             timed_out = True
         except Exception as exc:  # noqa: BLE001 - translated below so no request rides it out
             failed = type(exc).__name__

@@ -3,7 +3,8 @@
 Two dependency builders, both composed on `current_session`, so authentication happens first and
 exactly once and an unauthenticated request is a 401 that never reaches a rule. Both refuse with
 `NotAuthorized` - one 403, one body, no challenge - and put why on the exception rather than on
-the wire.
+the wire. A rule that must explain itself raises `AuthorizationRefused` on purpose, and that one -
+held again to its own rules as it leaves the rule - reaches the client as built and logs nothing.
 
 The rules themselves are the consumer's: a synchronous predicate over the session, and an
 asynchronous membership lookup taking the resource id this request named. That is deliberate -
@@ -25,7 +26,14 @@ from fastapi import Depends
 from pydantic import TypeAdapter, ValidationError
 
 from .containment import unwrapped
-from .errors import BetterAuthError, ConfigurationError, NotAuthorized, SessionError
+from .errors import (
+    AuthorizationRefused,
+    BetterAuthError,
+    ConfigurationError,
+    NotAuthorized,
+    SessionError,
+    judge_refusal,
+)
 from .models import Session, User, UserId
 from .reasons import safe_label
 
@@ -139,11 +147,12 @@ def permitted(predicate: Predicate, session: Session[Any]) -> bool:
     except HONOURED:
         raise
     except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-        raise _resolved(exc, PREDICATE) from None
-    if inspect.isawaitable(answer):
-        _close(answer)
-        raise ConfigurationError(ASYNC_PREDICATE)
-    return answer is True
+        failure = _resolved(exc, PREDICATE)
+    else:
+        return _exactly_true(answer)
+    # Decided inside the handler (so _contained logs the accident), raised outside it: raised in
+    # there, even `from None` keeps the rule's exception - detail, headers - on __context__.
+    raise failure from None
 
 
 async def granted(member: Member, resource_id: str, session: Session[Any]) -> Any:
@@ -161,15 +170,48 @@ async def granted(member: Member, resource_id: str, session: Session[Any]) -> An
     except HONOURED:
         raise
     except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-        raise _resolved(exc, LOOKUP) from None
+        failure = _resolved(exc, LOOKUP)
+    raise failure from None  # outside the handler, as in `permitted`
+
+
+def _exactly_true(answer: object) -> bool:
+    if inspect.isawaitable(answer):
+        _close(answer)
+        raise ConfigurationError(ASYNC_PREDICATE)
+    return answer is True
 
 
 def _resolved(exc: Exception, what: str) -> BaseException:
-    """Decide whether an escaping exception is an answer or an accident (D-066)."""
+    """Decide whether an escaping exception is an answer or an accident (D-066).
+
+    The one place an `AuthorizationRefused` is honoured, bare or as a group's single leaf - and
+    so the one place it is checked as it now is rather than as it was built (D-337).
+    """
     leaf = unwrapped(exc)
     if isinstance(leaf, HONOURED):
         return leaf
+    if isinstance(leaf, AuthorizationRefused):
+        return _answered(leaf, what)
     return _contained(leaf, what)
+
+
+def _answered(refusal: AuthorizationRefused, what: str) -> BaseException:
+    """The refusal itself if it still keeps its rules, else the uniform one.
+
+    Logged without a traceback: that would render `str(refusal)`, which carries the `detail`.
+    """
+    verdict = judge_refusal(refusal.status_code, refusal.headers)
+    if verdict.breach is None:
+        refusal.headers = verdict.headers
+        return refusal
+    name = type(refusal).__name__
+    logger.error(
+        "the %s refused with %s, but %s; answered as the uniform refusal",
+        what,
+        name,
+        verdict.breach,
+    )
+    return NotAuthorized(reason=f"{name} from the {what} was not honoured: {verdict.breach}")
 
 
 def _contained(exc: BaseException, what: str) -> NotAuthorized:
