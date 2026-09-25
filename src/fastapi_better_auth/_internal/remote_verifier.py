@@ -40,7 +40,6 @@ from __future__ import annotations
 import hmac
 import time
 from collections.abc import Callable, Sequence
-from datetime import datetime, timezone
 from typing import Any, TypeVar, cast
 
 import anyio
@@ -65,14 +64,13 @@ from .errors import (
     ConfigurationError,
     InvalidCredential,
     SessionError,
-    SessionExpired,
-    SessionRevoked,
 )
 from .labels import cookie_source
 from .models import Session, User
 from .negative_cache import MAX_REMEMBERED_MISSES, NEGATIVE_TTL, NegativeCache
 from .parsing import parse_user
 from .reasons import fingerprint
+from .refusal_clock import check_ban, check_expiry
 from .remote_backoff import BackoffLatch
 from .remote_config import (
     MAX_OUTBOUND_CONCURRENCY,
@@ -103,6 +101,7 @@ UserModelT = TypeVar("UserModelT", bound=User)
 
 COOKIE_HEADER = "cookie"
 ACCEPT_JSON = "application/json"
+UPSTREAM_SESSION = "the session upstream returned"
 
 DEFAULT_BASE_PATH = "/api/auth"
 GET_SESSION_PATH = "/get-session"
@@ -617,8 +616,8 @@ class RemoteVerifier:
                 raise InvalidCredential(
                     reason=f"upstream answered a session naming a different token [{marker}]"
                 )
-            _check_expiry(record, marker)
-            _check_ban(stored, marker)
+            check_expiry(record, marker, subject=UPSTREAM_SESSION)
+            check_ban(stored, marker)
             return _build_session(record, stored, token, user_model)
         finally:
             token = ""
@@ -662,26 +661,6 @@ def _rung_one(material: str) -> str:
     finally:
         material = decoded = token = signature = ""
     return result
-
-
-def _check_expiry(record: StoredSession, marker: str) -> None:
-    """A session whose upstream `expiresAt` has elapsed. The record carries the token, so this
-    frame reads the one field it needs and drops the record before the refusal (D-094, D-181)."""
-    expires_at = record.expires_at
-    del record
-    if expires_at <= datetime.now(timezone.utc):
-        raise SessionExpired(reason=f"the session upstream returned has expired [{marker}]")
-
-
-def _check_ban(user: StoredUser, marker: str) -> None:
-    """A banned user, unless the ban has lapsed. `banned is None` is unknown, treated as not banned
-    (a deployment without the admin plugin has no ban state); `ban_expires is None` on a banned user
-    is a permanent ban. Mode A's semantics verbatim (D-182)."""
-    if user.banned is None or user.banned is False:
-        return
-    lapsed = user.ban_expires is not None and user.ban_expires <= datetime.now(timezone.utc)
-    if not lapsed:
-        raise SessionRevoked(reason=f"the session's user is banned [{marker}]")
 
 
 def _build_session(

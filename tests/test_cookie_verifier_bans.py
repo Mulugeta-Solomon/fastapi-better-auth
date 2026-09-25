@@ -1,6 +1,6 @@
 """B2: the ban check fails CLOSED, and `StoredUser` refuses a `banned` nobody can read.
 
-`_check_ban` tested `banned is not True` and returned, so a record carrying `1`, `"true"`, `"yes"`
+The ban check tested `banned is not True` and returned, so a record carrying `1`, `"true"`, `"yes"`
 or `[1]` authenticated a banned user. Only `None` (the admin plugin is not installed, so there is
 no ban state at all) and `False` are "not banned" now; everything else is banned. The constructor
 refuses a non-bool outright, and the guard is kept as well - a `StoredUser` can be built outside a

@@ -11,30 +11,30 @@ a trailing `Z` - which is the only shape a get-session body or a Redis value eve
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
 
 import pytest
 
-from fastapi_better_auth._internal import cookie_verifier, remote_verifier
+from fastapi_better_auth._internal import refusal_clock
 
 INSTANT = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
 """A frozen check instant, millisecond-aligned so `wire` renders it exactly."""
 
 
-class FrozenWallClock:
-    """Stands in for the `datetime` a rung reads `now(tz)` from."""
+def freeze_wall_clock(
+    monkeypatch: pytest.MonkeyPatch, instant: datetime = INSTANT
+) -> list[datetime]:
+    """Every expiry and ban rung reads `instant` as the real time, until the test ends.
 
-    def __init__(self, instant: datetime) -> None:
-        self._instant = instant
+    Returns the list of instants handed out, one per read, so a test can count the reads.
+    """
+    reads: list[datetime] = []
 
-    def now(self, tz: Any = None) -> datetime:
-        return self._instant
+    def frozen() -> datetime:
+        reads.append(instant)
+        return instant
 
-
-def freeze_wall_clock(monkeypatch: pytest.MonkeyPatch, instant: datetime = INSTANT) -> None:
-    """Every expiry and ban rung reads `instant` as the real time, until the test ends."""
-    for module in (cookie_verifier, remote_verifier):
-        monkeypatch.setattr(module, "datetime", FrozenWallClock(instant))
+    monkeypatch.setattr(refusal_clock, "wall_clock", frozen)
+    return reads
 
 
 def wire(moment: datetime) -> str:

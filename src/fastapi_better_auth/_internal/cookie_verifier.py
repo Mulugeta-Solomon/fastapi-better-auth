@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
 from typing import Any, TypeVar, cast
 
 from pydantic import SecretStr
@@ -40,7 +39,6 @@ from .errors import (
     ConfigurationError,
     InvalidCredential,
     SessionError,
-    SessionExpired,
     SessionRevoked,
 )
 from .labels import cookie_source
@@ -48,6 +46,7 @@ from .models import Session, User
 from .once import Once
 from .parsing import parse_user
 from .reasons import fingerprint, safe_label
+from .refusal_clock import check_ban, check_expiry
 from .shared_secret import SharedSecret
 from .signing import verify_signature
 from .stores.outage import OutageLatch, report_once
@@ -62,6 +61,7 @@ DEFAULT_COOKIE_NAME = "better-auth.session_token"
 DEFAULT_SECURE_PREFIX = "__Secure-"
 COOKIE_HEADER = "cookie"
 ILLEGAL_IN_A_COOKIE_NAME = frozenset(" \t\r\n;=,")
+STORED_SESSION = "the stored session"
 
 
 class CookieCredential:
@@ -312,13 +312,13 @@ class CookieVerifier:
             record = await self._looked_up(token, marker)
             if record is None:
                 raise SessionRevoked(reason=f"no stored session for this token [{marker}]")
-            _check_expiry(record, marker)
+            check_expiry(record, marker, subject=STORED_SESSION)
             stored = record.user
             if stored is None:
                 stored = await self._looked_up_user(record.user_id, marker)
                 if stored is None:
                     raise SessionRevoked(reason=f"the session's user is absent [{marker}]")
-            _check_ban(stored, marker)
+            check_ban(stored, marker)
             return _session(record, stored, token, user_model)
         finally:
             token = ""
@@ -372,37 +372,6 @@ def _joined_cookie_header(connection: HTTPConnection) -> str:
 
 def _store_unavailable(marker: str) -> AuthServiceUnavailable:
     return AuthServiceUnavailable(reason=f"session store lookup could not complete [{marker}]")
-
-
-def _check_expiry(record: StoredSession, marker: str) -> None:
-    """A stored session whose `expiresAt` has elapsed - which upstream's findSession does not check.
-
-    The record carries the raw session token, so this frame reads the one field it needs and
-    drops the record before the refusal can put the frame on a traceback (D-094, D-181).
-    """
-    expires_at = record.expires_at
-    del record
-    if expires_at <= datetime.now(timezone.utc):
-        raise SessionExpired(reason=f"the stored session has expired [{marker}]")
-
-
-def _check_ban(user: StoredUser, marker: str) -> None:
-    """A banned user, unless the ban has lapsed. `banned is None` is unknown, treated as not banned.
-
-    `None` means the admin plugin is not installed, so there is no ban state at all - reading its
-    absence as "banned" would refuse every user on a deployment without the plugin. A `ban_expires`
-    of `None` on a banned user is a permanent ban, not a lapsed one.
-
-    Everything else is banned. `StoredUser` refuses a `banned` that is not `bool | None`, but a
-    record can be built outside a store, and a ban check that assumed someone else had validated
-    would be a check with a caller it has never met - so the two "not banned" values are named
-    here and nothing is inferred from truthiness (D-182).
-    """
-    if user.banned is None or user.banned is False:
-        return
-    lapsed = user.ban_expires is not None and user.ban_expires <= datetime.now(timezone.utc)
-    if not lapsed:
-        raise SessionRevoked(reason=f"the session's user is banned [{marker}]")
 
 
 def _session(
