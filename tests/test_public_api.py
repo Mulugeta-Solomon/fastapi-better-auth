@@ -15,6 +15,7 @@ EXPECTED = (
     "AdminUser",
     "AmbiguousCredentials",
     "AuthServiceUnavailable",
+    "AuthorizationRefused",
     "BetterAuth",
     "BetterAuthError",
     "ConfigurationError",

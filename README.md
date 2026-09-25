@@ -951,7 +951,8 @@ The predicate is synchronous and **only `True` passes** — compared by identity
 (a database row, a non-empty error string, the coroutine an `async def` predicate returns) refuses
 rather than admits. An `async def` predicate is a `ConfigurationError` rather than a permanent,
 silent `403`. Whatever the predicate raises is logged and answered `403`, except a `SessionError` or
-`ConfigurationError` it raised on purpose, which keeps its own shape.
+`ConfigurationError` it raised on purpose, which keeps its own shape — and an
+`AuthorizationRefused`, which is how a rule explains itself ([below](#a-refusal-that-explains)).
 
 **The organization id comes from the request — its path or its query — and membership is checked with
 your own query. Never from `session.raw["activeOrganizationId"]`.**
@@ -995,8 +996,10 @@ characters, no control characters); one that fails them is the same `403`, and n
 `member_of` answers the **grant**: anything other than `None` or `False` — a role string, a row, a
 set of scopes — reaches the route on `Membership.grant`, typed, next to `Membership.session` and
 `Membership.resource_id`. `None` and `False` are the refusal. A lookup that raises is logged and
-answered `403`; one that forgot its `async def` is a `ConfigurationError`, because a value returned
-from a plain `def` would otherwise have been handed to the route as the grant.
+answered `403` — unless what it raised is an `AuthorizationRefused`
+([below](#a-refusal-that-explains)); one that forgot its `async def` is a `ConfigurationError`,
+because a value returned from a plain `def` would otherwise have been handed to the route as the
+grant.
 
 Why the rule is a rule: `activeOrganizationId` is written by `POST /organization/set-active`, a route
 the *client* calls (`dist/plugins/organization/routes/crud-org.mjs:379`). Upstream does check
@@ -1037,6 +1040,119 @@ refuses because the `member` query for `(B, user)` finds nothing. The broken one
 serves B's invoices, because it asked whether the user had an active organization and never asked
 which organization this request was about.
 
+#### A refusal that explains
+
+The uniform `403` is right for the session layer and wrong for a product whose design requires a
+denial that names what was missing. Only the rule that refused knows which — a capability the role
+lacks, a district the grants do not cover — so the rule says so itself: raise an
+`AuthorizationRefused`, or your own subclass of it, from the predicate or the lookup, and it reaches
+the client with the status, `detail` and headers you built it with.
+
+```python
+from typing import Annotated
+
+from fastapi import Depends, FastAPI
+
+from fastapi_better_auth import (
+    AuthorizationRefused,
+    BetterAuth,
+    JwtVerifier,
+    Membership,
+    Session,
+    User,
+)
+
+auth = BetterAuth(verifiers=[JwtVerifier(base_url="https://auth.example.com")])
+
+
+class Staff(User):
+    role: str | None = None
+
+
+class PermissionDenied(AuthorizationRefused):
+    """Your refusal and your body, built from your own rules and rows."""
+
+    def __init__(self, code: str, message: str, **context: object) -> None:
+        super().__init__(detail={"code": code, "message": message, **context})
+
+
+CAPABILITIES = {"auditor": {"view_audit_log"}, "dispatcher": {"send_sms_alert"}}
+COVERAGE = {"user_1": {"ada-east": "Ada East District"}}
+
+
+def views_audit_log(session: Session[Staff]) -> bool:
+    if "view_audit_log" in CAPABILITIES.get(session.user.role or "", set()):
+        return True
+    raise PermissionDenied(
+        "missing_capability",
+        "You do not have permission to view the audit log.",
+        capability="view_audit_log",
+    )
+
+
+async def covers(district_id: str, session: Session[Staff]) -> str:
+    """Your query. The district's name, or a refusal naming the districts the user does cover."""
+    covered = COVERAGE.get(session.user.id, {})
+    if district_id in covered:
+        return covered[district_id]
+    raise PermissionDenied(
+        "outside_jurisdiction",
+        "That is outside the area you cover.",
+        covers=sorted(covered.values()),
+    )
+
+
+AuditLogReader = Annotated[
+    Session[Staff],
+    Depends(auth.require(views_audit_log, reason="view_audit_log", user_model=Staff)),
+]
+DistrictStaff = Annotated[
+    Membership[Staff, str],
+    Depends(
+        auth.require_membership("district_id", covers, reason="district coverage", user_model=Staff)
+    ),
+]
+
+app = FastAPI()
+
+
+@app.get("/audit-log")
+async def audit_log(session: AuditLogReader) -> list[str]:
+    return [session.user.id]
+
+
+@app.get("/districts/{district_id}/incidents")
+async def incidents(access: DistrictStaff) -> dict[str, str]:
+    return {"district": access.grant}
+```
+
+A dispatcher asking for the audit log is answered `403` with this body, and a user asking about a
+district they do not cover gets `403` with `"covers": ["Ada East District"]` — explained with the
+rows the lookup just read, rather than re-derived by a second query that could answer differently:
+
+```json
+{"detail": {"code": "missing_capability",
+            "message": "You do not have permission to view the audit log.",
+            "capability": "view_audit_log"}}
+```
+
+The rules around it:
+
+- **`403` or `404`, nothing else.** `404` is for a rule that would rather not confirm the resource
+  exists; with no `detail` its body is the one an unknown path gets. Any other status — a `401`
+  would tell a valid session to sign in again — or a `WWW-Authenticate` header in any spelling
+  raises `ValueError` at construction. Raised inside a rule, that is an accident like any other:
+  logged, and answered with the uniform `403`.
+- **Only the marker is honoured.** A plain `HTTPException` raised inside a rule — a helper's stray
+  `404` or `500` — is still contained, logged and answered `403`: a bug is not a decision.
+- **Reachable only after authentication, and never logged.** An anonymous or forged request is the
+  uniform `401` before any rule runs, so the explaining body is only ever shown to a caller whose
+  credential verified. The refusal is an answer, not an accident, so nothing is logged for it.
+- **Build the body from your own rules and rows** — never from the token, the cookie or the
+  upstream payload. It is the one refusal whose every byte is yours.
+- **An unusable resource id stays the uniform `403`.** An id that fails the identifier rules above
+  is refused before your lookup is ever called, so there is no rule there to explain it.
+
 ### `/docs`, restated for Mode C
 
 Identical to Mode A, because it is the same cookie: the route publishes an `APIKeyCookie` scheme, so
@@ -1069,6 +1185,13 @@ the wire. Reaching a `403` at all means authentication already succeeded; an ano
 request is answered `401` before any rule is asked, so a `403` is never an oracle for which
 credentials this deployment accepts.
 
+There is one deliberate exception to per-status uniformity, and it is the application's to make:
+an `AuthorizationRefused` raised on purpose inside a `require` predicate or a `require_membership`
+lookup reaches the client with the `403` or `404` and the body the application chose
+([A refusal that explains](#a-refusal-that-explains)). It is reachable only after authentication,
+this library puts nothing of its own into it, and it must never carry anything read from the
+credential.
+
 Why a request was refused lives on the exception, as `.reason`, and nowhere else. **This library
 does not log ordinary refusals** — a forged, expired or malformed token, an unknown key id, a
 missing or ambiguous credential — and that is deliberate rather than an omission: what to record
@@ -1087,6 +1210,10 @@ warning (once per process). At `ERROR`, with the traceback: an
 exception that escaped a verifier, and one that escaped an authorization predicate or a membership
 lookup — each answered as the uniform refusal rather than a `500`, so the log is the only place the
 real exception exists. The `reason` those build names the exception's *type* and not its message.
+An `AuthorizationRefused` is an answer rather than an escape, and logs nothing — unless it was
+edited after it was built into something it could not have been built as (a `401`, a challenge
+header, headers that are not text): that one is logged at `ERROR` with its class and the rule it
+broke, never its headers or its `detail`, and answered as the uniform `403`.
 None of these lines carries a raw token, a cookie value or a signature.
 
 ### Your own error envelope
@@ -1137,6 +1264,10 @@ malformed, expired, revoked, unreachable auth service — carries the same `401`
 `"Not authenticated"` and the same `WWW-Authenticate: Bearer`, so a handler that reads only them
 cannot produce two distinguishable answers however many exception classes it is handed. The
 envelope changes the shape of the body, not the number of bodies.
+
+An `AuthorizationRefused` never reaches this handler: it is not a `SessionError` but the
+application's own `HTTPException`, rendered by FastAPI's `HTTPException` handler — register one for
+`AuthorizationRefused` if its body should wear the envelope too.
 
 **The anti-pattern: `type(exc).__name__` or `exc.reason` in the response.** Either one hands a
 client the oracle the uniform body exists to remove — one lets an unauthenticated caller sort

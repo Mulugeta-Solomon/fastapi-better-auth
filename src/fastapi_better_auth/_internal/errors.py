@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple, cast
 
 from fastapi import HTTPException
 
@@ -18,10 +19,45 @@ SANCTIONED_RESPONSES: Mapping[int, tuple[str, Mapping[str, str] | None]] = Mappi
     }
 )
 SHADOWED_ATTRIBUTES = ("status_code", "detail", "headers")
+REFUSAL_STATUSES = frozenset({403, 404})
+CHALLENGE_HEADER = "www-authenticate"
+FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+FIELD_VALUE = re.compile(r"[\t\x20-\x7e]*")
+STATUS_BREACH = "its status_code is not a plain int, 403 or 404"
+HEADERS_BREACH = "its headers are not a plain dict of str to str"
+CHALLENGE_BREACH = "its headers carry WWW-Authenticate"
+FIELD_BREACH = (
+    "its headers are not RFC 9110 fields: a name must be a token, and a value may carry only"
+    " tabs, spaces and visible US-ASCII"
+)
+BREACH_CAUSES: Mapping[str, str] = MappingProxyType(
+    {
+        STATUS_BREACH: "A 401 would tell a session that already verified to re-authenticate, 400"
+        " is the ambiguous-credential answer, and any other status is not a refusal.",
+        HEADERS_BREACH: "Pass a mapping of str to str; it is copied into a plain dict. Nothing"
+        " else is honoured once the refusal leaves the rule, because only a plain dict reads the"
+        " same when it is checked and when it is written.",
+        CHALLENGE_BREACH: "The challenge belongs to authentication, and a session that reached a"
+        " rule already passed it.",
+        FIELD_BREACH: "A CR or LF in a value splits the response on a server that writes it, and"
+        " one that refuses it aborts the response or answers 500; obs-text is what RFC 9110 says"
+        " new fields should not use, and a client may be unable to decode it (sections 5.1, 5.5"
+        " and 5.6.2).",
+    }
+)
 
 
 def _rebuild(error_cls: type[SessionError], reason: str) -> SessionError:
     return error_cls(reason=reason)
+
+
+def _refuse_shadowing(cls: type[HTTPException], consequence: str) -> None:
+    shadowed = [name for name in SHADOWED_ATTRIBUTES if name in cls.__dict__]
+    if shadowed:
+        raise TypeError(
+            f"{cls.__name__} sets {', '.join(shadowed)} in its class body. Those are"
+            f" instance attributes {consequence}"
+        )
 
 
 class BetterAuthError(Exception):
@@ -82,13 +118,11 @@ class SessionError(HTTPException):
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        shadowed = [name for name in SHADOWED_ATTRIBUTES if name in cls.__dict__]
-        if shadowed:
-            raise TypeError(
-                f"{cls.__name__} sets {', '.join(shadowed)} in its class body. Those are"
-                " instance attributes and would silently win over the response constants;"
-                " set response_status / response_detail / response_headers instead."
-            )
+        _refuse_shadowing(
+            cls,
+            "and would silently win over the response constants;"
+            " set response_status / response_detail / response_headers instead.",
+        )
         sanctioned = SANCTIONED_RESPONSES.get(cls.response_status)
         if sanctioned is None:
             raise TypeError(
@@ -200,7 +234,8 @@ class NotAuthorized(SessionError):
     never carries the client's data verbatim.
 
     Raised by `BetterAuth.require` and `BetterAuth.require_membership`, and available for an
-    application's own authorization failures.
+    application's own authorization failures. A rule whose refusal has to explain itself raises
+    `AuthorizationRefused` instead, which reaches the client with the status and body it chose.
     """
 
     response_status: ClassVar[int] = 403
@@ -234,3 +269,153 @@ class AmbiguousCredentials(SessionError):
     response_status: ClassVar[int] = 400
     response_detail: ClassVar[str] = "Ambiguous request"
     response_headers: ClassVar[Mapping[str, str] | None] = None
+
+
+class AuthorizationRefused(HTTPException):
+    """A refusal the authorization rule explains itself, raised on purpose from inside the rule.
+
+    `NotAuthorized` is one uniform `403` whatever the rule was - right for the session layer,
+    wrong for a product whose design requires a denial that names what was missing: "you may
+    not send SMS alerts", "that district is outside the area you cover". Only the rule that
+    refused knows which, so raise this - or your own subclass of it - from a `BetterAuth.require`
+    predicate or a `BetterAuth.require_membership` lookup, and it reaches the client exactly as
+    you built it: its status, its `detail`, its headers. Nothing is logged; it is an answer, not
+    an accident.
+
+        class MissingCapability(AuthorizationRefused):
+            def __init__(self, capability: str) -> None:
+                super().__init__(detail={"code": "missing_capability", "capability": capability})
+
+    **Reachable only after authentication.** Both gates compose on `current_session`, so an
+    anonymous or forged request is answered `401` before any rule runs, and this class raised by
+    a verifier is contained like any other escape. The body is only ever shown to a caller whose
+    credential already verified, so it is never an oracle for which credentials are accepted.
+
+    **What it must never carry:** anything read from the credential - a token, a cookie, a
+    signature, a session id - nor the upstream payload. It is the one deliberate exception to
+    this library's per-status uniformity, and it is safe only because the application chose
+    every byte of it, from its own rules and its own rows.
+
+    **Why a plain `HTTPException` in a rule is still contained.** A rule calls helpers, and a
+    helper's stray `404` or `500` is a bug, not a decision. Inside a rule only this class is
+    honoured; anything else is logged and answered as the uniform `NotAuthorized`.
+
+    It is not a `SessionError`: per-status uniformity is what it opts out of, so a handler you
+    registered for `SessionError` never sees it, and FastAPI's own `HTTPException` handler
+    renders it.
+
+    **Checked again as it leaves the rule.** An exception is a mutable object, so the gate holds
+    the refusal to the same rules the constructor does at the moment it is honoured - its headers
+    must then still be a plain `dict`, read once, and that read is what is written. One edited
+    afterwards into something it could not have been built as is an accident, logged with its
+    class and the rule it broke - never a header value, never the `detail` - and answered as the
+    uniform `NotAuthorized`.
+
+    Args:
+        status_code: `403` (the default) or `404`, for a rule that would rather not confirm the
+            resource exists. Read once as a plain `int` - that value is checked and kept. A `401`
+            would tell a session that is valid to re-authenticate, a `400` is this library's
+            ambiguous-credential answer, and a `5xx` is not a refusal.
+        detail: The body's `detail`, any JSON-serializable value, exactly as `HTTPException`
+            takes it. `None` renders the status phrase.
+        headers: Extra response headers: a mapping of `str` to `str`, copied as plain text at
+            construction. Each name must be an RFC 9110 token and each value only tabs, spaces
+            and visible US-ASCII - so no value can split the response or reach a client as bytes
+            it cannot decode.
+            They may not carry `WWW-Authenticate` in any spelling: the challenge belongs to
+            authentication, and this session already passed it.
+
+    Raises:
+        ValueError: At construction, if `status_code` is not 403 or 404, or `headers` is not a
+            mapping of `str` to `str`, names `WWW-Authenticate`, or holds a name or value RFC 9110
+            does not allow. Raised inside a rule, that is an accident like any other.
+        TypeError: When a subclass is defined that sets `status_code`, `detail` or `headers`
+            in its class body, where `__init__` would silently override them.
+    """
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        _refuse_shadowing(
+            cls,
+            "set by __init__, so a class value would be silently ignored;"
+            " pass them to super().__init__() instead.",
+        )
+
+    def __init__(
+        self,
+        status_code: int = 403,
+        detail: Any = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        status = _plain_status(status_code)
+        kept = None if headers is None else _plain_headers(headers)
+        verdict = judge_refusal(status, kept)
+        if verdict.breach is not None:
+            raise ValueError(_misbuilt(verdict.breach, status_code))
+        super().__init__(status_code=cast("int", status), detail=detail, headers=verdict.headers)
+
+
+class Judgement(NamedTuple):
+    """One read of a refusal: the rule it breaks, if any, and its headers exactly as judged."""
+
+    breach: str | None
+    headers: dict[str, str] | None
+
+
+def judge_refusal(status_code: object, headers: object) -> Judgement:
+    """Hold an explaining refusal to its rules, reading its headers exactly once.
+
+    Asked twice with the same answer: at construction, and by `authz` as the refusal leaves the
+    rule - an exception is a mutable object, and what reaches the wire is what it holds then. The
+    headers judged are a fresh plain `dict` of that one read, and they are what the caller keeps,
+    so the object written to the wire is the object that was judged.
+    """
+    if type(status_code) is not int or status_code not in REFUSAL_STATUSES:
+        return Judgement(STATUS_BREACH, None)
+    if headers is None:
+        return Judgement(None, None)
+    pairs = _text_pairs(headers)
+    if pairs is None:
+        return Judgement(HEADERS_BREACH, None)
+    return Judgement(_field_breach(pairs), dict(pairs))
+
+
+def _text_pairs(headers: object) -> list[tuple[str, str]] | None:
+    """One read of exactly a plain `dict` of plain `str` to plain `str`, or `None`."""
+    if type(headers) is not dict:
+        return None
+    pairs = list(cast("dict[object, object]", headers).items())
+    if not all(type(name) is str and type(value) is str for name, value in pairs):
+        return None
+    return cast("list[tuple[str, str]]", pairs)
+
+
+def _field_breach(pairs: list[tuple[str, str]]) -> str | None:
+    if any(name.strip().lower() == CHALLENGE_HEADER for name, _ in pairs):
+        return CHALLENGE_BREACH
+    if all(FIELD_NAME.fullmatch(name) and FIELD_VALUE.fullmatch(value) for name, value in pairs):
+        return None
+    return FIELD_BREACH
+
+
+def _plain_status(status_code: object) -> object:
+    if isinstance(status_code, int) and not isinstance(status_code, bool):
+        return int.__int__(status_code)
+    return status_code
+
+
+def _plain_headers(headers: object) -> object:
+    if not isinstance(headers, Mapping):
+        return headers
+    source = cast("Mapping[object, object]", headers)
+    plain: dict[str, str] = {}
+    for name, value in source.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            return source
+        plain[str.__str__(name)] = str.__str__(value)
+    return plain
+
+
+def _misbuilt(breach: str, status_code: object) -> str:
+    got = f" (got {status_code!r})" if breach == STATUS_BREACH else ""
+    return f"AuthorizationRefused was built wrong: {breach}{got}. {BREACH_CAUSES[breach]}"

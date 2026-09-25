@@ -23,16 +23,19 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI
+import pytest
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import SecretStr
 from typing_extensions import assert_type
 
 from fastapi_better_auth import (
     AdminUser,
+    AuthorizationRefused,
     BetterAuth,
     JwtVerifier,
     Membership,
     Session,
+    SessionError,
     SharedSecret,
     User,
     Verifier,
@@ -79,6 +82,34 @@ Editor = Annotated[
 Scoped = Annotated[
     Membership[Staff, str],
     Depends(auth.require_membership("org_id", member_of, reason="org member", user_model=Staff)),
+]
+
+
+class MissingCapability(AuthorizationRefused):
+    """A consumer's own explaining refusal: a subclass with a constructor of its own."""
+
+    def __init__(self, capability: str) -> None:
+        super().__init__(detail={"code": "missing_capability", "capability": capability})
+
+
+def can_send_sms(session: Session[Staff]) -> bool:
+    if session.user.role != "dispatcher":
+        raise MissingCapability("send_sms")
+    return True
+
+
+async def covers(district_id: str, session: Session[Staff]) -> str:
+    if district_id != "ada-east":
+        raise AuthorizationRefused(status_code=404, headers={"Cache-Control": "no-store"})
+    return f"{session.user.id}:{district_id}"
+
+
+SmsSender = Annotated[
+    Session[Staff], Depends(auth.require(can_send_sms, reason="send_sms", user_model=Staff))
+]
+District = Annotated[
+    Membership[Staff, str],
+    Depends(auth.require_membership("district_id", covers, reason="district", user_model=Staff)),
 ]
 
 
@@ -142,6 +173,37 @@ async def read_scoped(access: Scoped) -> dict[str, str]:
     return {"id": access.session.user.id, "grant": access.grant}
 
 
+async def read_sms_sender(session: SmsSender) -> dict[str, str]:
+    """A predicate that raises its own refusal changes nothing about what the route is handed."""
+    assert_type(session, Session[Staff])
+    return {"id": session.user.id}
+
+
+async def read_district(access: District) -> dict[str, str]:
+    """Nor does a lookup that raises one: its grant is still the type it declared."""
+    assert_type(access, Membership[Staff, str])
+    assert_type(access.grant, str)
+    return {"grant": access.grant}
+
+
+def takes_an_http_exception(error: HTTPException) -> int:
+    return error.status_code
+
+
+def read_the_refusal_types() -> None:
+    """The marker is an `HTTPException` a consumer subclasses - and not a `SessionError`."""
+    refusal = MissingCapability("send_sms")
+
+    assert_type(refusal, MissingCapability)
+    assert_type(refusal.status_code, int)
+    assert_type(refusal.headers, Mapping[str, str] | None)
+    assert_type(takes_an_http_exception(refusal), int)
+    assert_type(AuthorizationRefused(status_code=404, detail={"k": ["v"]}), AuthorizationRefused)
+    assert_type(refusal, SessionError)  # pyright: ignore[reportAssertTypeFailure]
+    with pytest.raises(ValueError, match="403 or 404"):
+        AuthorizationRefused(status_code="403")  # pyright: ignore[reportArgumentType]
+
+
 # --- the types around the session -------------------------------------------------------
 
 
@@ -195,6 +257,8 @@ app.add_api_route("/default", read_default, methods=["GET"])
 app.add_api_route("/default-maybe", read_default_maybe, methods=["GET"])
 app.add_api_route("/editor", read_editor, methods=["GET"])
 app.add_api_route("/orgs/{org_id}/invoices", read_scoped, methods=["GET"])
+app.add_api_route("/sms", read_sms_sender, methods=["GET"])
+app.add_api_route("/districts/{district_id}", read_district, methods=["GET"])
 
 
 def test_every_asserted_call_site_is_a_route_that_answers() -> None:
@@ -219,6 +283,22 @@ def test_the_authorization_call_sites_are_routes_that_answer() -> None:
 
     assert refused.status_code == 403
     assert scoped.json() == {"id": "u1", "grant": "u1:acme"}
+
+
+def test_the_refusal_call_sites_are_routes_that_answer() -> None:
+    """The fake's user is an `admin`, not a `dispatcher`, so the predicate refuses with its own
+    body; the lookup refuses an uncovered district and grants a covered one."""
+    with client(app) as http:
+        sms = http.get("/sms", headers={HEADER: GOOD_CREDENTIAL})
+        outside = http.get("/districts/acme", headers={HEADER: GOOD_CREDENTIAL})
+        inside = http.get("/districts/ada-east", headers={HEADER: GOOD_CREDENTIAL})
+
+    assert sms.status_code == 403
+    assert sms.json() == {"detail": {"code": "missing_capability", "capability": "send_sms"}}
+    assert (outside.status_code, outside.json()) == (404, {"detail": "Not Found"})
+    assert outside.headers["cache-control"] == "no-store"
+    assert inside.json() == {"grant": "u1:ada-east"}
+    read_the_refusal_types()
 
 
 def test_the_surrounding_types_are_exercised_too() -> None:
