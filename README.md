@@ -78,7 +78,7 @@ The default client honours the process environment the way `httpx` does — `HTT
 `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`/`SSL_CERT_DIR` and `~/.netrc`. That is usually what a
 deployment behind an egress proxy or a private CA wants; if it is not, pass your own
 `HttpxTransport(client=httpx.AsyncClient(trust_env=False))`. Either way the client never follows a
-redirect and never keeps a cookie. [SECURITY.md](SECURITY.md) spells out what the library trusts.
+redirect and never keeps a cookie. [SECURITY.md](https://github.com/Mulugeta-Solomon/fastapi-better-auth/blob/main/SECURITY.md) spells out what the library trusts.
 
 ```bash
 pip install "fastapi-better-auth-bridge[httpx]"   # or: uv add "fastapi-better-auth-bridge[httpx]"

@@ -106,4 +106,4 @@ __all__ = [
     "parse_user",
 ]
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
