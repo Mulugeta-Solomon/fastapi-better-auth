@@ -16,11 +16,11 @@ posture asserted in only one direction is not asserted at all.
 | 1.7.1 with `secondaryStorage` (Redis) | conformance, gating | every pull request, and every push to `main` | — (HEAD only) |
 | 1.7.1 with `bearer({ requireSignature: true })` | conformance (strict posture), gating | every pull request, and every push to `main` | — (HEAD only) |
 | 1.7.1 with `rateLimit: { enabled: true, customRules: { "/get-session": { window: 10, max: 3 } } }` | conformance (throttled posture), gating | every pull request, and every push to `main` | — (HEAD only) |
-| 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161) |
-| 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161) |
-| 1.7.5 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161, as `latest`) |
-| 1.7.6 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | — |
-| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.5.0 on 2026-09-16 (run 35050080161), `latest` = 1.7.5 that day |
+| 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408) |
+| 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408) |
+| 1.7.5 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408) |
+| 1.7.6 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408) |
+| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408), `latest` = 1.7.6 that day |
 
 That list is readable from a running application as `fastapi_better_auth.VERIFIED_BETTER_AUTH` — the
 canary matrix without its `latest` entry, which is a dist-tag rather than a version — and
@@ -71,8 +71,8 @@ at the version cited. A file cited at 1.7.5 with no 1.7.6 line beside it is byte
   Redis document is still the raw token as key and `JSON.stringify({ session, user })` as value
   (`better-auth@1.7.1` `dist/db/internal-adapter.mjs:303-306`, `better-auth@1.7.5` `:302-305`).
   Cookie signing lives in the peer package `better-call`, which all three versions pin exactly to
-  `1.4.0` (`package.json:470` in each), and every cookie-mode leg ran green against 1.7.5 (run
-  35050080161, as `latest`).
+  `1.4.0` (`package.json:470` in each), and every cookie-mode leg ran green against 1.7.5 and 1.7.6
+  (run 36109363408).
 - **Schema validation is on by default from 1.7.3**, in every environment, unless
   `advanced.database.validateSchema` is `false` (`@better-auth/core@1.7.5` and `@1.7.6`
   `dist/db/schema-check.mjs:4-9`; the option at `dist/types/init-options.d.mts:391-400`; neither
