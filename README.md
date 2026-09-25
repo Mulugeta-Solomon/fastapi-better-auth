@@ -1307,7 +1307,15 @@ a refresh that failed while a usable key set was still on hand, a stored record 
 it cannot use, a user model that declares a required field the upstream payload does not carry
 (once per process per model, naming the model and the missing wire keys), a `429` backoff latch
 opening (once per latch, never once per refused request), and the advisory `requireSignature`
-warning (once per process). At `ERROR`, with the traceback: an
+warning (once per process). Also at `WARNING`: a session-store lookup that could not complete — a
+statement the database refused, a database or Redis server that could not be reached (the first
+lookup before any `connect()` included), or a store of your own raising — once per kind of failure
+(the cookie verifier counts its session and user lookups apart), where the kind is the driver
+error's class and its SQLSTATE when it carries a well-formed one, beside a fingerprint of what was
+looked up and none of the error's text. It is said again only after a lookup completes, and past
+eight distinct kinds one constant notice says further kinds are held back until then. The request
+is answered the uniform `401` either way, like any other dependency that could not be reached.
+At `ERROR`, with the traceback: an
 exception that escaped a verifier, and one that escaped an authorization predicate or a membership
 lookup — each answered as the uniform refusal rather than a `500`, so the log is the only place the
 real exception exists. The `reason` those build names the exception's *type* and not its message.
