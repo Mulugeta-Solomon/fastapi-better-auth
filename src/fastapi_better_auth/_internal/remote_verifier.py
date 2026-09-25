@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import hmac
 import time
-import urllib.parse
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any, TypeVar, cast
@@ -56,6 +55,7 @@ from .cookie_parsing import (
     cookie_pairs,
     parse_signed_value,
     resolve_named_cookie,
+    unquoted_strictly,
 )
 from .cookie_verifier import DEFAULT_COOKIE_NAME, DEFAULT_SECURE_PREFIX
 from .csrf import CsrfFacts, CsrfPolicy, enforce_policy, validated_policy
@@ -338,13 +338,15 @@ class RemoteVerifier:
         """
         try:
             await self._ready()
+            return
         except AuthServiceUnavailable as unreachable:
-            raise ConfigurationError(
+            failure = ConfigurationError(
                 f"RemoteVerifier could not reach get-session at {self._uri} during startup:"
                 f" {unreachable.reason}. An auth service unreachable at boot is a deployment that"
                 " should not take traffic. Fix reachability, or omit startup()/lifespan to let the"
                 " probe run lazily on the first request instead."
-            ) from None
+            )
+        raise failure from None  # outside the handler, as in `_acquire`
 
     async def probe(self) -> None:
         """Run the get-session readiness probe once, now, without memoizing the outcome.
@@ -503,6 +505,7 @@ class RemoteVerifier:
         cancelled attempt rolls back its stamp so it does not spend the retry window (D-196)."""
         previous = self._probe_attempted_at
         self._probe_attempted_at = self._clock()
+        cancelled = anyio.get_cancelled_exc_class()
         try:
             await run_probe(
                 self._transport,
@@ -513,7 +516,7 @@ class RemoteVerifier:
         except ConfigurationError as contract:
             self._contract_failure = str(contract)
             raise
-        except anyio.get_cancelled_exc_class():
+        except cancelled:
             self._probe_attempted_at = previous
             raise
         self._probed_ok = True
@@ -548,10 +551,12 @@ class RemoteVerifier:
         try:
             with anyio.fail_after(self._queue_timeout):
                 await limiter.acquire()
+            return
         except TimeoutError:
-            raise AuthServiceUnavailable(
+            failure = AuthServiceUnavailable(
                 reason=f"get-session outbound queue saturated after {self._queue_timeout}s"
-            ) from None
+            )
+        raise failure from None  # outside the handler, so no __context__ links the TimeoutError
 
     async def _get(self, outbound: dict[str, str]) -> TransportResponse:
         """The transport GET, with every failure translated so no credential rides out on the chain.
@@ -635,12 +640,11 @@ def _rung_one(material: str) -> str:
             raise InvalidCredential(
                 reason=f"cookie value is {length} bytes, over the cap [{marker}]"
             )
-        try:
-            decoded = urllib.parse.unquote(material, errors="strict")
-        except UnicodeDecodeError:
+        decoded = unquoted_strictly(material)
+        if decoded is None:
             raise InvalidCredential(
                 reason=f"cookie value is not valid percent-encoded UTF-8 [{marker}]"
-            ) from None
+            )
         token, separator, signature = decoded.rpartition(".")
         if not separator:
             raise InvalidCredential(

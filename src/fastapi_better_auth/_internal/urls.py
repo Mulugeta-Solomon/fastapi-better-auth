@@ -150,16 +150,23 @@ def _canonical_host(split: SplitResult, field: str) -> tuple[str, bool]:
             " the one it reads as. Pass the punycode ('xn--') form."
         )
     host = raw.removesuffix(".")
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
+    address = _ip_address(host)
+    if address is None:
         if not HOSTNAME.fullmatch(host) or len(host) > MAX_HOST_LENGTH:
             raise ConfigurationError(
                 f"{field} has an unusable host {host!r}. A host is letters, digits, hyphens"
                 f" and dots, or an IP literal. Pass an origin such as {EXAMPLE!r}."
-            ) from None
+            )
         return host, host == "localhost"
     return address.compressed, address.is_loopback
+
+
+def _ip_address(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The address `text` spells, or `None`: refused by the caller, with nothing chained."""
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
 
 
 def ip_literal(raw: str, field: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -169,10 +176,9 @@ def ip_literal(raw: str, field: str) -> ipaddress.IPv4Address | ipaddress.IPv6Ad
     )
     if "%" in raw:
         raise ConfigurationError(unusable)
-    try:
-        address = ipaddress.ip_address(raw)
-    except ValueError:
-        raise ConfigurationError(unusable) from None
+    address = _ip_address(raw)
+    if address is None:
+        raise ConfigurationError(unusable)
     mapped = getattr(address, "ipv4_mapped", None)
     if mapped is not None:
         raise ConfigurationError(

@@ -79,8 +79,8 @@ def _built_client(url: object) -> Any:
     The `Raises:` contract promises a `ConfigurationError` for every construction failure, and a
     bare `url=7` would otherwise be an `AttributeError` from `from_url`. Neither the value nor
     redis-py's own error is echoed: a redis URL can carry a password (`redis://user:pass@host`),
-    so the refusal names what to check and chains `from None` so the credential cannot ride out
-    on `__cause__`.
+    so the refusal names what to check and is raised outside the handler with `from None`, so the
+    credential can ride out on neither `__cause__` nor `__context__`.
     """
     if not isinstance(url, str) or not url.strip():
         raise ConfigurationError(
@@ -89,9 +89,10 @@ def _built_client(url: object) -> Any:
     try:
         return _import_redis().from_url(url)
     except (ValueError, TypeError):
-        raise ConfigurationError(
+        failure = ConfigurationError(
             "the url= given was rejected by redis-py; check its scheme, host and port"
-        ) from None
+        )
+    raise failure from None
 
 
 class RedisSessionStore:

@@ -166,12 +166,11 @@ def parse_signed_value(material: str) -> ParsedCookie:
             raise InvalidCredential(
                 reason=f"cookie value is {length} bytes, over the cap [{marker}]"
             )
-        try:
-            decoded = urllib.parse.unquote(material, errors="strict")
-        except UnicodeDecodeError:
+        decoded = unquoted_strictly(material)
+        if decoded is None:
             raise InvalidCredential(
                 reason=f"cookie value is not valid percent-encoded UTF-8 [{marker}]"
-            ) from None
+            )
         token, separator, signature = decoded.rpartition(".")
         if not separator:
             raise InvalidCredential(
@@ -185,10 +184,9 @@ def parse_signed_value(material: str) -> ParsedCookie:
             raise InvalidCredential(
                 reason=f"signature is {length} characters, not {required} [{marker}]"
             )
-        try:
-            digest = base64.b64decode(signature, validate=True)
-        except (binascii.Error, ValueError):
-            raise InvalidCredential(reason=f"signature is not standard base64 [{marker}]") from None
+        digest = _standard_base64(signature)
+        if digest is None:
+            raise InvalidCredential(reason=f"signature is not standard base64 [{marker}]")
         length = len(digest)
         if length != HMAC_BYTES:
             raise InvalidCredential(
@@ -199,6 +197,26 @@ def parse_signed_value(material: str) -> ParsedCookie:
         material = decoded = token = signature = ""
         digest = b""
     return result
+
+
+def unquoted_strictly(material: str) -> str | None:
+    """`unquote(errors='strict')`, or `None` when the percent-encoded bytes are not UTF-8.
+
+    Returns rather than raises: the decode error's `.object` is the whole cookie value, so the
+    caller refuses with nothing chained to it.
+    """
+    try:
+        return urllib.parse.unquote(material, errors="strict")
+    except UnicodeDecodeError:
+        return None
+
+
+def _standard_base64(signature: str) -> bytes | None:
+    """The decoded signature, or `None`; the decoder's frames would hold the signature."""
+    try:
+        return base64.b64decode(signature, validate=True)
+    except (binascii.Error, ValueError):
+        return None
 
 
 def _value_for_base(pairs: tuple[tuple[str, str], ...], base: str) -> str | None:
