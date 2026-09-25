@@ -5,10 +5,12 @@ it one-way: expiry is checked against the LATER of the real time and `now()`, an
 against the EARLIER. Moving the seam forward expires sessions sooner, moving it back changes
 nothing, and no seam can shorten a ban - so left wired in production, its worst case is early expiry.
 
-Every property is proven over a range of offsets, one second to thirty days, in both directions,
-for both verifiers and on both backends: a mutation one offset lets through, its neighbours catch.
-The real clock is frozen at `INSTANT` (`tests/wall_clock.py`), so each offset is exact. A seam that
-raises or returns something unusable is `test_refusal_clock_contained.py`.
+Every property is proven over a range of offsets, from one microsecond - `datetime`'s resolution -
+to thirty days, in both directions, for both verifiers and on both backends: a mutation one offset
+lets through, its neighbours catch, and a seam honoured only past some threshold is caught below
+it. The record sits still at a millisecond-aligned instant and the real clock (frozen,
+`tests/wall_clock.py`) and the seam are placed around it, so each offset is exact on Mode C's wire
+too. A seam that raises or returns something unusable is `test_refusal_clock_contained.py`.
 """
 
 from __future__ import annotations
@@ -32,7 +34,13 @@ from tests import cookies, remote_fixtures
 from tests.transports import ScriptedTransport, json_reply
 from tests.wall_clock import INSTANT, freeze_wall_clock, wire
 
+RESOLUTION = timedelta(microseconds=1)
 OFFSETS = (
+    RESOLUTION,
+    timedelta(microseconds=2),
+    timedelta(milliseconds=1),
+    timedelta(milliseconds=500),
+    timedelta(microseconds=999_999),
     timedelta(seconds=1),
     timedelta(seconds=59),
     timedelta(minutes=31),
@@ -40,9 +48,12 @@ OFFSETS = (
     timedelta(days=1),
     timedelta(days=30),
 )
-OFFSET_IDS = ("1s", "59s", "31min", "6h", "1d", "30d")
+OFFSET_IDS = ("1us", "2us", "1ms", "500ms", "999999us", "1s", "59s", "31min", "6h", "1d", "30d")
 MODES = ("cookie", "remote")
 MILLISECOND = timedelta(milliseconds=1)
+RECORD = INSTANT
+"""Where a range leg's `expires_at` or `ban_expires` sits. Millisecond-aligned, because Mode C's
+wire carries milliseconds (`JSON.stringify`): the clocks move around the record, never it."""
 LONG_LIVED = INSTANT + timedelta(days=3650)
 """A session expiry beyond every seam here, for the legs about bans."""
 
@@ -128,6 +139,25 @@ def frozen(monkeypatch: pytest.MonkeyPatch) -> list[datetime]:
     return freeze_wall_clock(monkeypatch)
 
 
+Freeze = Callable[[datetime], list[datetime]]
+
+
+@pytest.fixture
+def real_clock(monkeypatch: pytest.MonkeyPatch) -> Freeze:
+    """Re-freezes the real clock at a leg's own instant; the list it returns counts the reads."""
+    return lambda instant: freeze_wall_clock(monkeypatch, instant)
+
+
+def inside(offset: timedelta) -> timedelta:
+    """How far past the earlier clock the record sits: half the gap, and at least 1 us.
+
+    From 2 us up that is strictly between the two clocks, so a range leg never rests on the `<=`
+    the boundary legs pin. At 1 us - the resolution - the window `(earlier, later]` holds exactly
+    one instant, the later clock's, and the record has to sit on it.
+    """
+    return max(RESOLUTION, offset // 2)
+
+
 # ---------------------------------------------------------------- expiry: the later of the two
 
 
@@ -136,29 +166,35 @@ def frozen(monkeypatch: pytest.MonkeyPatch) -> list[datetime]:
 @pytest.mark.parametrize("mode", MODES)
 class TestExpiryReadsTheLaterClock:
     async def test_a_seam_ahead_refuses_a_session_the_real_clock_admits(
-        self, mode: str, offset: timedelta
+        self, mode: str, offset: timedelta, real_clock: Freeze
     ) -> None:
         """The whole of #82: move the clock past the consumer's own cap and see the refusal."""
-        expires_at = INSTANT + offset / 2
+        real = RECORD - inside(offset)
+        reads = real_clock(real)
 
-        assert await outcome(mode, now=None, expires_at=expires_at) == "admitted"
-        assert await outcome(mode, now=at(INSTANT + offset), expires_at=expires_at) == "expired"
+        assert await outcome(mode, now=None, expires_at=RECORD) == "admitted"
+        assert await outcome(mode, now=at(real + offset), expires_at=RECORD) == "expired"
+        assert reads, "the frozen real clock was never read"
 
     async def test_a_seam_behind_leaves_a_live_session_live(
-        self, mode: str, offset: timedelta
+        self, mode: str, offset: timedelta, real_clock: Freeze
     ) -> None:
-        expires_at = INSTANT + offset / 2
+        real = RECORD - inside(offset)
+        reads = real_clock(real)
 
-        assert await outcome(mode, now=at(INSTANT - offset), expires_at=expires_at) == "admitted"
+        assert await outcome(mode, now=at(real - offset), expires_at=RECORD) == "admitted"
+        assert reads, "the frozen real clock was never read"
 
     async def test_a_seam_behind_cannot_revive_an_expired_session(
-        self, mode: str, offset: timedelta
+        self, mode: str, offset: timedelta, real_clock: Freeze
     ) -> None:
         """The seam alone would admit this session; the real clock still refuses it."""
-        expires_at = INSTANT - offset / 2
+        seam = RECORD - inside(offset)
+        reads = real_clock(seam + offset)
 
-        assert await outcome(mode, now=None, expires_at=expires_at) == "expired"
-        assert await outcome(mode, now=at(INSTANT - offset), expires_at=expires_at) == "expired"
+        assert await outcome(mode, now=None, expires_at=RECORD) == "expired"
+        assert await outcome(mode, now=at(seam), expires_at=RECORD) == "expired"
+        assert reads, "the frozen real clock was never read"
 
 
 # ---------------------------------------------------------------- a ban's lapse: the earlier of the two
@@ -169,37 +205,43 @@ class TestExpiryReadsTheLaterClock:
 @pytest.mark.parametrize("mode", MODES)
 class TestBanLapseReadsTheEarlierClock:
     async def test_a_seam_ahead_cannot_lapse_a_ban_early(
-        self, mode: str, offset: timedelta
+        self, mode: str, offset: timedelta, real_clock: Freeze
     ) -> None:
         """A temporary ban still holds: the seam alone would read it as lapsed."""
-        until = INSTANT + offset / 2
+        real = RECORD - inside(offset)
+        reads = real_clock(real)
 
-        assert await banned_outcome(mode, now=None, ban_expires=until) == "banned"
-        assert await banned_outcome(mode, now=at(INSTANT + offset), ban_expires=until) == "banned"
+        assert await banned_outcome(mode, now=None, ban_expires=RECORD) == "banned"
+        assert await banned_outcome(mode, now=at(real + offset), ban_expires=RECORD) == "banned"
+        assert reads, "the frozen real clock was never read"
 
     async def test_a_seam_ahead_leaves_a_lapsed_ban_lapsed(
-        self, mode: str, offset: timedelta
+        self, mode: str, offset: timedelta, real_clock: Freeze
     ) -> None:
-        until = INSTANT - offset / 2
+        real = RECORD + inside(offset)
+        reads = real_clock(real)
 
-        assert await banned_outcome(mode, now=at(INSTANT + offset), ban_expires=until) == (
-            "admitted"
-        )
+        assert await banned_outcome(mode, now=at(real + offset), ban_expires=RECORD) == "admitted"
+        assert reads, "the frozen real clock was never read"
 
     async def test_a_seam_behind_keeps_a_ban_the_real_clock_would_let_lapse(
-        self, mode: str, offset: timedelta
+        self, mode: str, offset: timedelta, real_clock: Freeze
     ) -> None:
-        until = INSTANT - offset / 2
+        seam = RECORD - inside(offset)
+        reads = real_clock(seam + offset)
 
-        assert await banned_outcome(mode, now=None, ban_expires=until) == "admitted"
-        assert await banned_outcome(mode, now=at(INSTANT - offset), ban_expires=until) == "banned"
+        assert await banned_outcome(mode, now=None, ban_expires=RECORD) == "admitted"
+        assert await banned_outcome(mode, now=at(seam), ban_expires=RECORD) == "banned"
+        assert reads, "the frozen real clock was never read"
 
     async def test_a_seam_behind_leaves_an_active_ban_active(
-        self, mode: str, offset: timedelta
+        self, mode: str, offset: timedelta, real_clock: Freeze
     ) -> None:
-        until = INSTANT + offset / 2
+        real = RECORD - inside(offset)
+        reads = real_clock(real)
 
-        assert await banned_outcome(mode, now=at(INSTANT - offset), ban_expires=until) == "banned"
+        assert await banned_outcome(mode, now=at(real - offset), ban_expires=RECORD) == "banned"
+        assert reads, "the frozen real clock was never read"
 
 
 @pytest.mark.anyio
