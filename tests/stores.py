@@ -19,15 +19,17 @@ same reason every case runs through both `FLAVOURS`.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import pathlib
 import sqlite3
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 
+import aiosqlite
 import pytest
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -318,6 +320,43 @@ class ShiftingStateError(sqlite3.OperationalError):
     @property
     def sqlstate(self) -> str:
         return f"{next(self._states) % 100_000:05d}"
+
+
+class AiosqliteStops:
+    """Every future `aiosqlite.Connection.stop()` hands out while installed, to await on its loop.
+
+    aiosqlite's failed connect calls `stop()` and drops the future it returns (0.22.1,
+    `core.py:169-171`), so the worker thread's last act - `call_soon_threadsafe` on that future's
+    loop (`core.py:66`) - can land after the loop has closed: `RuntimeError: Event loop is closed`,
+    twice, and a dead thread that pytest pins on whichever test is running when it notices.
+    `drained()`, awaited on the same loop before it closes, is what makes closing it safe.
+
+    A release with no `stop()` (0.20, the declared floor) stops its worker with a bare sentinel
+    that posts to no loop, so there is nothing to record and `installed` is `False`.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.futures: list[asyncio.Future[object]] = []
+        original = cast(
+            "Callable[[aiosqlite.Connection], asyncio.Future[object] | None] | None",
+            vars(aiosqlite.Connection).get("stop"),
+        )
+        self.installed = original is not None
+        if original is None:
+            return
+
+        def stop(connection: aiosqlite.Connection) -> asyncio.Future[object] | None:
+            future = original(connection)
+            if future is not None:
+                self.futures.append(future)
+            return future
+
+        monkeypatch.setattr(aiosqlite.Connection, "stop", stop)
+
+    async def drained(self) -> None:
+        """Wait for every worker thread to post its last result, on the loop that is still open."""
+        for future in self.futures:
+            await future
 
 
 class DriverFault:
