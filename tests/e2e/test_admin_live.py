@@ -202,7 +202,7 @@ class TestLapsedBan:
     @pytest.mark.anyio
     async def test_mode_c_admits_it_and_reads_the_ban_as_data(self, harness: str) -> None:
         """Upstream answers `get-session` for a lapsed ban rather than refusing it, so the
-        decision is this library's - the same `_check_ban` rule Mode A applies."""
+        decision is this library's - `refusal_clock.check_ban`, the one both cookie modes call."""
         cookie, user_id = banned_after_the_fact(harness)
 
         session = await read_mode_c(harness, cookie)

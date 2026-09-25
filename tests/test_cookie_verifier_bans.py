@@ -1,6 +1,6 @@
 """B2: the ban check fails CLOSED, and `StoredUser` refuses a `banned` nobody can read.
 
-`_check_ban` tested `banned is not True` and returned, so a record carrying `1`, `"true"`, `"yes"`
+The ban check tested `banned is not True` and returned, so a record carrying `1`, `"true"`, `"yes"`
 or `[1]` authenticated a banned user. Only `None` (the admin plugin is not installed, so there is
 no ban state at all) and `False` are "not banned" now; everything else is banned. The constructor
 refuses a non-bool outright, and the guard is kept as well - a `StoredUser` can be built outside a
@@ -15,7 +15,7 @@ this one rule spanning both.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -35,6 +35,7 @@ from tests.cookies import (
     verifier,
 )
 from tests.stores import USER_ID, wire_user
+from tests.wall_clock import INSTANT, freeze_wall_clock
 
 
 def a_user(**overrides: Any) -> StoredUser:
@@ -73,6 +74,32 @@ class TestBans:
         session = await run(verifier(store=store), http(cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}"))
 
         assert session is not None
+
+    @pytest.mark.anyio
+    async def test_a_ban_lapses_at_exactly_its_expiry_instant(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`ban_expires <= now` has lapsed, the boundary included - the same `<=` as expiry."""
+        freeze_wall_clock(monkeypatch)
+        user = stored_user(banned=True, ban_expires=INSTANT)
+        store = FakeStore(sessions={CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN, user=user)})
+
+        session = await run(verifier(store=store), http(cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}"))
+
+        assert session is not None
+
+    @pytest.mark.anyio
+    async def test_a_ban_expiring_just_after_the_check_instant_still_holds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One millisecond later it holds - and since the frozen instant is in the real clock's
+        past, this leg is also what proves the freeze reached the ban rung at all."""
+        freeze_wall_clock(monkeypatch)
+        user = stored_user(banned=True, ban_expires=INSTANT + timedelta(milliseconds=1))
+        store = FakeStore(sessions={CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN, user=user)})
+
+        with pytest.raises(SessionRevoked):
+            await run(verifier(store=store), http(cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}"))
 
     @pytest.mark.anyio
     @pytest.mark.parametrize("banned", [1, "true", "yes", 2, [1], 0, ""], ids=repr)
