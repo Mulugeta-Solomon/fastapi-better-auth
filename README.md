@@ -498,9 +498,10 @@ the security requirement appears on the operation. Two honest limits:
   the verifier that owns it.
 
 The scheme's component key is `BetterAuthCookie` whatever the cookie is called, so a committed
-OpenAPI snapshot does not change with a per-environment cookie prefix; its `name` is still the
-configured cookie name (the description names it too), so a snapshot that diffs `name` pins its
-exporter's prefix; and an application that reads two different cookies publishes one key per
+OpenAPI snapshot does not change with a per-environment cookie prefix; its `name` is the one cookie
+the verifier reads, exactly as the browser sends it (`__Secure-better-auth.session_token` under the
+default `secure_cookies=True`; the description names it too), so a snapshot that diffs `name` pins
+its exporter's prefix; and an application that reads two different cookies publishes one key per
 cookie, `BetterAuthCookie-<cookie name>` with each character outside `A-Za-z0-9._-` replaced by `-`
 (`session+id` → `BetterAuthCookie-session-id`), so adding a second cookie verifier renames the
 first one's key.

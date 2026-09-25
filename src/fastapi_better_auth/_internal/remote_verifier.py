@@ -68,6 +68,7 @@ from .errors import (
     SessionExpired,
     SessionRevoked,
 )
+from .labels import cookie_source
 from .models import Session, User
 from .negative_cache import MAX_REMEMBERED_MISSES, NEGATIVE_TTL, NegativeCache
 from .parsing import parse_user
@@ -101,7 +102,6 @@ from .urls import normalize_base_url
 UserModelT = TypeVar("UserModelT", bound=User)
 
 COOKIE_HEADER = "cookie"
-COOKIE_SOURCE_PREFIX = "cookie:"
 ACCEPT_JSON = "application/json"
 
 DEFAULT_BASE_PATH = "/api/auth"
@@ -177,7 +177,8 @@ class RemoteVerifier:
             this and `secrets`; neither is legal.
         secrets: A keyring of `SharedSecret`s for a rotation. At most one of this and `secret`.
         cookie_name: The unprefixed cookie name Better Auth sets. Exactly one name is read - the
-            `__Secure-`-prefixed form or this plain one, per `secure_cookies` - with its chunk names.
+            `__Secure-`-prefixed form or this plain one, per `secure_cookies` - with its chunk names,
+            and that one name is the cookie `/docs` shows an Authorize field for.
         secure_prefix: The prefix on the hardened cookie name, used only when `secure_cookies`.
         secure_cookies: Whether the single accepted name is the `__Secure-`-prefixed one. `True` by
             default, matching Better Auth's production default; never both names.
@@ -253,7 +254,7 @@ class RemoteVerifier:
         self._refuse_unsigned_bearer = validated_refuse_unsigned_bearer(refuse_unsigned_bearer)
         self._clock = validated_clock(clock)
         self._uri = f"{self._origin}{self._base_path}{GET_SESSION_PATH}{GET_SESSION_QUERY}"
-        self.credential_source = f"{COOKIE_SOURCE_PREFIX}{self._cookie_name}"
+        self.credential_source = cookie_source(self._base)
         self._cache = NegativeCache(
             ttl=validated_negative_ttl(negative_ttl),
             max_remembered=validated_max_remembered(max_remembered),
@@ -281,7 +282,8 @@ class RemoteVerifier:
 
     @property
     def cookie_name(self) -> str:
-        """The unprefixed cookie name this verifier reads and documents."""
+        """The unprefixed cookie name this verifier was configured with. The name it reads and
+        documents is `credential_source`'s: this one, or it behind `secure_prefix`."""
         return self._cookie_name
 
     @property

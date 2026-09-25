@@ -22,6 +22,7 @@ from .errors import (
     MissingCredential,
     SessionError,
 )
+from .labels import collision_key
 from .models import Session, User
 from .openapi import declaring, schemes_for
 from .verifiers import PreparedVerifier, Verifier
@@ -129,7 +130,8 @@ class BetterAuth:
             exists: the sequence is empty or is not a sequence; an entry does not implement
             `Verifier`, has a non-callable `extract`/`verify`, declares an `async def extract`,
             or declares a blank `credential_source`; the same verifier appears twice; two
-            verifiers declare the same `credential_source`, so every request carrying it would
+            verifiers declare the same `credential_source` - or cookie labels naming one cookie
+            plain and behind `__Secure-` or `__Host-` - so every request carrying it would
             be ambiguous; or two `credential_source` labels would be published under one
             OpenAPI security-scheme name, where one definition would silently replace the
             other.
@@ -678,15 +680,16 @@ def _validated(verifiers: object) -> tuple[Verifier, ...]:
 
 def _reject_collision(verifier: Verifier, seen: Sequence[Verifier]) -> None:
     """Two *different* verifiers reading one credential — what identity cannot see."""
-    source = verifier.credential_source.strip().casefold()
-    clash = next((s for s in seen if s.credential_source.strip().casefold() == source), None)
+    key = collision_key(verifier.credential_source)
+    clash = next((s for s in seen if collision_key(s.credential_source) == key), None)
     if clash is None:
         return
     raise ConfigurationError(
         f"BetterAuth(verifiers=...) has two verifiers on one credential:"
-        f" {type(clash).__name__} and {type(verifier).__name__} both declare"
-        f" credential_source={verifier.credential_source!r}. Both would find it, so every"
-        " request carrying that credential would be ambiguous."
+        f" {type(clash).__name__} declares credential_source={clash.credential_source!r} and"
+        f" {type(verifier).__name__} declares credential_source={verifier.credential_source!r}."
+        " Both would find it (a cookie and its __Secure- or __Host- form count as one), so"
+        " every request carrying it would be ambiguous."
     )
 
 

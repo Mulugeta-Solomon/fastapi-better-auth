@@ -43,6 +43,7 @@ from .errors import (
     SessionExpired,
     SessionRevoked,
 )
+from .labels import cookie_source
 from .models import Session, User
 from .once import Once
 from .parsing import parse_user
@@ -59,7 +60,6 @@ UserModelT = TypeVar("UserModelT", bound=User)
 DEFAULT_COOKIE_NAME = "better-auth.session_token"
 DEFAULT_SECURE_PREFIX = "__Secure-"
 COOKIE_HEADER = "cookie"
-COOKIE_SOURCE_PREFIX = "cookie:"
 ILLEGAL_IN_A_COOKIE_NAME = frozenset(" \t\r\n;=,")
 
 
@@ -136,8 +136,8 @@ class CookieVerifier:
         csrf: The cross-site request forgery policy. Required, keyword-only, no default.
         cookie_name: The unprefixed cookie name Better Auth sets, `better-auth.session_token` by
             default. Exactly one name is read - the `__Secure-`-prefixed form or this plain one,
-            per `secure_cookies` - together with its `${name}.${index}` chunk names, and it is the
-            cookie `/docs` shows an Authorize field for.
+            per `secure_cookies` - together with its `${name}.${index}` chunk names, and that one
+            name is the cookie `/docs` shows an Authorize field for.
         secure_prefix: The prefix on the hardened cookie name, `__Secure-` by default, used only
             when `secure_cookies` is `True`. **`__Host-` is the only prefix that stops a sibling
             subdomain from planting a cookie your app will read; `__Secure-` does not** - a sibling
@@ -191,11 +191,12 @@ class CookieVerifier:
         # own first session_data cookie, so a second deployment's CVE-2026-67337 warning is not
         # eaten by the first (D-197).
         self._session_data_once = Once()
-        self.credential_source = f"{COOKIE_SOURCE_PREFIX}{self._cookie_name}"
+        self.credential_source = cookie_source(self._base)
 
     @property
     def cookie_name(self) -> str:
-        """The unprefixed cookie name this verifier reads and documents."""
+        """The unprefixed cookie name this verifier was configured with. The name it reads and
+        documents is `credential_source`'s: this one, or it behind `secure_prefix`."""
         return self._cookie_name
 
     @property

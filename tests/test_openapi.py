@@ -182,7 +182,7 @@ def test_a_cookie_verifier_publishes_an_api_key_cookie_scheme(cookie: str) -> No
 def test_only_the_key_differs_from_what_fastapis_own_api_key_cookie_publishes(sole: bool) -> None:
     """Choosing the key must not hand-assemble the definition: it stays byte-for-byte what a
     plain FastAPI application publishes for `APIKeyCookie` on the same cookie."""
-    others = [] if sole else [FakeVerifier(HEADER_B, source=f"cookie:{SECURE_COOKIE}")]
+    others = [] if sole else [FakeVerifier(HEADER_B, source=f"cookie:{STAGING_COOKIE}")]
     auth = BetterAuth(verifiers=[FakeVerifier(HEADER, source=COOKIE_SOURCE), *others])
     key = COOKIE_NAME if sole else DERIVED_COOKIE_NAME
     published = schemes(auth)[key]
@@ -266,17 +266,17 @@ def test_a_label_is_read_the_way_the_collision_check_reads_it(source: str) -> No
 
 def test_the_cookie_name_survives_into_the_scheme_name() -> None:
     """Two cookie verifiers on different cookies must not collapse onto one definition, so each
-    keeps a key derived from its own cookie."""
+    keeps a key derived from its own cookie - a `__Secure-` prefix included, verbatim."""
     auth = BetterAuth(
         verifiers=[
             FakeVerifier(HEADER, source=COOKIE_SOURCE),
-            FakeVerifier(HEADER_B, source=f"cookie:{SECURE_COOKIE}"),
+            FakeVerifier(HEADER_B, source="cookie:__Secure-other.session_token"),
         ]
     )
 
     assert set(schemes(auth)) == {
         DERIVED_COOKIE_NAME,
-        "BetterAuthCookie-__Secure-better-auth.session_token",
+        "BetterAuthCookie-__Secure-other.session_token",
     }
 
 
@@ -381,10 +381,9 @@ def test_two_distinct_cookies_each_keep_a_key_derived_from_their_name() -> None:
     assert transport.calls == 0
 
 
-def test_one_cookie_behind_two_labels_is_still_refused_at_construction() -> None:
-    """Two labels, one cookie. They are distinct `credential_source` values, so the duplicate
-    label check lets them through; counted as two cookie declarations, each takes the derived key,
-    the keys collide, and construction refuses with the message it always gave."""
+def test_one_cookie_behind_two_labels_is_refused_at_construction() -> None:
+    """Two labels, one cookie. The collision check reads a label through the same parse the
+    scheme does, so it sees one cookie and refuses before a document is ever built."""
     with pytest.raises(ConfigurationError) as caught:
         BetterAuth(
             verifiers=[
@@ -393,7 +392,10 @@ def test_one_cookie_behind_two_labels_is_still_refused_at_construction() -> None
             ]
         )
 
-    assert "'BetterAuthCookie-session'" in str(caught.value)
+    message = str(caught.value)
+    assert "two verifiers on one credential" in message
+    assert "'cookie:session'" in message
+    assert "'cookie: session'" in message
 
 
 # --- a label nothing recognizes documents nothing --------------------------------------
