@@ -18,12 +18,12 @@ from __future__ import annotations
 import logging
 import pathlib
 import socket
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from typing import Any, cast
 
-import anyio
 import pytest
 from anyio.from_thread import BlockingPortal
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -53,7 +53,13 @@ from tests.cookies import (
 )
 from tests.fakes import client, session_app
 from tests.log_hygiene import LIBRARY_LOGGER, broken_log_filter, capturing
-from tests.stores import DeniedError, DriverFault, ShiftingStateError, StoreFixture
+from tests.stores import (
+    AiosqliteStops,
+    DeniedError,
+    DriverFault,
+    ShiftingStateError,
+    StoreFixture,
+)
 
 TEMPLATE_HEAD = "session store lookup"
 REQUESTS = 3
@@ -99,10 +105,30 @@ def cookie_verifier(store: SessionStore) -> CookieVerifier:
     )
 
 
-def statuses(verifier: CookieVerifier, backend: str, requests: int = REQUESTS) -> list[int]:
+@pytest.fixture
+def aiosqlite_stops(monkeypatch: pytest.MonkeyPatch) -> AiosqliteStops:
+    return AiosqliteStops(monkeypatch)
+
+
+def apps_loop(http: TestClient) -> BlockingPortal:
+    """The portal onto the loop a `TestClient` runs the app on - open until its `with` exits."""
+    return cast("BlockingPortal", http.portal)  # pyright: ignore[reportUnknownMemberType]
+
+
+def statuses(
+    verifier: CookieVerifier,
+    backend: str,
+    requests: int = REQUESTS,
+    *,
+    before_close: Sequence[Callable[[], Awaitable[object]]] = (),
+) -> list[int]:
+    """`requests` refused-or-served GETs, then each `before_close` step on the app's own loop."""
     app = session_app(BetterAuth(verifiers=[verifier]))
     with client(app, backend) as http:
-        return [http.get("/required", headers=HEADERS).status_code for _ in range(requests)]
+        answered = [http.get("/required", headers=HEADERS).status_code for _ in range(requests)]
+        for step in before_close:
+            apps_loop(http).call(step)
+    return answered
 
 
 def closed_port() -> int:
@@ -118,17 +144,27 @@ def closed_port() -> int:
     [("async", "asyncio"), ("sync", "asyncio"), ("sync", "trio")],
 )
 def test_a_sql_store_that_cannot_reach_its_database_warns_once(
-    flavour: str, backend: str, tmp_path: pathlib.Path, records: list[logging.LogRecord]
+    flavour: str,
+    backend: str,
+    tmp_path: pathlib.Path,
+    records: list[logging.LogRecord],
+    aiosqlite_stops: AiosqliteStops,
 ) -> None:
     """D-373, reproduced: `connect()` never ran, so discovery fails inside the first lookup and
-    escapes the store as a raw `SQLAlchemyError` - no statement parameter is bound there."""
+    escapes the store as a raw `SQLAlchemyError` - no statement parameter is bound there. Each
+    failed aiosqlite connect leaves a `stop()` behind on the app's loop, so the engine is disposed
+    and those are awaited on that loop, before the `TestClient` closes it."""
     url = f"{tmp_path / 'no' / 'such' / 'directory' / 'auth.db'}"
     store: SessionStore
     if flavour == "async":
         async_engine = create_async_engine(f"sqlite+aiosqlite:///{url}")
         store = SqlAlchemySessionStore(engine=async_engine)
-        answered = statuses(cookie_verifier(store), backend)
-        anyio.run(async_engine.dispose)
+        answered = statuses(
+            cookie_verifier(store),
+            backend,
+            before_close=(async_engine.dispose, aiosqlite_stops.drained),
+        )
+        assert len(aiosqlite_stops.futures) == (REQUESTS if aiosqlite_stops.installed else 0)
     else:
         sync_engine = create_engine(f"sqlite+pysqlite:///{url}")
         store = SyncStoreAdapter(engine=sync_engine)
@@ -260,6 +296,7 @@ def test_a_refused_statement_is_one_line_in_total(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     records: list[logging.LogRecord],
+    aiosqlite_stops: AiosqliteStops,
 ) -> None:
     """The store reports a refused statement and hands the verifier a translated error, so the
     verifier adds nothing: the store's line is the only one. The first request discovers the
@@ -273,8 +310,8 @@ def test_a_refused_statement_is_one_line_in_total(
         discovered = http.get("/required", headers=HEADERS).status_code
         fault.error = DeniedError
         answered = [http.get("/required", headers=HEADERS).status_code for _ in range(REQUESTS)]
-        portal = cast("BlockingPortal", http.portal)  # pyright: ignore[reportUnknownMemberType]
-        portal.call(build.aclose)
+        apps_loop(http).call(build.aclose)
+        apps_loop(http).call(aiosqlite_stops.drained)
 
     assert discovered == 401
     assert answered == [401] * REQUESTS
