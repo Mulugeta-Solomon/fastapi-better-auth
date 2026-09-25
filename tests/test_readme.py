@@ -62,8 +62,8 @@ A cookie mode checks CSRF *before* it looks at the credential, so a cross-site p
 same-origin, and a snippet that allowed some other origin fails here rather than passing on a 403.
 """
 
-COOKIE_SCHEME_PREFIX = "BetterAuthCookie-"
-"""How every cookie verifier names its OpenAPI scheme: the prefix, then the cookie name."""
+COOKIE_SCHEME = "BetterAuthCookie"
+"""The OpenAPI key of an application's only cookie scheme, whatever that cookie is called."""
 
 COOKIE_NAMES = ("better-auth.session_token", "__Secure-better-auth.session_token")
 """Both spellings of the one cookie Better Auth sets.
@@ -362,9 +362,7 @@ def test_the_applications_the_snippets_build_enforce_and_document_themselves(
                     where = f"{snippet.id} POST {path}"
                     requirement = document["paths"][path]["post"]["security"]
                     assert requirement and all(len(r) == 1 for r in requirement), where
-                    assert any(
-                        next(iter(r)).startswith(COOKIE_SCHEME_PREFIX) for r in requirement
-                    ), where
+                    assert {COOKIE_SCHEME: []} in requirement, where
                     for cookie in FORGED_COOKIES:
                         headers = {
                             "Cookie": forged_cookie_header(cookie),

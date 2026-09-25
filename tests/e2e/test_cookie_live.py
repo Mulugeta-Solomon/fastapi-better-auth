@@ -45,6 +45,7 @@ from .conftest import (
     sign_in,
     sign_out,
 )
+from .cookie_scheme import cookie_scheme
 
 try:
     # Every name Mode A added after 0.1.0 belongs in here, not above: the canary's
@@ -73,7 +74,6 @@ if "secure_cookies" not in inspect.signature(CookieVerifier.__init__).parameters
 
 pytestmark = pytest.mark.e2e
 
-COOKIE_SCHEME = "BetterAuthCookie-better-auth.session_token"
 BEARER_SCHEME = "BetterAuthBearer"
 
 
@@ -277,14 +277,15 @@ class TestComposition:
                 document = (await client.get("/openapi.json")).json()
                 docs = await client.get("/docs")
 
+        cookie_key = cookie_scheme()
         schemes = document["components"]["securitySchemes"]
         assert schemes[BEARER_SCHEME]["type"] == "http"
-        assert schemes[COOKIE_SCHEME]["type"] == "apiKey"
-        assert schemes[COOKIE_SCHEME]["in"] == "cookie"
-        assert schemes[COOKIE_SCHEME]["name"] == SESSION_COOKIE
+        assert schemes[cookie_key]["type"] == "apiKey"
+        assert schemes[cookie_key]["in"] == "cookie"
+        assert schemes[cookie_key]["name"] == SESSION_COOKIE
         required = document["paths"]["/required"]["get"]["security"]
         named = {name for requirement in required for name in requirement}
-        assert named == {BEARER_SCHEME, COOKIE_SCHEME}
+        assert named == {BEARER_SCHEME, cookie_key}
         assert docs.status_code == 200
 
 
