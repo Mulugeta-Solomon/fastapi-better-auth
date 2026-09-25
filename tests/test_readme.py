@@ -25,12 +25,13 @@ a snippet that reaches upstream to decide a forgery names the route it did it fr
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import anyio
 import httpx
@@ -38,6 +39,7 @@ import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 import fastapi_better_auth
@@ -597,3 +599,76 @@ def test_the_factory_app_is_overridden_through_the_instance_it_built(
     assert all(FACTORY_FAKE_ID in answer.json().values() for answer in served)
     assert refuse_network == []
     assert refuse_database == []
+
+
+SESSION_FACTS = "## What a verified session carries"
+FORWARD = "revoke_upstream"
+FORWARDED_NAME = "__Secure-better-auth.session_token"
+FORWARDED_VALUE = "forwarded-session-token.c2lnbmF0dXJl%2Bc2lnbmF0dXJl%3D"
+"""The value as a verifier accepted it: still percent-encoded, so the recipe must not decode it."""
+FORWARDED_TOKEN = "forwarded-session-token"
+
+Forward = Callable[[httpx.AsyncClient, Session[User], SecretStr], Awaitable[httpx.Response | None]]
+
+
+def forwarding_recipe() -> Forward:
+    """The one fence under the session-facts heading, run, and the function it defines."""
+    found = fences_under(SESSION_FACTS)
+    assert len(found) == 1, f"{SESSION_FACTS} holds {len(found)} python fences, not one"
+    recipe = run(found[0]).get(FORWARD)
+    assert callable(recipe), f"the fence under {SESSION_FACTS} defines no {FORWARD}"
+    return cast("Forward", recipe)
+
+
+def verified(*, cookie: bool = True, origin: str | None = ALLOWED_ORIGIN) -> Session[User]:
+    """A session shaped as Modes A and C build it, or as a GET or Mode B leaves it."""
+    return Session(
+        user=User(id="u1"),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        token=SecretStr(FORWARDED_TOKEN),
+        cookie=(FORWARDED_NAME, SecretStr(FORWARDED_VALUE)) if cookie else None,
+        origin=origin,
+        raw={},
+    )
+
+
+async def forwarded(session: Session[User]) -> tuple[httpx.Response | None, list[httpx.Request]]:
+    """Run the recipe against an upstream that records each request and says yes."""
+    sent: list[httpx.Request] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"status": True})
+
+    assert session.token is not None
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        response = await forwarding_recipe()(client, session, session.token)
+    return response, sent
+
+
+def test_the_forwarding_recipe_sends_exactly_what_revoke_session_reads() -> None:
+    """The cookie as accepted, the matched origin, and `{token}` - nothing re-read, nothing more."""
+    answer, sent = anyio.run(forwarded, verified())
+
+    assert answer is not None and answer.status_code == 200
+    (request,) = sent
+    assert request.method == "POST"
+    assert str(request.url) == f"{BASE_URL}/api/auth/revoke-session"
+    assert SecretStr(request.headers["cookie"]) == SecretStr(f"{FORWARDED_NAME}={FORWARDED_VALUE}")
+    assert request.headers["origin"] == ALLOWED_ORIGIN
+    assert sorted(json.loads(request.content)) == ["token"]
+    assert SecretStr(json.loads(request.content)["token"]) == SecretStr(FORWARDED_TOKEN)
+
+
+@pytest.mark.parametrize(
+    ("cookie", "origin"),
+    [(True, None), (False, None), (False, ALLOWED_ORIGIN)],
+    ids=["a GET: no origin", "Mode B: neither", "no cookie"],
+)
+def test_the_forwarding_recipe_sends_nothing_without_a_cookie_and_a_matched_origin(
+    cookie: bool, origin: str | None
+) -> None:
+    answer, sent = anyio.run(forwarded, verified(cookie=cookie, origin=origin))
+
+    assert answer is None
+    assert sent == []

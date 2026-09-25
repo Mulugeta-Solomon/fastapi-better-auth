@@ -20,6 +20,8 @@ import binascii
 import urllib.parse
 from dataclasses import dataclass
 
+from pydantic import SecretStr
+
 from .errors import InvalidCredential
 from .reasons import fingerprint
 
@@ -118,8 +120,9 @@ def resolve_named_cookie(pairs: tuple[tuple[str, str], ...], base: str) -> tuple
     a chunk run with a gap, a repeat or a missing index 0 is refused: a server emits none of
     those shapes.
 
-    Mode C forwards exactly this pair as its outbound `cookie:` header, under the base name the
-    browser sent (`__Secure-` preserved verbatim), value still percent-encoded.
+    Both verifiers resolve through here, once per request. Mode C forwards exactly this pair as
+    its outbound `cookie:` header, under the base name the browser sent (`__Secure-` preserved
+    verbatim), value still percent-encoded; both hand it on as `Session.cookie`.
 
     Raises:
         InvalidCredential: For any malformed set, and (defensively) if the base has no material.
@@ -135,19 +138,16 @@ def resolve_named_cookie(pairs: tuple[tuple[str, str], ...], base: str) -> tuple
         pairs = ()
 
 
-def resolve_cookie_value(pairs: tuple[tuple[str, str], ...], base: str) -> str:
-    """The one signed cookie value these pairs carry for the single configured base.
+def accepted_cookie(name: str, value: str) -> tuple[str, SecretStr]:
+    """The `(name, value)` a verifier accepted, as `Session.cookie` carries it: the value masked.
 
-    The `.value` projection of `resolve_named_cookie`, kept as the name Mode A reads (the cookie
-    verifier needs the value, never the name it resolved under, because it already knows the base).
-
-    Raises:
-        InvalidCredential: For any malformed set, and (defensively) if the base has no material.
+    Both verifiers call this as the last step of building the session, after every check has
+    passed, and nowhere else - so a pair exists only for a request that was accepted.
     """
     try:
-        return resolve_named_cookie(pairs, base)[1]
+        return name, SecretStr(value)
     finally:
-        pairs = ()
+        value = ""
 
 
 def parse_signed_value(material: str) -> ParsedCookie:

@@ -38,7 +38,9 @@ def parse_session_document(document: Mapping[str, Any], subject: str) -> StoredS
     and a user object, or a session missing any of `expiresAt`, `userId`, `token`, or whose user
     half does not parse. The `token` is promoted onto the record but **not** checked against
     anything here: whether it names the credential the caller presented is the caller's decision,
-    made in the caller's own frame.
+    made in the caller's own frame. The session's own `id` is optional: better-auth writes one,
+    but nothing guarantees a stored document carries it, so a missing or unreadable one is
+    `None` on the record and refuses nothing.
 
     Args:
         document: The parsed JSON object, already known to be a mapping.
@@ -67,6 +69,7 @@ def parse_session_document(document: Mapping[str, Any], subject: str) -> StoredS
         payload=payload,
         user=user,
         impersonated_by=as_text(payload.get("impersonatedBy")),
+        id=as_text(payload.get("id")),
     )
 
 
