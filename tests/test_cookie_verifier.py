@@ -13,7 +13,6 @@ from __future__ import annotations
 import base64
 import hmac
 import logging
-from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -35,7 +34,6 @@ from fastapi_better_auth import (
     SignedDoubleSubmit,
     User,
 )
-from fastapi_better_auth._internal import cookie_verifier as cv
 from fastapi_better_auth._internal.cookie_verifier import CookieVerifier
 from tests.cookies import (
     CAPTURED_TOKEN,
@@ -58,6 +56,7 @@ from tests.cookies import (
 )
 from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, resolver_of
 from tests.fakes import connection as fake_connection
+from tests.wall_clock import INSTANT, freeze_wall_clock
 
 APP = "https://app.example.com"
 EVIL = "https://evil.example.com"
@@ -65,16 +64,6 @@ SECURE = "__Secure-better-auth.session_token"
 
 OTHER_SECRET = SharedSecret("Nf4Wq7zC2mVt9Bs5Kx1Ld8Hj6Yr3Pg0Zx")
 CSRF_SECRET = SharedSecret("Qb8Xm2vTz6Lp1RkYd9Wn4Hs7Cj3Fg5Ae")
-
-
-class _FixedClock:
-    """Stands in for `cookie_verifier.datetime`, whose `now(tz)` the expiry check reads."""
-
-    def __init__(self, instant: datetime) -> None:
-        self._instant = instant
-
-    def now(self, tz: Any = None) -> datetime:
-        return self._instant
 
 
 # ---------------------------------------------------------------- construction
@@ -306,10 +295,9 @@ class TestVerifyPipeline:
     ) -> None:
         """Strict expiry is `expires_at <= now`: a session expiring at EXACTLY the check instant is
         expired. Only a frozen clock distinguishes `<=` from `<`; year-2000/2999 cannot."""
-        instant = datetime(2026, 6, 1, tzinfo=timezone.utc)
-        monkeypatch.setattr(cv, "datetime", _FixedClock(instant))
+        freeze_wall_clock(monkeypatch)
         store = FakeStore(
-            sessions={CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN, expires_at=instant)}
+            sessions={CAPTURED_TOKEN: stored_session(CAPTURED_TOKEN, expires_at=INSTANT)}
         )
         with pytest.raises(SessionExpired):
             await run(verifier(store=store), http(cookie=f"{COOKIE}={sign(CAPTURED_TOKEN)}"))
