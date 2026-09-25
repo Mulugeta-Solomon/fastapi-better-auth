@@ -52,6 +52,7 @@ from .cookie_parsing import (
     MAX_COOKIE_HEADER_BYTES,
     MAX_COOKIE_PAIRS,
     acceptable_names,
+    accepted_cookie,
     cookie_pairs,
     parse_signed_value,
     resolve_named_cookie,
@@ -288,6 +289,11 @@ class RemoteVerifier:
         return self._cookie_name
 
     @property
+    def secure_prefix(self) -> str:
+        """The prefix on the hardened cookie name."""
+        return self._secure_prefix
+
+    @property
     def secure_cookies(self) -> bool:
         """Whether the single accepted name is the `__Secure-`-prefixed one (`True`) or the plain."""
         return self._secure_cookies
@@ -409,6 +415,8 @@ class RemoteVerifier:
         Returns:
             The verified session. `token` is the raw session token, `expires_at` the upstream
             expiry, and `raw` the get-session session payload - so `impersonatedBy` is reachable.
+            `id` is the session id upstream returned, `cookie` the `(name, value)` pair forwarded,
+            and `origin` the `allowed_origins` entry a shipped CSRF policy matched.
 
         Raises:
             InvalidCredential: A malformed cookie, a signature that verifies against no configured
@@ -426,7 +434,7 @@ class RemoteVerifier:
             name, material = resolve_named_cookie(credential.pairs, self._base)
             token = _rung_one(material)
             marker = fingerprint(token)
-            enforce_policy(self._csrf, credential.facts, token)
+            origin = enforce_policy(self._csrf, credential.facts, token)
             verified = self._rung_two(material, marker)
             if self._cache.holds(material):
                 raise null_outcome(verified, marker)
@@ -439,7 +447,7 @@ class RemoteVerifier:
             response = await self._fetched(outbound, marker)
             self._backoff.observe(response)
             record = self._document(response, material, marker, verified)
-            return self._session(record, token, marker, user_model)
+            return self._session(record, token, marker, user_model, (name, material), origin)
         finally:
             # `credential`/`record`/`response` carry the forwarded cookie/token as frame locals;
             # every verify() exit - success, the D-094/180/210 refusals, and the WP15 cache/latch/
@@ -606,11 +614,17 @@ class RemoteVerifier:
             material = ""
 
     def _session(
-        self, record: StoredSession, token: str, marker: str, user_model: type[UserModelT]
+        self,
+        record: StoredSession,
+        token: str,
+        marker: str,
+        user_model: type[UserModelT],
+        cookie: tuple[str, str],
+        origin: str | None,
     ) -> Session[UserModelT]:
         # parse_session_document guarantees the user is present, so the cast keeps that invariant
-        # local rather than re-checking a branch no reachable document can take. This frame holds
-        # the forwarded token and the record's copy of it; both are dropped before any refusal.
+        # local. This frame holds the forwarded token, the accepted cookie and the record's copy
+        # of the token; all are dropped before any refusal propagates.
         stored = cast("StoredUser", record.user)
         try:
             if not hmac.compare_digest(record.token.encode("utf-8"), token.encode("utf-8")):
@@ -619,9 +633,10 @@ class RemoteVerifier:
                 )
             _check_expiry(record, marker)
             _check_ban(stored, marker)
-            return _build_session(record, stored, token, user_model)
+            return _build_session(record, stored, token, user_model, cookie, origin)
         finally:
             token = ""
+            cookie = ("", "")
             del record, stored
 
 
@@ -685,12 +700,19 @@ def _check_ban(user: StoredUser, marker: str) -> None:
 
 
 def _build_session(
-    record: StoredSession, user: StoredUser, token: str, user_model: type[UserModelT]
+    record: StoredSession,
+    user: StoredUser,
+    token: str,
+    user_model: type[UserModelT],
+    cookie: tuple[str, str],
+    origin: str | None,
 ) -> Session[UserModelT]:
-    # The forwarded token, the record's copy of it, and the payload's own `token` column all live
-    # in this frame; all must be gone before it exits, on the refusal path as well as the return.
+    # The forwarded token, the accepted cookie, the record's copy of the token and the payload's
+    # own `token` column all live in this frame, and all are gone before it exits, refused or
+    # not. The last gate, `parse_user`, runs before `accepted_cookie` builds the pair.
     expires_at = record.expires_at
     impersonated_by = record.impersonated_by
+    session_id = record.id
     raw = record.payload
     del record
     try:
@@ -699,8 +721,12 @@ def _build_session(
             expires_at=expires_at,
             token=SecretStr(token),
             impersonated_by=impersonated_by,
+            id=session_id,
+            cookie=accepted_cookie(*cookie),
+            origin=origin,
             raw=raw,
         )
     finally:
         token = ""
+        cookie = ("", "")
         raw = {}

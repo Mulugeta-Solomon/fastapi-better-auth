@@ -28,9 +28,10 @@ from .cookie_parsing import (
     MAX_COOKIE_PAIRS,
     ParsedCookie,
     acceptable_names,
+    accepted_cookie,
     cookie_pairs,
     parse_signed_value,
-    resolve_cookie_value,
+    resolve_named_cookie,
     session_data_names,
 )
 from .csrf import CsrfFacts, CsrfPolicy, enforce_policy, validated_policy
@@ -269,7 +270,8 @@ class CookieVerifier:
         Returns:
             The verified session. `token` is the raw session token, `expires_at` is the stored
             expiry, and `raw` is the stored session payload - so `impersonatedBy` and the rest are
-            reachable there.
+            reachable there. `id` is the stored session's id, `cookie` the `(name, value)` pair
+            accepted, and `origin` the `allowed_origins` entry a shipped CSRF policy matched.
 
         Raises:
             InvalidCredential: For a malformed cookie or a signature that verifies against no key.
@@ -282,30 +284,34 @@ class CookieVerifier:
         """
         if not isinstance(credential, CookieCredential):
             raise InvalidCredential(reason="cookie credential snapshot is not this verifier's")
-        material = token = signature = ""
+        material = name = token = signature = ""
         parsed: ParsedCookie | None = None
         try:
-            material = resolve_cookie_value(credential.pairs, self._base)
+            name, material = resolve_named_cookie(credential.pairs, self._base)
             parsed = parse_signed_value(material)
             token = parsed.token
             signature = parsed.signature
             marker = fingerprint(token)
-            enforce_policy(self._csrf, credential.facts, token)
+            origin = enforce_policy(self._csrf, credential.facts, token)
             verify_signature(self._secrets, token, signature, marker)
-            return await self._resolved(token, marker, user_model)
+            return await self._resolved(token, marker, user_model, (name, material), origin)
         finally:
             # `credential` is a parameter, and a parameter is a frame local like any other
             # (D-094, D-180): it carries the whole cookie value, signature included.
             credential = None
-            material = token = signature = ""
+            material = name = token = signature = ""
             parsed = None
 
     async def _resolved(
-        self, token: str, marker: str, user_model: type[UserModelT]
+        self,
+        token: str,
+        marker: str,
+        user_model: type[UserModelT],
+        cookie: tuple[str, str],
+        origin: str | None,
     ) -> Session[UserModelT]:
-        # This frame holds the raw token across the store/expiry/ban refusals, and `record` holds
-        # it too - `StoredSession.token` is the raw token the store was found by (D-181). Scrub
-        # both before any of them propagates (D-094).
+        # This frame holds the raw token and the accepted cookie across the store/expiry/ban
+        # refusals, and `record` holds the token too (D-181). Scrub all of them (D-094).
         record: StoredSession | None = None
         stored: StoredUser | None = None
         try:
@@ -319,9 +325,10 @@ class CookieVerifier:
                 if stored is None:
                     raise SessionRevoked(reason=f"the session's user is absent [{marker}]")
             _check_ban(stored, marker)
-            return _session(record, stored, token, user_model)
+            return _session(record, stored, token, user_model, cookie, origin)
         finally:
             token = ""
+            cookie = ("", "")
             record = stored = None
 
     async def _looked_up(self, token: str, marker: str) -> StoredSession | None:
@@ -406,13 +413,19 @@ def _check_ban(user: StoredUser, marker: str) -> None:
 
 
 def _session(
-    record: StoredSession, user: StoredUser, token: str, user_model: type[UserModelT]
+    record: StoredSession,
+    user: StoredUser,
+    token: str,
+    user_model: type[UserModelT],
+    cookie: tuple[str, str],
+    origin: str | None,
 ) -> Session[UserModelT]:
-    # The raw token is in this frame three times - `token`, inside `record`, and inside the
-    # payload under upstream's own `token` column - and all three must be gone before it
-    # exits, on the refusal path as well as the return (D-181).
+    # The raw token is in this frame four times - `token`, `record`, `cookie` and the payload's
+    # own `token` column - and all are gone before it exits, refused or not (D-181). The last
+    # gate, `parse_user`, runs before `accepted_cookie` builds the pair.
     expires_at = record.expires_at
     impersonated_by = record.impersonated_by
+    session_id = record.id
     raw: Mapping[str, Any] = record.payload
     del record
     try:
@@ -421,10 +434,14 @@ def _session(
             expires_at=expires_at,
             token=SecretStr(token),
             impersonated_by=impersonated_by,
+            id=session_id,
+            cookie=accepted_cookie(*cookie),
+            origin=origin,
             raw=raw,
         )
     finally:
         token = ""
+        cookie = ("", "")
         raw = {}
 
 

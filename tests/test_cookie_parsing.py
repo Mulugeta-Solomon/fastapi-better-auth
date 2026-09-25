@@ -27,7 +27,7 @@ from fastapi_better_auth._internal.cookie_parsing import (
     acceptable_names,
     cookie_pairs,
     parse_signed_value,
-    resolve_cookie_value,
+    resolve_named_cookie,
     session_data_names,
 )
 
@@ -116,52 +116,52 @@ def pairs(*items: tuple[str, str]) -> tuple[tuple[str, str], ...]:
     return items
 
 
-class TestResolveCookieValue:
+class TestResolveNamedCookie:
     def test_a_single_cookie_for_the_base_is_returned(self) -> None:
-        assert resolve_cookie_value(pairs((COOKIE, "value")), COOKIE) == "value"
+        assert resolve_named_cookie(pairs((COOKIE, "value")), COOKIE) == (COOKIE, "value")
 
     def test_only_the_configured_base_is_read(self) -> None:
         """D1: with the plain base configured, a `__Secure-` cookie beside it is not read at all -
         the base resolves the plain value and the other name is another cookie's (D-189)."""
-        resolved = resolve_cookie_value(pairs((COOKIE, "plain"), (SECURE, "secure")), COOKIE)
+        resolved = resolve_named_cookie(pairs((COOKIE, "plain"), (SECURE, "secure")), COOKIE)
 
-        assert resolved == "plain"
+        assert resolved == (COOKIE, "plain")
 
     def test_a_duplicate_of_one_cookie_name_is_refused(self) -> None:
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(pairs((COOKIE, "one"), (COOKIE, "two")), COOKIE)
+            resolve_named_cookie(pairs((COOKIE, "one"), (COOKIE, "two")), COOKIE)
 
         assert "more than once" in caught.value.reason
 
     def test_a_whole_and_a_chunked_cookie_for_one_base_is_refused(self) -> None:
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(pairs((COOKIE, "whole"), (f"{COOKIE}.0", "chunk")), COOKIE)
+            resolve_named_cookie(pairs((COOKIE, "whole"), (f"{COOKIE}.0", "chunk")), COOKIE)
 
         assert "both whole and chunked" in caught.value.reason
 
     def test_contiguous_chunks_are_reassembled_in_index_order(self) -> None:
-        resolved = resolve_cookie_value(
+        resolved = resolve_named_cookie(
             pairs((f"{COOKIE}.1", "BB"), (f"{COOKIE}.0", "AA"), (f"{COOKIE}.2", "CC")),
             COOKIE,
         )
 
-        assert resolved == "AABBCC"
+        assert resolved == (COOKIE, "AABBCC")
 
     def test_a_gap_in_the_chunk_sequence_is_refused(self) -> None:
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(pairs((f"{COOKIE}.0", "AA"), (f"{COOKIE}.2", "CC")), COOKIE)
+            resolve_named_cookie(pairs((f"{COOKIE}.0", "AA"), (f"{COOKIE}.2", "CC")), COOKIE)
 
         assert "contiguous" in caught.value.reason
 
     def test_a_duplicate_chunk_index_is_refused(self) -> None:
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(pairs((f"{COOKIE}.0", "AA"), (f"{COOKIE}.0", "BB")), COOKIE)
+            resolve_named_cookie(pairs((f"{COOKIE}.0", "AA"), (f"{COOKIE}.0", "BB")), COOKIE)
 
         assert "contiguous" in caught.value.reason
 
     def test_chunks_that_do_not_start_at_zero_are_refused(self) -> None:
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(pairs((f"{COOKIE}.1", "AA"), (f"{COOKIE}.2", "BB")), COOKIE)
+            resolve_named_cookie(pairs((f"{COOKIE}.1", "AA"), (f"{COOKIE}.2", "BB")), COOKIE)
 
         assert "contiguous" in caught.value.reason
 
@@ -169,7 +169,7 @@ class TestResolveCookieValue:
         """Unreachable through extract, which only dispatches when a name matched; refused so a
         direct caller can never be handed an empty string."""
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(pairs(("unrelated", "x")), COOKIE)
+            resolve_named_cookie(pairs(("unrelated", "x")), COOKIE)
 
         assert "no session cookie material" in caught.value.reason
 
@@ -177,7 +177,7 @@ class TestResolveCookieValue:
         half = MAX_COOKIE_BYTES // 2 + 1
         chunked = pairs((f"{COOKIE}.0", "a" * half), (f"{COOKIE}.1", "b" * half))
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(chunked, COOKIE)
+            resolve_named_cookie(chunked, COOKIE)
 
         assert "over the cap" in caught.value.reason
 
@@ -330,21 +330,21 @@ class TestFrameLocalsHygiene:
     def test_a_non_contiguous_chunk_run_leaves_no_material_in_a_library_frame(self) -> None:
         crafted = pairs((f"{COOKIE}.0", MARK + "A"), (f"{COOKIE}.2", MARK + "C"))
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(crafted, COOKIE)
+            resolve_named_cookie(crafted, COOKIE)
 
         assert MARK not in _rendered_frames(caught.value)
 
     def test_a_duplicate_cookie_leaves_no_material_in_a_library_frame(self) -> None:
         crafted = pairs((COOKIE, MARK + "one"), (COOKIE, MARK + "two"))
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(crafted, COOKIE)
+            resolve_named_cookie(crafted, COOKIE)
 
         assert MARK not in _rendered_frames(caught.value)
 
     def test_a_whole_and_chunked_cookie_leaves_no_material_in_a_library_frame(self) -> None:
         crafted = pairs((COOKIE, MARK + "whole"), (f"{COOKIE}.0", MARK + "chunk"))
         with pytest.raises(InvalidCredential) as caught:
-            resolve_cookie_value(crafted, COOKIE)
+            resolve_named_cookie(crafted, COOKIE)
 
         assert MARK not in _rendered_frames(caught.value)
 

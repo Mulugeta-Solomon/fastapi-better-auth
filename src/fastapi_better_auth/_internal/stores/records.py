@@ -18,6 +18,14 @@ NOT_A_FLAG = (
     " there is no reading of a 1, a 'true' or anything else that is not a guess - and a guess on"
     " a ban check is a guess in the direction of letting a banned user through."
 )
+NOT_AN_ID = (
+    "StoredSession.id must be a str or None; got {kind}. It is the session row's own id, which"
+    " Session.id hands to the application as text - leave it out when the store does not know it."
+)
+BLANK_ID = (
+    "StoredSession.id must not be blank: a blank id names no session row. Pass None when the"
+    " store does not know it."
+)
 
 
 def freeze(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -36,6 +44,17 @@ def require_flag(value: object) -> bool | None:
     if value is None or isinstance(value, bool):
         return value
     raise TypeError(NOT_A_FLAG.format(kind=type(value).__name__))
+
+
+def require_optional_id(value: object) -> str | None:
+    """`None`, or non-blank text: what `Session.id` can carry without a verifier re-checking it."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(NOT_AN_ID.format(kind=type(value).__name__))
+    if not value.strip():
+        raise ValueError(BLANK_ID)
+    return value
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -111,11 +130,16 @@ class StoredSession:
         impersonated_by: The admin's user id when this session was created by the admin
             plugin's impersonation endpoint, and `None` both when the column does not exist and
             when nobody is impersonating. Treat it as *provenance*, not permission.
+        id: The session's own id - better-auth's `session.id` - which a verifier hands on as
+            `Session.id`. Not a credential, so it renders in `repr()`. The SQL store always sets
+            it (a row without a usable one is a miss); the Redis store sets it when the stored
+            document carries one. A store of your own may leave it out, and it is then `None`.
 
     Instances are immutable.
 
     Raises:
-        ValueError: If `expires_at` is naive.
+        ValueError: If `expires_at` is naive, or `id` is blank.
+        TypeError: If `id` is neither a `str` nor `None`.
     """
 
     token: str = field(repr=False)
@@ -124,7 +148,9 @@ class StoredSession:
     payload: Mapping[str, Any] = field(repr=False)
     user: StoredUser | None = None
     impersonated_by: str | None = None
+    id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", freeze(self.payload))
         require_aware("expires_at", self.expires_at)
+        require_optional_id(self.id)

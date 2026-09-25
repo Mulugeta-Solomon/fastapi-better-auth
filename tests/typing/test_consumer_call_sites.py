@@ -124,6 +124,9 @@ async def read_member(session: CurrentMember) -> dict[str, str]:
     assert_type(session.token, SecretStr | None)
     assert_type(session.expires_at, datetime | None)
     assert_type(session.raw, Mapping[str, Any])
+    assert_type(session.id, str | None)
+    assert_type(session.cookie, tuple[str, SecretStr] | None)
+    assert_type(session.origin, str | None)
     assert_type(session.user, User)  # pyright: ignore[reportAssertTypeFailure]
     return {"id": session.user.id, "role": session.user.role or ""}
 

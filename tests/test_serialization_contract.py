@@ -21,10 +21,16 @@ from pydantic import SecretStr
 from fastapi_better_auth import Session, User
 
 SECRET_TOKEN = "raw-session-token-9f3ab21ce4"
+EXPECTED_TOKEN = SecretStr(SECRET_TOKEN)
 RAW_MARKER = "203.0.113.7"
 MASK = "**********"
 IMPERSONATOR = "admin-9f3ab21c"
 """An admin's user id. Unlike the token it is *not* a credential, so it is published."""
+COOKIE_NAME = "__Secure-better-auth.session_token"
+COOKIE_VALUE = "raw-cookie-value-7c1de0a9f2%2B"
+"""The accepted cookie's value: the token and its signature, so a credential like the token."""
+SESSION_ID = "sess-row-4d2e8b"
+MATCHED_ORIGIN = "https://app.example.com"
 
 
 def a_session() -> Session[User]:
@@ -33,6 +39,9 @@ def a_session() -> Session[User]:
         expires_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
         token=SecretStr(SECRET_TOKEN),
         impersonated_by=IMPERSONATOR,
+        id=SESSION_ID,
+        cookie=(COOKIE_NAME, SecretStr(COOKIE_VALUE)),
+        origin=MATCHED_ORIGIN,
         raw={"session": {"ipAddress": RAW_MARKER}},
     )
 
@@ -79,6 +88,21 @@ def test_the_token_never_appears_in_a_local_serialization(channel: str) -> None:
 
 
 @pytest.mark.parametrize("channel", ["repr", "str", "model_dump", "model_dump_json"])
+def test_the_cookie_value_never_appears_in_a_local_serialization(channel: str) -> None:
+    """The name is published - it is the configured cookie name - and the value is masked."""
+    session = a_session()
+    rendered = {
+        "repr": repr(session),
+        "str": str(session),
+        "model_dump": str(session.model_dump()),
+        "model_dump_json": session.model_dump_json(),
+    }[channel]
+
+    assert COOKIE_VALUE not in rendered
+    assert COOKIE_NAME in rendered
+
+
+@pytest.mark.parametrize("channel", ["repr", "str", "model_dump", "model_dump_json"])
 def test_raw_never_appears_in_a_local_serialization(channel: str) -> None:
     session = a_session()
     rendered = {
@@ -97,15 +121,21 @@ def test_the_secret_is_still_reachable_on_purpose() -> None:
     token = a_session().token
 
     assert token is not None
-    assert token.get_secret_value() == SECRET_TOKEN
+    assert reveals(token, EXPECTED_TOKEN)
+
+
+def reveals(secret: SecretStr, expected: SecretStr) -> bool:
+    """`.get_secret_value()` reads the value back; compared here so a failure renders masks."""
+    return secret.get_secret_value() == expected.get_secret_value()
 
 
 def test_a_route_returning_a_session_leaks_neither_token_nor_raw() -> None:
     body, _ = route_body_and_schema()
 
     assert SECRET_TOKEN not in body
+    assert COOKIE_VALUE not in body
     assert RAW_MARKER not in body
-    assert MASK in body
+    assert json.loads(body)["cookie"] == [COOKIE_NAME, MASK]
 
 
 def test_the_openapi_schema_hides_raw_and_marks_the_token_write_only() -> None:
@@ -120,11 +150,23 @@ def test_the_openapi_schema_hides_raw_and_marks_the_token_write_only() -> None:
     assert string_variant["writeOnly"] is True
 
 
+def test_the_openapi_schema_marks_the_cookie_value_write_only_and_not_its_name() -> None:
+    _, schema = route_body_and_schema()
+    variants: list[dict[str, Any]] = session_schema(schema)["properties"]["cookie"]["anyOf"]
+    pair = next(v for v in variants if v.get("type") == "array")
+    name, value = pair["prefixItems"]
+
+    assert value["format"] == "password"
+    assert value["writeOnly"] is True
+    assert "writeOnly" not in name
+
+
 def test_the_whole_openapi_document_is_free_of_both() -> None:
     _, schema = route_body_and_schema()
     document = json.dumps(schema)
 
     assert SECRET_TOKEN not in document
+    assert COOKIE_VALUE not in document
     assert RAW_MARKER not in document
 
 
@@ -161,6 +203,17 @@ def test_the_new_session_key_reaches_the_route_body_and_the_schema() -> None:
 
     assert payload["impersonated_by"] == IMPERSONATOR
     assert "impersonated_by" in session_schema(schema)["properties"]
+
+
+@pytest.mark.parametrize(("key", "published"), [("id", SESSION_ID), ("origin", MATCHED_ORIGIN)])
+def test_the_session_id_and_the_matched_origin_are_published(key: str, published: str) -> None:
+    """Neither is a credential: a row id authenticates nothing, and the origin is configuration.
+    So both are dumped like `impersonated_by`, and unlike `token` and the cookie's value."""
+    body, schema = route_body_and_schema()
+
+    assert json.loads(body)[key] == published
+    assert published in a_session().model_dump_json()
+    assert key in session_schema(schema)["properties"]
 
 
 def test_the_response_is_a_real_response_not_an_error() -> None:
