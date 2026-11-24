@@ -20,7 +20,9 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from typing import NoReturn
 
+import jwt
 import pytest
 
 from fastapi_better_auth import (
@@ -108,6 +110,26 @@ async def test_an_exp_of_true_is_refused_though_pyjwt_calls_it_expired() -> None
 
     assert isinstance(error, SessionExpired)
     assert error.status_code == 401
+
+
+def _overflowing_decode(*_arguments: object, **_keywords: object) -> NoReturn:
+    raise OverflowError("int too large to convert")
+
+
+@pytest.mark.anyio
+async def test_an_overflow_inside_pyjwt_is_a_credential_refusal_whatever_its_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """By construction, so it holds on every PyJWT the floor admits. PyJWT 2.15.1 catches the
+    `OverflowError` its own `int()` raises on `Infinity` and answers `DecodeError`; a version
+    that does not would let it escape `verify` as an accident. RED before `OverflowError` was in
+    the decode's except tuple: the patched decode's exception escaped as itself."""
+    monkeypatch.setattr(jwt, "decode", _overflowing_decode)
+
+    error, _transport = await refused(SIGNER.sign(claims()))
+
+    assert isinstance(error, InvalidCredential)
+    assert error.__context__ is None and error.__cause__ is None
 
 
 @pytest.mark.anyio
