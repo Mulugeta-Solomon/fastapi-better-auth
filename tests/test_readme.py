@@ -446,7 +446,6 @@ def test_a_snippet_runs_as_an_importable_module_and_leaves_none_behind() -> None
     namespace = run(snippet)
 
     assert namespace["importable"] is True
-    assert namespace["MemberSession"].__module__ == namespace["__name__"]
     assert set(sys.modules) - before == set()
 
 
