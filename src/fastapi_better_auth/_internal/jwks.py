@@ -332,7 +332,7 @@ class JwksClient:
         if unloadable and not keys:
             # Every key that should have loaded did not: a corrupt set, not an empty one, and
             # answering "unknown kid" would send the operator hunting for a rotation instead.
-            raise self._unusable(f"none of its keys loaded ({unloadable} would not)")
+            raise self._unusable(f"no key loaded; {unloadable} did not load")
         return keys
 
     def _check_answer(self, response: TransportResponse) -> None:
