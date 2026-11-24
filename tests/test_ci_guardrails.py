@@ -156,6 +156,29 @@ def test_every_setup_uv_reads_its_version_from_pyproject() -> None:
         assert "version-file: pyproject.toml" in step, f"{workflow}:{job}"
 
 
+def uv_required_version() -> str | None:
+    """`[tool.uv].required-version`, read as text: Python 3.10 ships no `tomllib`."""
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    section = re.search(r"^\[tool\.uv\]\s*$(?P<body>.*?)(?=^\[)", text, re.MULTILINE | re.DOTALL)
+    if section is None:
+        return None
+    value = re.search(r'^required-version\s*=\s*"([^"]+)"', section["body"], re.MULTILINE)
+    return value.group(1) if value else None
+
+
+def test_pyproject_gives_every_setup_uv_a_version_to_read() -> None:
+    """With an explicit version-file, setup-uv throws when the file names no uv version, so
+    removing this key would turn every job that sets up uv red, release included."""
+    readers = [
+        s for s in steps_using("astral-sh/setup-uv") if "version-file: pyproject.toml" in s[2]
+    ]
+    required = uv_required_version()
+
+    assert readers
+    assert required is not None, "pyproject.toml has no [tool.uv] required-version"
+    assert re.fullmatch(r"[<>=!~]=?\s*\d+(\.\d+)*(\s*,\s*[<>=!~]=?\s*\d+(\.\d+)*)*", required)
+
+
 def test_uv_sync_never_re_resolves_a_stale_lock() -> None:
     syncs = [
         (workflow, job, block)
