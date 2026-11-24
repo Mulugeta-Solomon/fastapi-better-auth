@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
     from ..errors import AuthServiceUnavailable
-    from .sqlalchemy_core import Columns, Plan
+    from .sqlalchemy_core import Discovered, Plan
 
 Row = Mapping[str, Any]
 Rows = Sequence[Row]
@@ -107,11 +107,19 @@ class _CoreStore(ABC):
         return self._sql.session_from(found, plan, token)
 
     async def fetch_user_by_id(self, user_id: str) -> StoredUser | None:
-        """The user row with this id. See `SessionStore.fetch_user_by_id`."""
+        """The user row with this id. See `SessionStore.fetch_user_by_id`.
+
+        Where the database generates ids, `user_id` is the text Better Auth writes for one -
+        `"7"` for a serial id, lowercase hyphenated for a uuid - and is bound as the column's own
+        type. Any other spelling of it (`"07"`, upper-case hex) is a miss, never a query.
+        """
         if not user_id.strip():
             return None
         plan = await self._ready()
-        found = await self._select(plan.user_statement, {self._sql.USER_ID_PARAM: user_id})
+        bound = self._sql.bound_user_id(plan, user_id)
+        if bound is None:
+            return None
+        found = await self._select(plan.user_statement, {self._sql.USER_ID_PARAM: bound})
         self._outage.rearm()
         return self._sql.user_from(found, plan, user_id, check_identity=True)
 
@@ -129,17 +137,19 @@ class _CoreStore(ABC):
         session_allowed, user_allowed = self._allowed
         async with self._lock:
             if self._plan is None:
+                discovered = await self._columns()
                 self._plan = self._sql.plan_for(
                     session,
                     user,
                     self._schema,
-                    await self._columns(),
+                    discovered.columns,
+                    types=discovered.types,
                     session_allowed=session_allowed,
                     user_allowed=user_allowed,
                 )
             return self._plan
 
-    def _reflected(self, connection: Connection) -> dict[str, tuple[str, ...] | None]:
+    def _reflected(self, connection: Connection) -> Discovered:
         return self._sql.reflected(connection, self._names, self._schema)
 
     def _unavailable(
@@ -150,7 +160,7 @@ class _CoreStore(ABC):
         return self._sql.lookup_unavailable(params)
 
     @abstractmethod
-    async def _columns(self) -> Columns:
+    async def _columns(self) -> Discovered:
         """The columns each table has, read however this flavour reaches the database."""
 
     @abstractmethod
@@ -260,11 +270,11 @@ class SqlAlchemySessionStore(_CoreStore):
         )
         self._engine = self._sql.validated_async_engine(engine)
 
-    async def _columns(self) -> Columns:
+    async def _columns(self) -> Discovered:
         async with self._engine.connect() as connection:
             return await self._inspected(connection)
 
-    async def _inspected(self, connection: AsyncConnection) -> Columns:
+    async def _inspected(self, connection: AsyncConnection) -> Discovered:
         return await connection.run_sync(self._reflected)
 
     async def _select(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
@@ -356,10 +366,10 @@ class SyncStoreAdapter(_CoreStore):
         )
         self._limiter: anyio.CapacityLimiter | None = None
 
-    async def _columns(self) -> Columns:
+    async def _columns(self) -> Discovered:
         return await run_sync(self._inspected, abandon_on_cancel=True, limiter=self._get_limiter())
 
-    def _inspected(self) -> Columns:
+    def _inspected(self) -> Discovered:
         with self._engine.connect() as connection:
             return self._reflected(connection)
 

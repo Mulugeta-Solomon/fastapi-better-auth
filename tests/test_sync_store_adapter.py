@@ -22,6 +22,7 @@ import pytest
 from sqlalchemy import Engine
 
 from fastapi_better_auth import ConfigurationError, SyncStoreAdapter
+from fastapi_better_auth._internal.stores.sqlalchemy_core import Discovered
 from fastapi_better_auth._internal.stores.sqlalchemy_store import (
     DEFAULT_MAX_CONCURRENCY,
     _pool_ceiling,  # pyright: ignore[reportPrivateUsage]
@@ -107,8 +108,8 @@ class GatedSyncAdapter(SyncStoreAdapter):
         self._entered = 0
         self._peak = 0
 
-    def _inspected(self) -> dict[str, tuple[str, ...] | None]:
-        return dict(FAKE_COLUMNS)
+    def _inspected(self) -> Discovered:
+        return Discovered(columns=dict(FAKE_COLUMNS))
 
     def _queried(self, statement: Any, params: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
         with self._counter_lock:
