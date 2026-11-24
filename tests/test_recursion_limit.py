@@ -66,6 +66,20 @@ def collection_one_frame_short_of_the_limit() -> None:
         gc.set_threshold(*threshold)
 
 
+INSTRUMENT_CALIBRATED = sys.version_info < (3, 14)
+"""The interpreters the reproduction is calibrated for: where CI saw the failure, and 3.12/3.13.
+
+From 3.14 the recursion limit and the collector interact differently and the instrument no longer
+fires the same way (CI: 3.14 reports no unraisable exception at all, 3.15 reports one without the
+finalizer). The pause itself is still exercised there by the test under the marker.
+"""
+
+
+@pytest.mark.skipif(
+    not INSTRUMENT_CALIBRATED,
+    reason="the reproduction is calibrated for Python 3.10 to 3.13; later interpreters do not"
+    " finalize at this point in the same way",
+)
 def test_without_the_pause_the_collector_finalizes_a_dead_loop_at_the_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
