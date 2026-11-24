@@ -808,6 +808,83 @@ def test_an_issue_list_without_a_usable_creation_time_acts_on_nothing(
     assert gh.calls == []
 
 
+# --- report: recovered versus superseded ----------------------------------------------------
+
+
+def close_comments(gh: Gh) -> dict[str, str]:
+    return {call[2]: call[call.index("--comment") + 1] for call in gh.of("close")}
+
+
+def test_a_close_says_passed_only_when_the_titled_combination_was_retested(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    """The project supports only the latest release, so an old wheel's or an old `latest`'s
+    issue closes either way - but the comment must not claim a retest that did not happen."""
+    record(
+        script, tmp_path, lane="wheel", version="latest", outcome="success", harness="1.8.1",
+        wheel="0.3.0",
+    )  # fmt: skip
+    gh = Gh(
+        {
+            10: "canary: published wheel 0.2.0 fails conformance against better-auth@latest (1.8.1)",
+            11: "canary: published wheel 0.3.0 fails conformance against better-auth@latest (1.8.0)",
+            12: "canary: published wheel 0.3.0 fails conformance against better-auth@latest (1.8.1)",
+            13: "canary: published-wheel lane cannot run against better-auth@latest (unresolved)",
+            14: "canary: published-wheel lane cannot run against better-auth@latest (1.8.0)",
+        }
+    )
+
+    report(script, tmp_path, gh)
+
+    comments = close_comments(gh)
+    assert sorted(comments) == ["10", "11", "12", "13", "14"]
+    for number in ("10", "11", "14"):
+        text = comments[number].lower()
+        assert "superseded" in text, number
+        assert "not retested" in text, number
+        assert "better-auth 1.8.1" in comments[number], number
+    assert "wheel 0.2.0" in comments["10"]
+    assert "wheel 0.3.0" in comments["10"]
+    assert "better-auth 1.8.0" in comments["11"]
+    for number in ("12", "13"):
+        assert "superseded" not in comments[number].lower(), number
+        assert "passed" in comments[number], number
+
+
+def test_a_pinned_leg_always_recovers_what_it_titles(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
+    gh = Gh(STALE_OCTOBER)
+
+    report(script, tmp_path, gh)
+
+    comment = close_comments(gh)["95"]
+    assert "passed" in comment
+    assert "superseded" not in comment.lower()
+
+
+def test_superseding_never_widens_which_issues_a_leg_owns(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    record(
+        script, tmp_path, lane="wheel", version="1.7.1", outcome="success", harness="1.7.1",
+        wheel="0.3.0",
+    )  # fmt: skip
+    gh = Gh(
+        {
+            20: "canary: published wheel 0.2.0 fails conformance against better-auth@1.7.10",
+            21: "canary: published wheel 0.2.0 fails conformance against better-auth@1.7.1 (1.7.1)x",
+            22: "canary: published wheel 0.2.0 fails conformance against better-auth@1.7.1",
+        }
+    )
+
+    report(script, tmp_path, gh)
+
+    assert sorted(close_comments(gh)) == ["22"]
+    assert "superseded" in close_comments(gh)["22"].lower()
+
+
 # --- report: untrusted input and failed calls are loud --------------------------------------
 
 
