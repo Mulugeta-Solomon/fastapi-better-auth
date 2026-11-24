@@ -27,7 +27,9 @@ this one unless its scope allows it, and two hosts under a platform domain such 
 
 The CSRF policy refused it. Its `Origin` is not in `allowed_origins`, or the browser marked it
 `Sec-Fetch-Site: cross-site`. Add every front end's origin, and this API's own origin if its pages
-post back to it. See [CSRF](csrf.md).
+post back to it. See [CSRF](csrf.md). A front end on another site cannot write through a cookie
+mode at all, whatever is in `allowed_origins`; see
+[Deploying across two origins](cross-origin.md).
 
 ## A request is `400` with `{"detail": "Ambiguous request"}`
 

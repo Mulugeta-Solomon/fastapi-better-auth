@@ -76,8 +76,10 @@ Call the factory: `Depends(auth.current_session())`, with the parentheses. A bar
 
 ## Quickstart: Mode A
 
-A store answers two reads. This one is a dict, so the example runs anywhere; in production, use
-the SQL or Redis store that reads what Better Auth writes.
+A store answers two reads. This one is a dict, so the example runs anywhere. It starts empty and
+Better Auth does not write to it, so as written it refuses every cookie. To sign a real user in,
+use the SQL or Redis store that reads what Better Auth writes: see
+[Session stores](https://github.com/Mulugeta-Solomon/fastapi-better-auth/blob/main/docs/stores.md).
 
 ```python
 from typing import Annotated

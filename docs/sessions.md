@@ -102,9 +102,12 @@ async def revoke_current(session: CurrentSession) -> dict[str, bool]:
   `trustedOrigins` there are two lists, and Better Auth refuses the forward when the origin is only
   in yours. It trusts its own `baseURL` by default, so a front end on any other origin has to be
   named on both sides.
-- **A `GET` has no origin to forward.** No CSRF check runs on a safe method, so `session.origin` is
-  `None` there. A route that must forward from a `GET` chooses one of its own configured origins
-  itself, deliberately — or does not forward, which is what the recipe does.
+- **Do not forward a state-changing call from a `GET`.** No CSRF check runs on a safe method, so
+  `session.origin` is `None` there and nothing has checked where the request came from. A link on
+  another site can make a signed-in browser send that `GET` with its cookie. A route that then
+  forwards with an origin it picked itself presents a request nobody checked to Better Auth as a
+  trusted one. Forward only from an unsafe method that passed the CSRF check, with the origin the
+  check matched, which is what the recipe does.
 - **The cookie is a live credential on its way out.** Nothing above binds its value to a name
   outside the call that sends it; keep it that way, and keep the outbound request out of your logs.
   `tests/e2e/test_session_facts_live.py` runs this recipe against a live Better Auth server and

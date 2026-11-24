@@ -91,6 +91,18 @@ third-party cookie, and RFC 6265bis §7.1 records that most user agents now limi
 resources cannot rely on them being treated consistently. Where you can put both hosts under one
 domain you own, the same-site layout is the sturdier one.
 
+**A cookie mode takes no writes in this layout.** Both shipped CSRF policies, `OriginCheck` and
+`SignedDoubleSubmit`, refuse an unsafe request or a WebSocket handshake that the browser marks
+`Sec-Fetch-Site: cross-site`, whatever its `Origin` is: being in `allowed_origins` does not change
+that (see [CSRF](csrf.md#the-three-policies)). Every `fetch` from the front end to the API is
+cross-site here. So a `GET` that carries the cookie is served, and a `POST`, `PUT`, `PATCH` or
+`DELETE` that carries it is answered `403`. If the front end must write, choose one of these:
+
+- Put both hosts under one domain you own. That is the same-site layout above.
+- Serve the API under the front end's own origin, through a reverse proxy or a rewrite. The browser
+  then sees one origin, and the cookie never crosses a site.
+- Use [Mode B](mode-b-jwt.md). The front end sends a bearer token, and no cookie is involved.
+
 > **A platform domain cannot do this.** A `Domain=` attribute may not name a public suffix. RFC
 > 6265bis §5.7 step 9 is exact about it: a user agent configured to reject public suffixes **ignores
 > the cookie entirely**, unless the attribute is identical to the request host, in which case the
@@ -100,10 +112,11 @@ domain you own, the same-site layout is the sturdier one.
 > (14037), `up.railway.app` (15445), `onrender.com` (15477) and `vercel.app` (16269). So
 > `yourapp-web.up.railway.app` and `yourapp-api.up.railway.app` **cannot** share a cookie, and
 > neither can two `*.vercel.app` deployments — the browser drops the `Set-Cookie` and nothing in
-> either log says why. No configuration on either side changes it. The fallback that does work there
-> is the plain cross-site path above: `SameSite=None; Secure`, CORS with credentials, and
-> `OriginCheck`. Put a domain you own in front of both hosts and `crossSubDomainCookies` is back on
-> the table.
+> either log says why. No configuration on either side changes it. What is left there is the
+> cross-site path above, and in a cookie mode that path carries reads only, because this library's
+> CSRF policies refuse cross-site writes. Put a domain you own in front of both hosts and
+> `crossSubDomainCookies` is back on the table; or serve the API under the front end's own origin;
+> or use Mode B.
 
 **Either layout: what this side needs.** Nothing in this library changes between the two. The
 cookie's name does not depend on `SameSite` or `Domain=`: it is built from the cookie prefix and
@@ -118,7 +131,8 @@ both. What is on this side, in both:
    so name the front ends you actually serve.
 2. **The cookie mode's CSRF policy allows those same origins** — and it is not optional in either
    layout: a `None` cookie rides on cross-site requests and a `Lax` one on every sibling's, which is
-   why `csrf=` has no default.
+   why `csrf=` has no default. In the cross-site layout an allowed origin is still not enough for a
+   write, as described above.
 
 Both are in this application, and it is the same application for either layout:
 
