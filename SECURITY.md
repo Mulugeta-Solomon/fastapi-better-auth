@@ -25,9 +25,11 @@ deployment's security posture. The versions each release is verified against are
 ## Dependency floors
 
 The declared lower bounds are security floors, not merely API floors. In particular `PyJWT` is
-required at **2.12.0 or newer** (CVE-2026-32597: unknown `crit` header extensions were accepted),
-and independently of the installed version this library refuses any token that declares a `crit`
-header at all, because Better Auth never emits one and no extension is supported here.
+required at **2.15.0 or newer**: 2.15.0 reports a token nested too deeply to parse as a
+`DecodeError` rather than a raw `RecursionError`, and it includes the 2.14.0 security fixes to
+`jwt.decode` and the CVE-2026-32597 fix from 2.12.0 (unknown `crit` header extensions were
+accepted). Independently of the installed version, this library refuses any token that declares
+a `crit` header at all, because Better Auth never emits one and no extension is supported here.
 
 ## What this library trusts, and what it does not
 
