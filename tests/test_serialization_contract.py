@@ -15,10 +15,10 @@ from typing import Any
 import httpx2
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from fastapi_better_auth import Session, User
+from tests.fakes import TestClient
 
 SECRET_TOKEN = "raw-session-token-9f3ab21ce4"
 EXPECTED_TOKEN = SecretStr(SECRET_TOKEN)

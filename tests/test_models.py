@@ -182,7 +182,7 @@ def test_a_naive_user_timestamp_is_read_as_utc() -> None:
 def test_a_naive_session_expiry_is_rejected() -> None:
     """We are the expiry enforcer: a naive value reads the wrong clock fail-open (A3)."""
     with pytest.raises(ValidationError):
-        naive = datetime(2026, 9, 1)  # noqa: DTZ001 - the naive value is the subject
+        naive = datetime(2026, 9, 1)  # naive on purpose: it is the subject
         Session[User](user=base_user(), expires_at=naive, raw={})
 
 

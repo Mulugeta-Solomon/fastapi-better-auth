@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import functools
 import inspect
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Generator, Mapping
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from datetime import datetime, timezone
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 import anyio
 from fastapi import Depends, FastAPI, params
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient as _StarletteTestClient
 from starlette.requests import HTTPConnection
+from starlette.testclient import WebSocketTestSession
+from typing_extensions import Self
 
 from fastapi_better_auth import (
     BetterAuth,
@@ -389,6 +392,43 @@ def resolver_of(dependency: Callable[..., Any]) -> Callable[..., Awaitable[Sessi
     anchored = default.dependency
     assert anchored is not None
     return anchored
+
+
+class TestClient(_StarletteTestClient):
+    """Starlette's `TestClient`, unchanged at runtime, with an `__enter__` pyright can read.
+
+    Why it exists: `[tool.pyright]` checks against Python 3.10, but pyright reads the
+    installed packages from the dev venv, which runs a newer Python. There, starlette >= 1.8
+    and httpx2 >= 2.14 (both require Python 3.11) annotate `__enter__` with `typing.Self`, a
+    name that does not exist when the file is read as 3.10. Pyright reads the package's own
+    file at the global version whatever the importing file is, so every `with ... as http:`
+    target became Unknown, and strict mode turned that into hundreds of errors downstream.
+    This works with every starlette the lock resolves: older ones type `__enter__` anyway.
+
+    When it can go: once pyright reads a venv whose Python matches `pythonVersion` (a 3.10
+    venv resolves starlette releases that still support 3.10), or once the library's floor
+    reaches Python 3.11. Then import `TestClient` from `fastapi.testclient` again.
+    """
+
+    def __enter__(self) -> Self:
+        # Typed view of the parent: its own `__enter__` reads as Unknown for the reason above.
+        cast("AbstractContextManager[object]", super()).__enter__()
+        return self
+
+
+@contextmanager
+def websocket(
+    http: TestClient, url: str, *, headers: Mapping[str, str]
+) -> Generator[WebSocketTestSession, None, None]:
+    """`http.websocket_connect(...)` as a context manager pyright can read; see `TestClient`.
+
+    `WebSocketTestSession.__enter__` carries the same `typing.Self` annotation, so the session
+    is entered through an `ExitStack` and handed back by its own, known type.
+    """
+    with ExitStack() as stack:
+        session = http.websocket_connect(url, headers=dict(headers))
+        stack.enter_context(session)
+        yield session
 
 
 def client(app: FastAPI, backend: str = "asyncio") -> TestClient:

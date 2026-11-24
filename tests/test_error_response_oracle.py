@@ -18,7 +18,6 @@ import httpx2
 import pytest
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.testclient import TestClient
 
 from fastapi_better_auth import (
     AmbiguousCredentials,
@@ -32,7 +31,7 @@ from fastapi_better_auth import (
     SessionExpired,
     SessionRevoked,
 )
-from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, session_app
+from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, TestClient, session_app
 
 UNAUTHENTICATED_CASES: tuple[tuple[str, type[SessionError], str], ...] = (
     ("invalid", InvalidCredential, "signature mismatch kid=iRAEH8dY tok_fp=9f3ab21c"),

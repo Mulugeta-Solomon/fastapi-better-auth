@@ -30,6 +30,7 @@ import json
 import pathlib
 import re
 import sys
+import types
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
@@ -39,8 +40,7 @@ import anyio
 import httpx
 import httpx2
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+from fastapi import FastAPI, testclient
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -58,6 +58,7 @@ from tests.cookies import COOKIE, FakeStore, sign, stored_session
 from tests.cookies import SECRET as COOKIE_SECRET
 from tests.cookies import http as cookie_request
 from tests.cookies import run as run_cookie_mode
+from tests.fakes import TestClient
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
@@ -213,12 +214,23 @@ def run(snippet: Snippet) -> dict[str, Any]:
 
     Compiled with `dont_inherit=True`: a reader's module does not have this file's
     `from __future__ import annotations`, so the snippet must not run under it either.
+
+    Run as a real module, registered in `sys.modules` while its top level executes, because a
+    reader's file is one: pydantic 2.14 looks the module up by `__name__` when a generic model
+    is parametrized at module level. Unregistered afterwards, success or failure, so no
+    snippet outlives its run or is found by the next one.
     """
-    namespace: dict[str, Any] = {"__name__": f"readme_snippet_{snippet.line}"}
+    name = f"readme_snippet_{snippet.line}"
+    assert name not in sys.modules, f"{name} is already a module; snippets must not nest"
+    module = types.ModuleType(name)
     code = compile(snippet.code, f"<{snippet.id}>", "exec", dont_inherit=True)
-    # The source is this repository's own documentation, and running it IS the test.
-    exec(code, namespace)  # noqa: S102
-    return namespace
+    sys.modules[name] = module
+    try:
+        # The source is this repository's own documentation, and running it IS the test.
+        exec(code, module.__dict__)  # noqa: S102
+    finally:
+        del sys.modules[name]
+    return module.__dict__
 
 
 def factory_apps(namespace: Mapping[str, Any]) -> tuple[FastAPI, ...]:
@@ -407,6 +419,46 @@ def test_the_extractor_catches_a_snippet_that_stopped_working(tmp_path: pathlib.
         run(extracted[0])
 
 
+MODULE_LEVEL_GENERIC = """\
+import sys
+
+from fastapi_better_auth import Session, User
+
+
+class Member(User):
+    pass
+
+
+MemberSession = Session[Member]
+importable = sys.modules[__name__].__dict__ is globals()
+"""
+"""What a reader's module does at top level: parametrize a generic model, and be importable.
+
+Pydantic 2.14 registers a module-level `Session[Member]` in `sys.modules[__name__]`, so a
+snippet that runs in a namespace no module owns fails where the reader's file would not.
+"""
+
+
+def test_a_snippet_runs_as_an_importable_module_and_leaves_none_behind() -> None:
+    snippet = Snippet(document="RUNNER.md", line=1, code=MODULE_LEVEL_GENERIC)
+    before = set(sys.modules)
+
+    namespace = run(snippet)
+
+    assert namespace["importable"] is True
+    assert set(sys.modules) - before == set()
+
+
+def test_a_snippet_that_fails_leaves_no_module_behind() -> None:
+    snippet = Snippet(document="RUNNER.md", line=2, code="raise RuntimeError('fence')")
+    before = set(sys.modules)
+
+    with pytest.raises(RuntimeError, match="fence"):
+        run(snippet)
+
+    assert set(sys.modules) - before == set()
+
+
 @pytest.mark.parametrize("snippet", ALL_SNIPPETS, ids=[snippet.id for snippet in ALL_SNIPPETS])
 @pytest.mark.usefixtures("snippet_environment")
 def test_every_snippet_runs(
@@ -591,7 +643,8 @@ def clock_fence_test(backend: str) -> Callable[[], object]:
     namespace = run(found[0])
     tests = [value for name, value in namespace.items() if name.startswith("test_")]
     assert len(tests) == 1, f"the clock fence defines {len(tests)} test functions, not one"
-    bound = functools.partial(TestClient, backend=backend)  # pyright: ignore[reportArgumentType]
+    # The class a reader imports, not the typed one the rest of this file uses.
+    bound = functools.partial(testclient.TestClient, backend=backend)  # pyright: ignore[reportArgumentType]
     namespace["TestClient"] = bound
     return tests[0]
 
