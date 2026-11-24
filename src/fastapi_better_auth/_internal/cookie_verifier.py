@@ -180,12 +180,12 @@ class CookieVerifier:
             verdict on the credential, logged once as a WARNING of the kind
             `LookupDeadlineExceeded` until a lookup completes again. A store that cannot be
             interrupted and answers after the deadline anyway is refused the same way: a late
-            answer is never honoured, nor is a refusal the store raises late. A cancellation from outside (a client gone, a server
-            shutting down, a deadline of your own) stays a cancellation. `None` disables it, for
-            a caller that enforces its own deadline. A store that blocks a worker thread
-            (`SyncStoreAdapter`) is released from the request at the deadline, but the thread
-            cannot be interrupted: its call runs on, holding its connection, until the database
-            answers.
+            answer is never honoured, nor is a refusal the store raises late. A cancellation
+            from outside (a client gone, a server shutting down, a deadline of your own) stays a
+            cancellation. `None` disables it, for a caller that enforces its own deadline. A
+            store that blocks a worker thread (`SyncStoreAdapter`) is released from the request
+            at the deadline, but the thread cannot be interrupted: its call runs on, holding its
+            connection, until the database answers.
 
     Raises:
         ConfigurationError: For any unusable configuration, at construction: neither or both of
