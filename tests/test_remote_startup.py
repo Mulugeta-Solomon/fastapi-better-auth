@@ -36,6 +36,7 @@ from fastapi_better_auth import (
 )
 from fastapi_better_auth._internal import remote_probe
 from fastapi_better_auth._internal.once import Once
+from tests.fakes import TestClient
 from tests.transports import Reply, ScriptedTransport, json_reply
 
 UserModelT = TypeVar("UserModelT", bound=User)
@@ -182,10 +183,14 @@ async def test_probe_refuses_a_json_content_type_with_an_unparseable_body() -> N
 
 
 async def test_probe_refuses_a_non_routing_status() -> None:
+    """A `4xx` outside the routing set is still a contract failure. This test used `500` until
+    the transient-status ruling: a `5xx` (like `408`, `425` and `429`) now means the upstream could
+    not answer right now and is an `AuthServiceUnavailable` that is retried, not a verdict - see
+    `test_remote_probe_transient.py`. `403` keeps pinning the non-routing message."""
     with pytest.raises(ConfigurationError) as caught:
-        await verifier(ScriptedTransport(Reply(b"", status=500))).probe()
+        await verifier(ScriptedTransport(Reply(b"", status=403))).probe()
 
-    assert "500" in str(caught.value)
+    assert "403" in str(caught.value)
     assert "must answer 200" in str(caught.value)
 
 
@@ -639,8 +644,6 @@ async def test_lifespan_surfaces_a_probe_failure() -> None:
 def test_lifespan_wires_into_fastapi_and_a_probe_failure_stops_startup() -> None:
     """The operator-facing shape: FastAPI(lifespan=auth.lifespan). A contract failure makes the
     ASGI lifespan startup fail, so the server never begins serving."""
-    from fastapi.testclient import TestClient
-
     v = verifier(ScriptedTransport(Reply(b'{"not": "null"}')))
     auth = BetterAuth(verifiers=[v])
     app = FastAPI(lifespan=auth.lifespan)
