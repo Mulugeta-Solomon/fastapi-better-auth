@@ -8,10 +8,15 @@ of that would be two chances to stop agreeing.
 from __future__ import annotations
 
 import logging
-from typing import Any
+import threading
+from typing import TYPE_CHECKING, Any
 
 import anyio
+import anyio.to_thread
 import pytest
+
+if TYPE_CHECKING:
+    from sqlalchemy import Engine
 
 from fastapi_better_auth import (
     CookieVerifier,
@@ -31,6 +36,15 @@ honours its deadline is back in tens of milliseconds, so the guard only ever fir
 DEADLINE = 0.02
 """The `lookup_timeout` the overrun cases configure: short enough to keep the suite fast, and
 above Windows' ~15 ms timer granularity so it is a deadline rather than a coin toss."""
+
+LONG = 60.0
+"""A `lookup_timeout` no case waits out, for a lookup that a test abandons itself."""
+
+WEDGE_BACKSTOP = 30.0
+"""How long a `DriverGate` holds a statement before giving up on the test that should have
+released it. This is a backstop against a wedged suite, never a margin a test relies on: every
+step of a test that holds the gate is bounded by its own, much shorter `GUARD`, so a test that
+reaches this has already failed."""
 
 CREDENTIAL = f"{COOKIE}={sign(CAPTURED_TOKEN)}"
 
@@ -90,6 +104,51 @@ def verifier(store: SessionStore, **options: Any) -> CookieVerifier:
         secure_cookies=False,
         **options,
     )
+
+
+class DriverGate:
+    """Holds every statement a sync engine sends in `do_execute` until released, and counts.
+
+    This stands in for a database that has stopped answering, met exactly where a worker thread
+    meets one. `entries` counts every call that ever reached the driver, `inside` the calls held
+    right now, and `peak` the most held at once. `entered(n)` is how a test knows, by an event
+    and not by a timer, that `n` calls have reached the driver.
+    """
+
+    def __init__(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.release = threading.Event()
+        self._changed = threading.Condition()
+        self.entries = 0
+        self.inside = 0
+        self.peak = 0
+        original = engine.dialect.do_execute
+
+        def do_execute(cursor: Any, statement: str, parameters: Any, context: Any = None) -> None:
+            with self._changed:
+                self.entries += 1
+                self.inside += 1
+                self.peak = max(self.peak, self.inside)
+                self._changed.notify_all()
+            try:
+                if not self.release.wait(WEDGE_BACKSTOP):
+                    raise RuntimeError("DriverGate was never released; the test wedged")
+                original(cursor, statement, parameters, context)
+            finally:
+                with self._changed:
+                    self.inside -= 1
+                    self._changed.notify_all()
+
+        monkeypatch.setattr(engine.dialect, "do_execute", do_execute)
+
+    async def entered(self, count: int) -> None:
+        """Wait until `count` calls in all have reached the driver, or fail the test."""
+
+        def reached() -> bool:
+            with self._changed:
+                return self._changed.wait_for(lambda: self.entries >= count, GUARD)
+
+        if not await anyio.to_thread.run_sync(reached):
+            pytest.fail(f"only {self.entries} of {count} calls reached the driver in {GUARD}s")
 
 
 async def every_slot_returned(store: SyncStoreAdapter) -> None:
