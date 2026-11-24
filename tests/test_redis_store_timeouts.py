@@ -9,11 +9,14 @@ option written into the URL's query string wins over both, which is redis-py's o
 
 from __future__ import annotations
 
+import asyncio
 import math
+import time
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from fastapi_better_auth import ConfigurationError, RedisSessionStore
 from fastapi_better_auth._internal.stores import redis_store as redis_store_module
@@ -95,6 +98,36 @@ class TestTheUrlWins:
 
         assert options["socket_timeout"] == 7
         assert options["socket_connect_timeout"] == DEFAULT_CONNECT_SECONDS
+
+
+class TestASilentRedis:
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("anyio_backend", ["asyncio"])
+    async def test_a_server_that_accepts_and_never_answers_cannot_hold_a_lookup(self) -> None:
+        """The behaviour the deadlines exist for, against a real socket: a listener that accepts
+        the connection and then says nothing. Without a read deadline this awaits forever."""
+        held: list[asyncio.StreamWriter] = []
+
+        async def silent(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            held.append(writer)
+
+        server = await asyncio.start_server(silent, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        url = f"redis://127.0.0.1:{port}/0"
+        started = time.monotonic()
+        try:
+            async with RedisSessionStore(url=url, socket_timeout=0.2) as store:
+                with pytest.raises(RedisTimeoutError) as caught:
+                    await asyncio.wait_for(store.fetch_session_by_token("t" * 32), timeout=10)
+        finally:
+            for writer in held:
+                writer.close()
+            server.close()
+            await server.wait_closed()
+
+        # redis-py's TimeoutError, not the outer `wait_for`'s: the store's own deadline fired.
+        assert isinstance(caught.value, RedisTimeoutError)
+        assert time.monotonic() - started < 5
 
 
 class TestRefusals:

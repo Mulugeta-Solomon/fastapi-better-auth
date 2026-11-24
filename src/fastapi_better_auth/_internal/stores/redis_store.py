@@ -31,10 +31,13 @@ loopback connect takes about two seconds on Windows, and a shorter deadline woul
 nobody listens on as a timeout instead of the refusal it is."""
 
 READ_TIMEOUT_SECONDS = 2.0
-"""How long a client built from `url=` waits for one reply - one `GET` of a value capped at
-`MAX_VALUE_BYTES`, which a healthy Redis answers in well under a millisecond. A lookup issues two,
-so a Redis that accepts connections and then stops answering costs a request at most
-`CONNECT_TIMEOUT_SECONDS + 2 * READ_TIMEOUT_SECONDS` before the verifier refuses it."""
+"""How long a client built from `url=` waits on one socket operation - a reply to one `GET` of a
+value capped at `MAX_VALUE_BYTES`, which a healthy Redis answers in well under a millisecond.
+
+It is a deadline per operation, not per lookup. A lookup issues two `GET`s, a fresh connection
+also waits on redis-py's own handshake replies, and a retry policy given in the URL multiplies
+all of it - so a silent Redis costs a lookup a few multiples of this, not one, and never an
+unbounded wait."""
 
 SOCKET_TIMEOUT = "socket_timeout"
 SOCKET_CONNECT_TIMEOUT = "socket_connect_timeout"
@@ -232,10 +235,11 @@ class RedisSessionStore:
         max_bytes: The largest stored value this store will parse. It bounds the parse and the
             record, not the read - the client has already received the value by the time it gets
             here - so read it as a refusal to believe something absurd, not as a DoS control.
-        socket_timeout: Seconds a client built from `url` waits for one reply; 2 by default. A
-            lookup issues two `GET`s, so a Redis that stops answering costs a request at most
-            the connect deadline plus twice this. An option of the same name in the URL's query
-            string (`?socket_timeout=5`) wins, which is redis-py's own precedence.
+        socket_timeout: Seconds a client built from `url` waits on one socket operation; 2 by
+            default. Per operation, not per lookup: two `GET`s, a new connection's handshake and
+            any retry policy each wait up to this. An option of the same name in the URL's query
+            string (`?socket_timeout=5`) wins over this argument, which is redis-py's own
+            precedence.
         socket_connect_timeout: Seconds a client built from `url` waits to connect; 3 by
             default, and overridden by the URL's query string the same way. Neither deadline may
             be changed alongside `client`: a lent client is never modified.
