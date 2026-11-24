@@ -478,19 +478,18 @@ def test_the_canary_label_is_ensured_before_an_issue_is_created(
     ],
     ids=["missing-fields", "newline", "unknown-outcome", "not-an-object"],
 )
-def test_a_tampered_result_file_is_refused_before_any_issue_call(
-    script: Report, tmp_path: pathlib.Path, document: object
+def test_a_tampered_result_file_is_rejected_and_its_leg_left_alone(
+    script: Report, capsys: pytest.CaptureFixture[str], tmp_path: pathlib.Path, document: object
 ) -> None:
     leg = tmp_path / "canary-result-head-1.7.1"
     leg.mkdir()
     (leg / "canary-result.json").write_text(json.dumps(document), encoding="utf-8")
     gh = Gh(STALE_OCTOBER)
 
-    with pytest.raises(SystemExit) as exited:
-        report(script, tmp_path, gh)
+    assert report(script, tmp_path, gh) == 1
 
-    assert exited.value.code == 1
     assert gh.calls == []
+    assert "::error::" in capsys.readouterr().err
 
 
 def result_bytes(script: Report, staging: pathlib.Path, *, lane: str, version: str) -> bytes:
@@ -511,7 +510,12 @@ def result_bytes(script: Report, staging: pathlib.Path, *, lane: str, version: s
     ids=["other-version", "other-lane", "prefix-version", "other-lane-latest"],
 )
 def test_a_leg_may_only_speak_for_itself(
-    script: Report, tmp_path: pathlib.Path, directory: str, lane: str, version: str
+    script: Report,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+    directory: str,
+    lane: str,
+    version: str,
 ) -> None:
     """A leg that ran compromised upstream code must not close, or collide with, another leg.
 
@@ -524,11 +528,10 @@ def test_a_leg_may_only_speak_for_itself(
     (results / directory / "canary-result.json").write_bytes(planted)
     gh = Gh(STALE_OCTOBER)
 
-    with pytest.raises(SystemExit) as exited:
-        report(script, results, gh)
+    assert report(script, results, gh) == 1
 
-    assert exited.value.code == 1
     assert gh.calls == []
+    assert "::error::" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -541,7 +544,7 @@ def test_a_leg_may_only_speak_for_itself(
     ids=["flat", "unnamed-directory", "nested"],
 )
 def test_a_result_outside_its_legs_artifact_directory_is_refused(
-    script: Report, tmp_path: pathlib.Path, where: str
+    script: Report, capsys: pytest.CaptureFixture[str], tmp_path: pathlib.Path, where: str
 ) -> None:
     """Only `<results>/canary-result-<lane>-<version>/canary-result.json` can be bound to a leg.
 
@@ -557,11 +560,28 @@ def test_a_result_outside_its_legs_artifact_directory_is_refused(
     target.write_bytes(planted)
     gh = Gh(STALE_OCTOBER)
 
-    with pytest.raises(SystemExit) as exited:
-        report(script, results, gh)
+    assert report(script, results, gh) == 1
 
-    assert exited.value.code == 1
     assert gh.calls == []
+    assert "::error::" in capsys.readouterr().err
+
+
+def test_a_rejected_result_does_not_block_valid_legs_or_the_watch(
+    script: Report, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Validation stays exactly as strict; only its blast radius shrinks to the one file."""
+    record(script, tmp_path, lane="head", version="1.6.30", outcome="success", harness="1.6.30")
+    bad = tmp_path / "canary-result-head-1.7.1"
+    bad.mkdir()
+    (bad / "canary-result.json").write_text("{not json", encoding="utf-8")
+    gh = Gh({**STALE_OCTOBER, 7: WATCH_TITLE})
+
+    assert report(script, tmp_path, gh, watch="success") == 1
+
+    assert sorted(numbers(gh.of("close"))) == ["7", "96"]
+    error = capsys.readouterr().err
+    assert "::error::" in error
+    assert "canary-result-head-1.7.1" in error
 
 
 @pytest.mark.parametrize(
