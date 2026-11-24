@@ -1,4 +1,4 @@
-"""The Redis store: one `GET` on the raw token, and nothing else - ever.
+"""The Redis store: a `GET` on the raw token, one on its user's revocation watermark, nothing else.
 
 When better-auth is configured with secondary storage, Redis is the whole truth: the Postgres
 session table may never receive the row at all, and a session that was signed out is *gone from
@@ -46,6 +46,7 @@ from tests.stores import (
 )
 
 UNKNOWN_TOKEN = "5RmMvJt3xQ8bWfKcApZnUhLd2YeGsT7q"
+WATERMARK_KEY = f"revoked-sessions-before-{USER_ID}"
 EXTRA = "fastapi-better-auth-bridge[redis]"
 FAR_FUTURE_ISO = "2999-01-01T00:00:00.000Z"
 VERIFIER_SECRET = SharedSecret("Qb8Xm2vTz6Lp1RkYd9Wn4Hs7Cj3Fg5Ae")
@@ -86,7 +87,7 @@ class TestFetchSessionByToken:
 
         record = await store.fetch_session_by_token(TOKEN)
 
-        assert client.calls == [("get", (TOKEN,))]
+        assert client.calls == [("get", (TOKEN,)), ("get", (WATERMARK_KEY,))]
         assert record is not None
         assert record.token == TOKEN
         assert record.user_id == USER_ID
@@ -97,14 +98,16 @@ class TestFetchSessionByToken:
         assert record.user.payload["email"] == "seed@example.com"
 
     @pytest.mark.anyio
-    async def test_the_happy_path_costs_exactly_one_round_trip(self) -> None:
-        """The stored value already carries the user, so the second fetch a database needs
-        does not exist here. A store that issued it anyway would be paying for nothing."""
+    async def test_the_happy_path_costs_exactly_two_round_trips(self) -> None:
+        """The stored value already carries the user, so the user fetch a database needs does
+        not exist here. The second round trip is the revocation watermark, named by the stored
+        `userId` and so not foldable into the first; anything beyond the two is paying for
+        nothing."""
         store, client = store_over(**{TOKEN: stored()})
 
         await store.fetch_session_by_token(TOKEN)
 
-        assert len(client.calls) == 1
+        assert len(client.calls) == 2
 
     @pytest.mark.anyio
     async def test_the_z_suffixed_timestamp_is_read_as_aware_utc(self) -> None:
@@ -411,14 +414,20 @@ class TestReadOnly:
         """Asserted against the commands the client actually received. The Node side owns every
         write, including the touch that extends a session - one issued here would rewrite an
         expiry the bridge is only supposed to read."""
-        store, client = store_over(**{TOKEN: stored()})
+        revoked = stored(
+            session=wire_session(token=UNKNOWN_TOKEN, createdAt="2000-01-01T00:00:00.000Z")
+        )
+        store, client = store_over(
+            **{TOKEN: stored(), UNKNOWN_TOKEN: revoked, WATERMARK_KEY: "946684800001"}
+        )
 
-        await store.fetch_session_by_token(TOKEN)
-        await store.fetch_session_by_token(UNKNOWN_TOKEN)
+        assert await store.fetch_session_by_token(TOKEN) is not None
+        assert await store.fetch_session_by_token(UNKNOWN_TOKEN) is None  # revoked
         await store.fetch_session_by_token("")
         await store.fetch_user_by_id(USER_ID)
 
         assert client.commands == {"get"}
+        assert len(client.calls) == 4
 
 
 class TestKeyPrefix:
@@ -433,7 +442,7 @@ class TestKeyPrefix:
         record = await store.fetch_session_by_token(TOKEN)
 
         assert record is not None
-        assert client.calls == [("get", (f"ba:{TOKEN}",))]
+        assert client.calls == [("get", (f"ba:{TOKEN}",)), ("get", (f"ba:{WATERMARK_KEY}",))]
 
 
 class TestConstruction:
