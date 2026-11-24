@@ -61,8 +61,8 @@ JURISDICTION_BODY = {"code": "outside_jurisdiction", "covers": ["Ada East Distri
 ACCIDENT = "a helper's own words that must never reach the wire"
 CLIENT_LOGGERS = frozenset({"httpx2", "asyncio"})
 
-RECIPE_PAGE = ROOT / "README.md"
-RECIPE_HEADING = "#### A refusal that explains"
+RECIPE_PAGE = ROOT / "docs" / "authorization.md"
+RECIPE_HEADING = "### A refusal that explains"
 RECIPE_MARKER = "class PermissionDenied(AuthorizationRefused):"
 JSON_FENCE = "```json\n"
 

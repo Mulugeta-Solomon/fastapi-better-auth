@@ -113,8 +113,8 @@ signature of the wrong length, and a well-formed envelope whose HMAC does not ve
 BASE_URL = "https://auth.example.com"
 BROKEN_SNIPPET = "```python\nfrom fastapi_better_auth import BetterAuht\n```\n"
 
-TESTING_HEADING = Heading(README, "## Testing")
-CLOCK_HEADING = Heading(README, "### Moving the verifier's clock")
+TESTING_HEADING = Heading(DOCS / "testing.md", "## Override the session dependency")
+CLOCK_HEADING = Heading(DOCS / "testing.md", "## Moving the verifier's clock")
 HTTP_CLIENTS = ("httpx", "httpx2")
 """The two libraries a bare `fastapi-better-auth-bridge` install has neither of (#65)."""
 
@@ -128,7 +128,7 @@ cookies are refused at the signature, so the store behind it is never asked anyt
 """
 LANE_SECRET = "readme-lane-secret-that-signs-nothing-it-is-shown"
 FACTORY_FAKE_ID = "u-factory-fake"
-QUICKSTART_A = Heading(README, "## Quickstart (Mode A — session cookie)")
+FACTORY_HEADING = Heading(DOCS / "mode-a-cookie.md", "## With an application factory")
 
 UNOPENED_SPELLINGS = ("```py", "~~~python", "```python3", "   ```python")
 """Fence openers a reader calls python and `snippets` does not open. None may be silent."""
@@ -409,6 +409,13 @@ def refuse_database(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     monkeypatch.setattr(AsyncEngine, "connect", refused)
     return attempted
+
+
+def test_the_docs_pages_are_in_the_census() -> None:
+    """`docs/` is where most snippets live; a glob that found nothing would run none of them."""
+    assert DOC_PAGES, "docs/ holds no pages"
+    assert set(DOC_PAGES) <= set(DOCUMENTS)
+    assert sum(1 for snippet in ALL_SNIPPETS if snippet.document.startswith("docs/")) >= 10
 
 
 def test_every_python_fence_in_the_documents_is_extracted() -> None:
@@ -715,7 +722,7 @@ def override_through(app: FastAPI, auth: BetterAuth) -> None:
 def test_the_factory_app_is_overridden_through_the_instance_it_built(
     refuse_network: list[str], refuse_database: list[str]
 ) -> None:
-    """§Testing's factory sentence, held against §Quickstart's own factory (#69).
+    """§Testing's factory sentence, held against the Mode A page's own factory (#69).
 
     Two calls build two `BetterAuth` instances, and each memoizes its own dependencies: keys taken
     off the other call's instance override nothing, so a forged cookie is refused for real; keys
@@ -724,9 +731,11 @@ def test_the_factory_app_is_overridden_through_the_instance_it_built(
     factory owns a SQLAlchemy `AsyncEngine`, an asyncio library.
     """
     built = [
-        namespace for namespace in map(run, fences_under(QUICKSTART_A)) if factory_apps(namespace)
+        namespace
+        for namespace in map(run, fences_under(FACTORY_HEADING))
+        if factory_apps(namespace)
     ]
-    assert len(built) == 1, f"{QUICKSTART_A} holds {len(built)} fences defining {FACTORY}"
+    assert len(built) == 1, f"{FACTORY_HEADING} holds {len(built)} fences defining {FACTORY}"
     (app,), (other,) = factory_apps(built[0]), factory_apps(built[0])
     assert app.state.auth is not other.state.auth
     headers = {"Cookie": forged_cookie_header(FORGED_COOKIES[-1]), "Origin": ALLOWED_ORIGIN}
@@ -747,7 +756,7 @@ def test_the_factory_app_is_overridden_through_the_instance_it_built(
     assert refuse_database == []
 
 
-SESSION_FACTS = Heading(README, "## What a verified session carries")
+SESSION_FACTS = Heading(DOCS / "sessions.md", "## What a verified session carries")
 FORWARD = "revoke_upstream"
 FORWARDED_NAME = "__Secure-better-auth.session_token"
 FORWARDED_VALUE = "forwarded-session-token.c2lnbmF0dXJl%2Bc2lnbmF0dXJl%3D"
