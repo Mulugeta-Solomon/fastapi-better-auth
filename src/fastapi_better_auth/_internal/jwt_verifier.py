@@ -366,7 +366,9 @@ def _decoded(token: str, key: Jwk, verifier: JwtVerifier, marker: str) -> Mappin
         )
     except jwt.ExpiredSignatureError:
         expired, failure = True, "ExpiredSignatureError"
-    except (jwt.PyJWTError, ValueError, TypeError, RecursionError) as exc:
+    except (jwt.PyJWTError, ValueError, TypeError, OverflowError, RecursionError) as exc:
+        # OverflowError: a date claim's int() conversion inside PyJWT, should a version not
+        # catch it itself - the claim is the token's, so it is the token that is refused.
         expired, failure = False, type(exc).__name__
     token = ""
     if expired:
