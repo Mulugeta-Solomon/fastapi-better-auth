@@ -20,8 +20,8 @@ from fastapi_better_auth._internal.models import User
 from tests.stores import EXPIRES_AT, TOKEN, USER_ID, RecordingRedis, wire_session, wire_user
 
 AWARE = datetime(2026, 9, 1, tzinfo=timezone.utc)
-# DTZ001 is the whole point of this constant: it is the value the records must refuse.
-NAIVE = datetime(2026, 9, 1)  # noqa: DTZ001
+# Naive on purpose (flake8-datetimez's DTZ001): it is the value the records must refuse.
+NAIVE = datetime(2026, 9, 1)
 
 
 def a_user(**overrides: Any) -> StoredUser:
