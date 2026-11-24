@@ -27,20 +27,43 @@ ELSEWHERE = (ROOT / "harness" / "README.md",)
 
 REPOSITORY = "https://github.com/Mulugeta-Solomon/fastapi-better-auth/"
 IN_REPOSITORY = re.compile(re.escape(REPOSITORY) + r"(?:blob|tree)/main/([^#?]+)(?:#(.+))?")
-LINK = re.compile(r"\]\(([^)\s]+)\)")
-FENCE = re.compile(r"^[ \t]*(```|~~~)")
+INLINE_LINK = re.compile(r"\]\(([^)\s]+)\)")
+DEFINITION = re.compile(r"^ {0,3}\[[^\]]+\]:[ \t]*<?([^\s>]+)>?")
+"""A reference definition, `[label]: target`: where a `[text][label]` link really points."""
+FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
+
+
+def prose(path: pathlib.Path) -> Iterator[tuple[int, str]]:
+    """Every line of a page that is not fenced code, with its line number.
+
+    A fence is closed only by a marker of the same character, at least as long as the one that
+    opened it, with nothing after it but whitespace (CommonMark 4.5). A `~~~` line inside a
+    backtick block is therefore code, and so is a shorter run of backticks.
+    """
+    opening = ""
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        marker = FENCE.match(line)
+        if opening:
+            if marker is not None and _closes(opening, marker.group(1), marker.group(2)):
+                opening = ""
+            continue
+        if marker is not None:
+            opening = marker.group(1)
+            continue
+        yield number, line
+
+
+def _closes(opening: str, candidate: str, rest: str) -> bool:
+    return candidate[0] == opening[0] and len(candidate) >= len(opening) and not rest.strip()
 
 
 def links(path: pathlib.Path) -> Iterator[tuple[int, str]]:
-    """Every markdown link target on a page with its line, skipping fenced code."""
-    fenced = False
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if FENCE.match(line):
-            fenced = not fenced
-            continue
-        if fenced:
-            continue
-        for match in LINK.finditer(line):
+    """Every link target on a page with its line: inline links and reference definitions."""
+    for number, line in prose(path):
+        definition = DEFINITION.match(line)
+        if definition is not None:
+            yield number, definition.group(1)
+        for match in INLINE_LINK.finditer(line):
             yield number, match.group(1)
 
 
@@ -57,12 +80,8 @@ def anchors(path: pathlib.Path) -> set[str]:
     """The anchors GitHub generates for a page's headings, duplicates suffixed as it does."""
     found: set[str] = set()
     seen: dict[str, int] = {}
-    fenced = False
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if FENCE.match(line):
-            fenced = not fenced
-            continue
-        if fenced or not line.startswith("#"):
+    for _, line in prose(path):
+        if not line.startswith("#"):
             continue
         base = slug(line.lstrip("#"))
         count = seen.get(base, 0)
@@ -78,6 +97,22 @@ def check_target(target: pathlib.Path, anchor: str | None, where: str) -> None:
         assert anchor in anchors(target), f"{where}: no heading for #{anchor}"
 
 
+def relative_targets(page: pathlib.Path) -> list[str]:
+    return [target for _, target in links(page) if not target.startswith("https://")]
+
+
+def check_relative_links(page: pathlib.Path, where: str) -> None:
+    for number, target in links(page):
+        if target.startswith(("https://", "http://", "mailto:")):
+            continue
+        path, _, anchor = target.partition("#")
+        destination = page if path == "" else (page.parent / path).resolve()
+        check_target(destination, anchor or None, f"{where}:{number}")
+
+
+# ------------------------------------------------------------------ the instrument, proven
+
+
 def test_the_checker_refuses_a_missing_page_and_a_missing_anchor(tmp_path: pathlib.Path) -> None:
     """Prove the instrument: a link that goes nowhere has to fail, not pass quietly."""
     page = tmp_path / "page.md"
@@ -90,6 +125,47 @@ def test_the_checker_refuses_a_missing_page_and_a_missing_anchor(tmp_path: pathl
         check_target(page, "not-a-heading", "heading inside a fence")
 
 
+def test_a_reference_style_link_is_a_link(tmp_path: pathlib.Path) -> None:
+    """`[text][label]` points wherever `[label]: target` says, so the definition is checked."""
+    page = tmp_path / "page.md"
+    page.write_text(
+        "See the [Guide][guide] and [the site][site].\n\n"
+        "[guide]: missing.md\n"
+        "[site]: <https://example.com/>\n",
+        encoding="utf-8",
+    )
+
+    assert list(links(page)) == [(3, "missing.md"), (4, "https://example.com/")]
+    assert relative_targets(page) == ["missing.md"]
+    with pytest.raises(AssertionError, match=r"page\.md:3: missing\.md does not exist"):
+        check_relative_links(page, "page.md")
+
+
+def test_a_fence_closes_only_on_its_own_marker(tmp_path: pathlib.Path) -> None:
+    """A `~~~` line inside a backtick block is code, so the block ends at its real closing fence
+    and the link after it is seen."""
+    page = tmp_path / "page.md"
+    page.write_text(
+        "```text\n~~~\n# not a heading\n```\n[broken](missing.md)\n\n## After the block\n",
+        encoding="utf-8",
+    )
+
+    assert list(links(page)) == [(5, "missing.md")]
+    assert anchors(page) == {"after-the-block"}
+
+
+def test_a_shorter_or_annotated_marker_does_not_close_a_fence(tmp_path: pathlib.Path) -> None:
+    page = tmp_path / "page.md"
+    page.write_text(
+        "````text\n```\n[inside](missing.md)\n```` not a close\n# still code\n````\n"
+        "[outside](also-missing.md)\n",
+        encoding="utf-8",
+    )
+
+    assert list(links(page)) == [(7, "also-missing.md")]
+    assert anchors(page) == set()
+
+
 def test_the_slug_matches_githubs_for_the_shapes_these_pages_use() -> None:
     assert slug("Moving the verifier's clock") == "moving-the-verifiers-clock"
     assert slug("`additionalFields`: make sure they reach the wire") == (
@@ -98,13 +174,11 @@ def test_the_slug_matches_githubs_for_the_shapes_these_pages_use() -> None:
     assert slug("Organizations and roles — the recipe") == "organizations-and-roles--the-recipe"
 
 
+# ------------------------------------------------------------------ the pages
+
+
 def test_the_readme_links_only_by_absolute_url() -> None:
-    relative = [
-        f"README.md:{number}: {target}"
-        for number, target in links(README)
-        if not target.startswith("https://")
-    ]
-    assert relative == []
+    assert relative_targets(README) == []
 
 
 def test_the_readme_links_into_this_repository_resolve() -> None:
@@ -126,10 +200,4 @@ def test_the_readme_links_into_this_repository_resolve() -> None:
 def test_relative_links_resolve(page: pathlib.Path) -> None:
     if not page.exists():
         pytest.fail(f"{page.name} is missing")
-    for number, target in links(page):
-        if target.startswith(("https://", "http://", "mailto:")):
-            continue
-        where = f"{page.relative_to(ROOT).as_posix()}:{number}"
-        path, _, anchor = target.partition("#")
-        destination = page if path == "" else (page.parent / path).resolve()
-        check_target(destination, anchor or None, where)
+    check_relative_links(page, page.relative_to(ROOT).as_posix())
