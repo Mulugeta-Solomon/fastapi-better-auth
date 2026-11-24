@@ -200,53 +200,82 @@ def close_matching(
     ]
 
 
-def plan(
-    results: Sequence[LegResult],
-    open_issues: Sequence[OpenIssue],
-    *,
-    run_url: str,
-    upstream_watch: str,
-    job_results: Mapping[str, str],
-) -> list[Action]:
-    actions: list[Action] = []
-    if upstream_watch == "failure":
+@dataclass(frozen=True)
+class Context:
+    """What every planning step reads: the run, the open issues, and what the jobs reported."""
+
+    run_url: str
+    open_issues: tuple[OpenIssue, ...]
+    upstream_watch: str
+    job_results: Mapping[str, str]
+    expected: tuple[str, ...]
+
+
+def plan(results: Sequence[LegResult], context: Context) -> list[Action]:
+    return [
+        *plan_watch(context),
+        *(action for result in results for action in plan_leg(result, context)),
+        *(action for lane in LANES for action in plan_coverage(lane, results, context)),
+    ]
+
+
+def plan_watch(context: Context) -> list[Action]:
+    if context.upstream_watch == "failure":
         watch = Create(
             WATCH_TITLE,
             "The daily watch could not decide whether better-auth published a release. Today's "
             "sweep ran anyway - the gates fail open - so this is not a missed canary, but the "
             "watch is no longer narrowing anything and every daily tick will run the full "
-            f"matrix until it is fixed. Run: {run_url}",
+            f"matrix until it is fixed. Run: {context.run_url}",
         )
-        actions.append(file_or_comment(watch, open_issues, run_url))
-    elif upstream_watch == "success":
+        return [file_or_comment(watch, context.open_issues, context.run_url)]
+    if context.upstream_watch == "success":
         exact = re.compile(re.escape(WATCH_TITLE))
-        actions += close_matching(exact, open_issues, f"The upstream watch read npm in {run_url}.")
+        comment = f"The upstream watch read npm in {context.run_url}."
+        return close_matching(exact, context.open_issues, comment)
+    return []
 
-    for result in results:
-        if result.outcome == "passed":
-            comment = (
-                f"The {LANE_NAMES[result.lane]} leg against {result.target} passed in {run_url} "
-                f"({result.ran}); closing."
-            )
-            actions += close_matching(owned_by(*result.leg), open_issues, comment)
-        else:
-            actions.append(file_or_comment(failure_issue(result, run_url), open_issues, run_url))
 
-    for lane in LANES:
-        title = unrecorded_title(lane)
-        recorded_failure = any(r.lane == lane and r.outcome != "passed" for r in results)
-        if job_results[lane] == "failure" and not recorded_failure:
-            missing = Create(
-                title,
-                f"A {LANE_NAMES[lane]} leg failed but left no failure result, so the reporter "
-                f"cannot say which leg or why; read the run. Run: {run_url}",
-            )
-            actions.append(file_or_comment(missing, open_issues, run_url))
-        elif job_results[lane] == "success":
-            exact = re.compile(re.escape(title))
-            comment = f"Every {LANE_NAMES[lane]} leg recorded its result in {run_url}."
-            actions += close_matching(exact, open_issues, comment)
-    return actions
+def plan_leg(result: LegResult, context: Context) -> list[Action]:
+    if result.outcome != "passed":
+        issue = failure_issue(result, context.run_url)
+        return [file_or_comment(issue, context.open_issues, context.run_url)]
+    comment = (
+        f"The {LANE_NAMES[result.lane]} leg against {result.target} passed in "
+        f"{context.run_url} ({result.ran}); closing."
+    )
+    return close_matching(owned_by(*result.leg), context.open_issues, comment)
+
+
+def plan_coverage(lane: str, results: Sequence[LegResult], context: Context) -> list[Action]:
+    """A failed lane names every expected leg with no usable result; a green lane closes that.
+
+    Checked per leg, so another leg's recorded failure never hides a missing one. A cancelled or
+    skipped lane says nothing.
+    """
+    title = unrecorded_title(lane)
+    if context.job_results[lane] == "success":
+        comment = f"Every {LANE_NAMES[lane]} leg recorded its result in {context.run_url}."
+        return close_matching(re.compile(re.escape(title)), context.open_issues, comment)
+    if context.job_results[lane] != "failure":
+        return []
+    covered = {r.matrix_version for r in results if r.lane == lane}
+    missing = [version for version in context.expected if version not in covered]
+    if missing:
+        named = ", ".join(f"better-auth@{version}" for version in missing)
+        body = (
+            f"These {LANE_NAMES[lane]} legs left no usable result: {named}. A leg lands here "
+            "when it failed before recording, its result was rejected by the reporter, or it "
+            f"only has a stale result from an earlier attempt; read the run. Run: {context.run_url}"
+        )
+    elif not any(r.lane == lane and r.outcome != "passed" for r in results):
+        body = (
+            f"The {LANE_NAMES[lane]} lane failed, yet every leg recorded a pass, so the reporter "
+            f"cannot say which leg failed or why; read the run. Run: {context.run_url}"
+        )
+    else:
+        return []
+    return [file_or_comment(Create(title, body), context.open_issues, context.run_url)]
 
 
 def run_gh(argv: Sequence[str]) -> tuple[int, str]:
@@ -405,6 +434,41 @@ def record(args: argparse.Namespace) -> int:
     return 0
 
 
+def expected_versions(value: str) -> tuple[str, ...]:
+    """The matrix both lanes sweep, as the one JSON list canary.yml passes."""
+    try:
+        listed: object = json.loads(value)
+    except ValueError:
+        fail(f"--expected-versions is not JSON: {value!r}")
+    if not isinstance(listed, list) or not listed:
+        fail("--expected-versions must be a non-empty JSON list")
+    versions: list[str] = []
+    for entry in listed:  # pyright: ignore[reportUnknownVariableType]
+        if not isinstance(entry, str) or not (entry in DIST_TAGS or VERSION.fullmatch(entry)):
+            fail(f"--expected-versions holds an implausible entry: {entry!r}")
+        if entry in versions:
+            fail(f"--expected-versions lists {entry} twice")
+        versions.append(entry)
+    return tuple(versions)
+
+
+def expected_only(loaded: Loaded, expected: Sequence[str]) -> Loaded:
+    """A result for a leg the matrix does not list cannot be tied to any expected leg."""
+    kept: list[LegResult] = []
+    rejected = loaded.rejected
+    for result in loaded.results:
+        if result.matrix_version in expected:
+            kept.append(result)
+            continue
+        rejected += 1
+        print(
+            f"::error::rejected the {result.lane} result for better-auth@"
+            f"{result.matrix_version}: the matrix does not list that version",
+            file=sys.stderr,
+        )
+    return Loaded(tuple(kept), rejected)
+
+
 def job_result(value: str, what: str) -> str:
     if value not in JOB_RESULTS:
         fail(f"{what} is not a job result: {value!r}")
@@ -420,7 +484,8 @@ def report(args: argparse.Namespace, gh: GhRunner) -> int:
         "head": job_result(args.head_job, "--head-job"),
         "wheel": job_result(args.wheel_job, "--wheel-job"),
     }
-    loaded = load_results(Path(args.results_dir))
+    expected = expected_versions(args.expected_versions)
+    loaded = expected_only(load_results(Path(args.results_dir)), expected)
     for result in loaded.results:
         report_line(f"{LANE_NAMES[result.lane]} leg against {result.target}: {result.outcome}")
     if (
@@ -431,13 +496,14 @@ def report(args: argparse.Namespace, gh: GhRunner) -> int:
     ):
         report_line("no leg ran and the watch did not decide; nothing to report")
         return 0
-    actions = plan(
-        loaded.results,
-        list_open_issues(gh),
+    context = Context(
         run_url=run_url,
+        open_issues=tuple(list_open_issues(gh)),
         upstream_watch=upstream_watch,
         job_results=job_results,
+        expected=expected,
     )
+    actions = plan(loaded.results, context)
     failures = execute(actions, gh)
     return 1 if failures or loaded.rejected else 0
 
@@ -459,6 +525,9 @@ def parse(argv: Sequence[str] | None) -> argparse.Namespace:
     summary.add_argument("--upstream-watch", required=True, help="needs.upstream-check.result")
     summary.add_argument("--head-job", required=True, help="needs.conformance.result")
     summary.add_argument("--wheel-job", required=True, help="needs.published-wheel.result")
+    summary.add_argument(
+        "--expected-versions", required=True, help="the matrix both lanes sweep, as a JSON list"
+    )
     return parser.parse_args(argv)
 
 
