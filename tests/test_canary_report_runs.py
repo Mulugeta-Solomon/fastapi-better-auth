@@ -334,6 +334,80 @@ def test_a_result_from_a_later_attempt_than_the_report_is_rejected(
     assert "::error::" in capsys.readouterr().err
 
 
+def a_rerun_where_one_leg_carries_an_earlier_pass(
+    script: Report, results: pathlib.Path, *, attempt: str = "2"
+) -> None:
+    """1.7.1 passed in attempt 1; 1.7.5 failed in the current attempt."""
+    record(script, results, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
+    record(
+        script, results, lane="head", version="1.7.5", outcome="failure", harness="1.7.5",
+        attempt=attempt,
+    )  # fmt: skip
+
+
+def carried_warnings(capsys: pytest.CaptureFixture[str]) -> list[str]:
+    return [line for line in capsys.readouterr().err.splitlines() if line.startswith("::warning::")]
+
+
+def test_a_full_rerun_warns_that_a_carried_pass_may_hide_a_leg_that_died(
+    script: Report, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """On "Re-run all jobs", 1.7.1 may have died before recording in attempt 2 and its attempt-1
+    pass still covers it. The jobs API cannot tell a re-run job from a carried one, and the same
+    inputs arise on "Re-run failed jobs", so this is a warning for the person who started the
+    re-run, never an issue."""
+    a_rerun_where_one_leg_carries_an_earlier_pass(script, tmp_path)
+    gh = Gh({})
+
+    code = report(script, tmp_path, gh, attempt="2", jobs={"head": "failure"})
+
+    assert code == 0
+    assert created_titles(gh) == ["canary: conformance failure against better-auth@1.7.5"]
+    (warning,) = carried_warnings(capsys)
+    assert "better-auth@1.7.1" in warning
+    assert "better-auth@1.7.5" not in warning
+    assert "earlier attempt" in warning
+
+
+def test_rerunning_failed_jobs_into_the_same_failure_warns_and_files_nothing_extra(
+    script: Report, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    a_rerun_where_one_leg_carries_an_earlier_pass(script, tmp_path)
+    gh = Gh({50: "canary: conformance failure against better-auth@1.7.5"})
+
+    code = report(script, tmp_path, gh, attempt="2", jobs={"head": "failure"})
+
+    assert code == 0
+    assert gh.of("create") == []
+    assert numbers(gh.of("comment")) == ["50"]
+    (warning,) = carried_warnings(capsys)
+    assert "better-auth@1.7.1" in warning
+
+
+def test_a_green_lane_with_carried_passes_warns_nothing(
+    script: Report, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
+    record(
+        script, tmp_path, lane="head", version="1.7.5", outcome="success", harness="1.7.5",
+        attempt="2",
+    )  # fmt: skip
+
+    assert report(script, tmp_path, Gh({}), attempt="2", jobs={"head": "success"}) == 0
+
+    assert carried_warnings(capsys) == []
+
+
+def test_a_first_attempt_never_warns_about_carried_passes(
+    script: Report, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    a_rerun_where_one_leg_carries_an_earlier_pass(script, tmp_path, attempt="1")
+
+    report(script, tmp_path, Gh({}), attempt="1", jobs={"head": "failure"})
+
+    assert carried_warnings(capsys) == []
+
+
 @pytest.mark.parametrize("attempt", ["0", "x", ""])
 def test_report_refuses_an_implausible_attempt(
     script: Report, tmp_path: pathlib.Path, attempt: str
