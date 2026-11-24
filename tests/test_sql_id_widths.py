@@ -87,17 +87,18 @@ class TestWidths:
         assert bound_user_id(built, str(high + 1)) is None
 
 
-@pytest.mark.parametrize(
-    ("column_type", "cast"),
-    [(SMALLINT(), "SMALLINT"), (INTEGER(), "INTEGER"), (BIGINT(), "BIGINT")],
-)
-def test_the_width_changes_no_statement(column_type: TypeEngine[Any], cast: str) -> None:
-    """Compiled, not executed: the range gates the bind, the bind still casts to the column's type."""
+@pytest.mark.parametrize("column_type", [SMALLINT(), INTEGER(), BIGINT()], ids=str)
+def test_the_width_changes_no_statement(column_type: TypeEngine[Any]) -> None:
+    """Compiled, not executed: the range gates the bind and leaves SQLAlchemy's typed bind as it is.
+
+    Which cast the bind carries is SQLAlchemy's choice and differs by release (2.0.0 casts a
+    SMALLINT bind as INTEGER, later releases as SMALLINT), so the cast's name is not pinned here.
+    """
     with_dialect = plan(column_type, "postgresql").user_statement.compile(dialect=asyncpg.dialect())
     without = plan(column_type, "").user_statement.compile(dialect=asyncpg.dialect())
 
     assert str(with_dialect) == str(without)
-    assert f'"user".id = $1::{cast}' in str(with_dialect)
+    assert '"user".id = $1::' in str(with_dialect)
 
 
 # --- through the real store, on SQLite --------------------------------------------------------
