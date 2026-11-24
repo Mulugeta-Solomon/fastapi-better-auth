@@ -209,6 +209,15 @@ class SqlAlchemySessionStore(_CoreStore):
     better-auth column that is missing is a loud warning naming it; a missing admin column is
     silence, because that plugin is optional upstream.
 
+    **Ids the database generates.** Discovery also reads the type of the id columns
+    (`session.id`, `session.userId`, `session.impersonatedBy`, `user.id`). Where a deployment lets
+    the database generate ids, an integer column's value is read as its decimal text and a uuid
+    column's as lowercase hyphenated text - what Better Auth puts in its own JSON - so records,
+    `Session.id` and `Session.raw` carry strings either way; `fetch_user_by_id` takes that same
+    text and binds it as the column's type. A column of any other type is read as text, as
+    before. Tested on SQLite (integer ids; uuids as text), where reflection never reports a uuid
+    type: a SQLAlchemy `Uuid` column there reflects as `CHAR(32)` and is read as its stored text.
+
     **Timestamps.** Postgres `timestamptz` answers an aware `datetime` and is the tested path.
     SQLite and MySQL answer a naive one, because those columns carry no offset - it is read as
     UTC, which is what Better Auth wrote. A column holding local time would be misread by

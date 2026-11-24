@@ -438,17 +438,13 @@ def _user_statement(user: Table, user_columns: tuple[str, ...], id_column: IdCol
 
 
 def bound_user_id(plan: Plan, user_id: str) -> str | int | uuid.UUID | None:
-    """The value `fetch_user_by_id` binds, or `None` (a miss, no query) when no row can hold it."""
-    id_column = plan.user_id()
-    value = bind_id(id_column.kind, user_id)
-    if value is None:
-        unusable(
-            "user id",
-            f"it is not the canonical text of an id the user table's {id_column.kind.value}"
-            " id column holds",
-            user_id,
-        )
-    return value
+    """The value `fetch_user_by_id` binds, or `None` when no row can hold it.
+
+    `None` is a silent miss with no query, the same answer a blank id or an id nobody has gets:
+    the text came from the caller, not from a stored row, so there is nothing to tell an
+    operator that a lookup by an unknown id would not equally have to tell them.
+    """
+    return bind_id(plan.user_id().kind, user_id)
 
 
 def session_from(rows: Sequence[Mapping[str, Any]], plan: Plan, token: str) -> StoredSession | None:

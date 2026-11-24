@@ -198,16 +198,17 @@ class TestSerialIds:
         assert log.selects == []
 
     @pytest.mark.anyio
-    async def test_the_refused_id_is_logged_by_fingerprint_only(
+    async def test_a_refused_spelling_is_a_silent_miss(
         self, build: Build, caplog: pytest.LogCaptureFixture
     ) -> None:
+        """Caller text, not a stored row: nothing to tell an operator that an unknown id would
+        not equally have to, so no request can write a log line here."""
         store, _log = build(**serial_schema())
 
         with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
             await store.fetch_user_by_id("not-a-serial-id")
 
-        assert any("integer id column" in record.getMessage() for record in caplog.records)
-        assert "not-a-serial-id" not in caplog.text
+        assert caplog.records == []
 
     @pytest.mark.anyio
     async def test_an_impersonating_admin_id_is_read_as_text(self, build: Build) -> None:
@@ -261,22 +262,30 @@ class TestWrongTypedValues:
     @pytest.mark.anyio
     @pytest.mark.parametrize("value", [11.5, b"11", "eleven"])
     async def test_a_session_id_that_is_not_an_integer_is_a_miss(
-        self, build: Build, value: object
+        self, build: Build, value: object, caplog: pytest.LogCaptureFixture
     ) -> None:
         store, _log = build(**serial_schema(id=value, session_types={"id": "INTEGER NOT NULL"}))
 
-        assert await store.fetch_session_by_token(TOKEN) is None
+        with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
+            assert await store.fetch_session_by_token(TOKEN) is None
+
+        # The row was read and refused - not a join that found nothing.
+        assert refused(caplog, "stored session is unusable (id is null, blank or unreadable)")
 
     @pytest.mark.anyio
     @pytest.mark.parametrize("value", [7.5, b"7", "seven"])
     async def test_a_user_id_that_is_not_an_integer_is_a_miss(
-        self, build: Build, value: object
+        self, build: Build, value: object, caplog: pytest.LogCaptureFixture
     ) -> None:
         store, _log = build(
             **serial_schema(userId=value, user={"id": value}, user_types={"id": "INTEGER"})
         )
 
-        assert await store.fetch_session_by_token(TOKEN) is None
+        with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
+            assert await store.fetch_session_by_token(TOKEN) is None
+
+        assert refused(caplog, "stored user is unusable (its id is null or blank")
+        assert refused(caplog, "stored session is unusable (userId, its user row is null")
 
     @pytest.mark.anyio
     @pytest.mark.parametrize("value", [3.5, b"3", "three"])
@@ -391,6 +400,10 @@ def cookie_verifier(store: Store) -> CookieVerifier:
         csrf=CsrfDisabled(reason="the id suite does not exercise CSRF"),
         secure_cookies=False,
     )
+
+
+def refused(caplog: pytest.LogCaptureFixture, prefix: str) -> bool:
+    return any(record.getMessage().startswith(prefix) for record in caplog.records)
 
 
 async def store_connected(store: Store) -> None:
