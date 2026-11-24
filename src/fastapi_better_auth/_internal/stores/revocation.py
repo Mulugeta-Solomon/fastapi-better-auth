@@ -26,8 +26,9 @@ from .diagnostics import unusable
 from .session_document import SESSION_KEY
 from .upstream import as_moment
 
-WATERMARK = "revocation watermark"
-"""The kind an unreadable watermark is reported as."""
+WATERMARK = "watermark"
+"""The kind an unreadable watermark is reported as. `unusable()` renders a kind through
+`safe_label`, which admits no space - a two-word kind would log as `<redacted>`."""
 
 WATERMARK_PREFIX = "revoked-sessions-before-"
 """Upstream's key, `revokedBeforeKey(userId)`, before the deployment's own namespace."""
@@ -79,7 +80,12 @@ def judge(watermark: object, session: Mapping[str, Any], subject: str) -> Verdic
         return Verdict.STANDING
     revoked_before = as_watermark(watermark)
     if revoked_before is None:
-        unusable(WATERMARK, "it is not a whole number of milliseconds", subject)
+        unusable(
+            WATERMARK,
+            "the revocation watermark for this session's user is not a whole number of"
+            " milliseconds",
+            subject,
+        )
         return Verdict.UNREADABLE
     created = created_ms(session.get("createdAt"))
     if created is None:
