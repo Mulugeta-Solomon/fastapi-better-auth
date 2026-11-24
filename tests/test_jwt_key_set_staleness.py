@@ -10,6 +10,7 @@ only the key set ages.
 from __future__ import annotations
 
 import inspect
+import logging
 from typing import Any
 
 import pytest
@@ -27,6 +28,11 @@ DAY = 86_400.0
 helps while this service cannot reach the JWKS but browsers can still reach the auth server - a
 day covers a real outage, and forever would keep a withdrawn key verifying through one."""
 DOWN = TimeoutError("jwks unreachable")
+SERVING = "jwks refresh failed for %s; serving the key set on hand"
+
+
+def _serving_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.msg == SERVING]
 
 
 @pytest.mark.anyio
@@ -85,21 +91,43 @@ async def test_a_held_key_set_is_still_honoured_at_exactly_the_bound(
 
 @pytest.mark.anyio
 async def test_a_held_key_set_past_the_bound_is_no_longer_honoured(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """F4.1: a set fetched a day ago and never confirmed since may carry a key the auth server
     withdrew after a compromise. Past the bound it is not honoured, and the answer is that the
     keys cannot be known - unavailable, not a credential refusal. RED before the bound: the set
-    on hand was honoured for as long as the refresh kept failing."""
+    on hand was honoured for as long as the refresh kept failing.
+
+    The failed refresh is not reported as "serving the key set on hand" either: past the bound
+    nothing is served, and a line saying otherwise would mislead the operator reading it."""
     clock = wind_jwks_clock(monkeypatch)
-    verifier, _transport = build(json_reply(KEY_SET), DOWN)
+    verifier, transport = build(json_reply(KEY_SET), DOWN)
     token = SIGNER.sign(claims())
 
     await verifier.verify(token, User)
     clock.advance(DAY + 1)
 
-    with pytest.raises(AuthServiceUnavailable):
+    with caplog.at_level(logging.WARNING), pytest.raises(AuthServiceUnavailable):
         await verifier.verify(token, User)
+    assert transport.calls == 2, "the refresh must have been attempted, and failed"
+    assert _serving_lines(caplog) == []
+
+
+@pytest.mark.anyio
+async def test_a_refresh_failing_inside_the_bound_says_it_serves_the_set_on_hand(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control for the assertion above: inside the bound the line is logged."""
+    clock = wind_jwks_clock(monkeypatch)
+    verifier, _transport = build(json_reply(KEY_SET), DOWN)
+    token = SIGNER.sign(claims())
+
+    await verifier.verify(token, User)
+    clock.advance(DAY)
+
+    with caplog.at_level(logging.WARNING):
+        await verifier.verify(token, User)
+    assert len(_serving_lines(caplog)) == 1
 
 
 @pytest.mark.anyio

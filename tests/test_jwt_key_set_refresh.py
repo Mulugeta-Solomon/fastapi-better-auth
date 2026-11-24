@@ -8,8 +8,9 @@ request whose `kid` is *not* in the held set has nothing to be answered from, an
 the refresh - behind the same refetch window and negative cache that keep a stream of invented
 kids from becoming a stream of fetches.
 
-The refresh is held open by the scripted transport's gate; every wait ends on a signal (all other
-tasks blocked, or a count reached), never on a stopwatch.
+The refresh is held open by the scripted transport's gate; every wait is a checkpoint loop that
+ends on a signal - a fetch count, an outcome count, or how many lookups are queued on the lock -
+never on a stopwatch or a poll interval.
 """
 
 from __future__ import annotations
@@ -17,9 +18,10 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 
 import anyio
+import anyio.lowlevel
 import pytest
 
-from fastapi_better_auth import InvalidCredential, Session, User
+from fastapi_better_auth import AuthServiceUnavailable, InvalidCredential, Session, User
 from fastapi_better_auth._internal.jwks import CACHE_TTL, REFETCH_INTERVAL
 from fastapi_better_auth._internal.jwt_verifier import JwtVerifier
 from tests.jwks_fixtures import wind_jwks_clock
@@ -32,20 +34,26 @@ STALE = CACHE_TTL + 1
 """Past the cache TTL, far inside the one-day bound: the set is stale and still honoured."""
 CROWD = 5
 
-Outcome = Session[User] | BaseException
+Outcome = Session[User] | Exception
 
 
 async def _outcome(verify: Callable[[], Awaitable[Session[User]]]) -> Outcome:
     try:
         return await verify()
-    except BaseException as exc:  # noqa: BLE001 - the outcome itself is under test
+    except Exception as exc:  # noqa: BLE001 - the outcome itself is under test
         return exc
 
 
-async def _settled() -> None:
-    """Returns once every other task is blocked: on the gate, on the lock, or finished."""
+async def _until(signal: Callable[[], bool]) -> None:
+    """Yield to the other tasks until `signal` holds; a hang fails the test, it never sleeps."""
     with anyio.fail_after(5):
-        await anyio.wait_all_tasks_blocked()
+        while not signal():
+            await anyio.lowlevel.checkpoint()
+
+
+def _queued(verifier: JwtVerifier) -> int:
+    """How many lookups are waiting on the key-set lock right now."""
+    return verifier._keys.waiting  # pyright: ignore[reportPrivateUsage]
 
 
 def _hold_the_next_fetch(transport: ScriptedTransport) -> anyio.Event:
@@ -74,8 +82,12 @@ async def test_one_request_refreshes_a_stale_set_and_the_rest_are_answered_from_
     async with anyio.create_task_group() as group:
         for _ in range(CROWD):
             group.start_soon(request)
-        await _settled()
+        await _until(
+            lambda: transport.calls >= 2
+            and (len(outcomes) >= CROWD - 1 or _queued(verifier) >= 1)
+        )
 
+        assert _queued(verifier) == 0, "a request with a held kid is queued on the refresh"
         assert transport.calls == 2, "exactly one refresh is in flight"
         assert len(outcomes) == CROWD - 1, "the others must not wait on the hung refresh"
         assert all(isinstance(each, Session) for each in outcomes), outcomes
@@ -150,13 +162,14 @@ async def test_an_unknown_kid_still_waits_for_the_refresh(monkeypatch: pytest.Mo
     async with anyio.create_task_group() as group:
         group.start_soon(unknown)
         group.start_soon(unknown)
-        await _settled()
+        await _until(lambda: transport.calls >= 2 and _queued(verifier) >= 1)
         assert transport.calls == 2, "the first unknown kid opened one refresh"
         for _ in range(CROWD):
             group.start_soon(held)
-        await _settled()
+        await _until(lambda: len(known_outcomes) >= CROWD or _queued(verifier) >= 2)
 
         assert unknown_outcomes == [], "an unknown kid must wait for the refresh"
+        assert _queued(verifier) == 1, "only the second unknown kid is queued"
         assert len(known_outcomes) == CROWD
         assert all(isinstance(each, Session) for each in known_outcomes), known_outcomes
         gate.set()
@@ -164,6 +177,31 @@ async def test_an_unknown_kid_still_waits_for_the_refresh(monkeypatch: pytest.Mo
     assert len(unknown_outcomes) == 2
     assert all(isinstance(each, Session) for each in unknown_outcomes), unknown_outcomes
     assert transport.calls == 2
+
+
+@pytest.mark.anyio
+async def test_a_flood_of_unknown_kids_against_a_failing_refresh_costs_one_fetch_per_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unknown-kid throttle on the path this package changed: a stale, honoured set and an
+    upstream that keeps failing. Every invented kid is unavailable (it cannot be confirmed), and
+    a generator of them still costs one fetch per refetch window, not one per request."""
+    clock = wind_jwks_clock(monkeypatch)
+    verifier, transport = build(json_reply(KEY_SET), TimeoutError("jwks unreachable"))
+    await verifier.verify(SIGNER.sign(claims()), User)
+    clock.advance(STALE)
+    invented = [ed25519_signer(f"flood-{index}").sign(claims()) for index in range(20)]
+
+    for token in invented:
+        with pytest.raises(AuthServiceUnavailable):
+            await verifier.verify(token, User)
+    assert transport.calls == 2
+
+    clock.advance(REFETCH_INTERVAL)
+    for token in invented:
+        with pytest.raises(AuthServiceUnavailable):
+            await verifier.verify(token, User)
+    assert transport.calls == 3
 
 
 @pytest.mark.anyio
@@ -183,7 +221,7 @@ async def test_a_cancelled_stale_refresher_releases_the_lock_and_the_window(
     with anyio.CancelScope() as scope:
         async with anyio.create_task_group() as group:
             group.start_soon(verifier.verify, token, User)
-            await _settled()
+            await _until(lambda: transport.calls >= 2)
             assert transport.calls == 2, "the refresh never started; this probe proves nothing"
             scope.cancel()
 
@@ -219,7 +257,11 @@ def test_the_single_refresher_holds_for_a_verifier_built_outside_the_loop(
         async with anyio.create_task_group() as group:
             for _ in range(CROWD):
                 group.start_soon(request)
-            await _settled()
+            await _until(
+                lambda: transport.calls >= 2
+                and (len(outcomes) >= CROWD - 1 or _queued(verifier) >= 1)
+            )
+            assert _queued(verifier) == 0
             assert len(outcomes) == CROWD - 1
             gate.set()
 

@@ -409,6 +409,30 @@ async def test_a_stale_key_set_never_turns_an_unknown_kid_into_an_accepted_one()
 
 
 @pytest.mark.anyio
+async def test_a_confirmed_absent_verdict_is_not_served_from_a_set_past_its_bound() -> None:
+    """A kid confirmed absent is answered `None` from the negative cache only while the set that
+    confirmed it is still honoured. With `max_stale` equal to the TTL and a verdict that would
+    outlive both, the answer past the bound is unavailable like every other lookup - the set
+    that said "absent" is no longer one this client answers from."""
+    clock = Clock()
+    keys, transport = client(
+        json_reply(KEY_SET),
+        clock=clock,
+        cache_ttl=60.0,
+        max_stale=60.0,
+        negative_ttl=1000.0,
+        refetch_interval=1000.0,
+    )
+
+    assert await keys.key_for("gone") is None  # confirmed absent, verdict young
+    clock.advance(61)  # past the bound; the verdict and the window are both still live
+
+    with pytest.raises(AuthServiceUnavailable):
+        await keys.key_for("gone")
+    assert transport.calls == 1
+
+
+@pytest.mark.anyio
 async def test_a_cold_cache_that_cannot_be_filled_is_unavailable() -> None:
     keys, _transport = client(TimeoutError("upstream down"))
 
