@@ -25,12 +25,15 @@ a snippet that reaches upstream to decide a forgery names the route it did it fr
 
 from __future__ import annotations
 
+import functools
+import json
 import pathlib
 import re
 import sys
-from collections.abc import Mapping, Sequence
+import urllib.parse
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import anyio
 import httpx
@@ -38,10 +41,23 @@ import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 import fastapi_better_auth
-from fastapi_better_auth import BetterAuth, Session, SessionError, SharedSecret, User
+from fastapi_better_auth import (
+    BetterAuth,
+    CookieVerifier,
+    OriginCheck,
+    Session,
+    SessionError,
+    SharedSecret,
+    User,
+)
+from tests.cookies import COOKIE, FakeStore, sign, stored_session
+from tests.cookies import SECRET as COOKIE_SECRET
+from tests.cookies import http as cookie_request
+from tests.cookies import run as run_cookie_mode
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
@@ -85,6 +101,7 @@ BASE_URL = "https://auth.example.com"
 BROKEN_SNIPPET = "```python\nfrom fastapi_better_auth import BetterAuht\n```\n"
 
 TESTING_HEADING = "## Testing"
+CLOCK_HEADING = "### Moving the verifier's clock"
 HTTP_CLIENTS = ("httpx", "httpx2")
 """The two libraries a bare `fastapi-better-auth-bridge` install has neither of (#65)."""
 
@@ -165,12 +182,23 @@ def snippets(path: pathlib.Path) -> tuple[Snippet, ...]:
 ALL_SNIPPETS = tuple(snippet for path in DOCUMENTS for snippet in snippets(path))
 
 
+def closes(line: str, heading: str) -> bool:
+    """Whether `line` is a heading at `heading`'s level or above: a `##` section ends at the next
+    `##`, a `###` subsection at the next `###` or `##`. The page has no other levels."""
+    level = len(heading) - len(heading.lstrip("#"))
+    return any(line.startswith("#" * depth + " ") for depth in range(2, level + 1))
+
+
 def fences_under(heading: str) -> tuple[Snippet, ...]:
-    """The README's python fences between `heading` and the next `## ` heading, in page order."""
+    """The README's python fences between `heading` and the next heading closing it, in page order."""
     lines = README.read_text(encoding="utf-8").splitlines()
     index = lines.index(heading)
     end = next(
-        (number for number, line in enumerate(lines[index + 1 :], index + 2) if line[:3] == "## "),
+        (
+            number
+            for number, line in enumerate(lines[index + 1 :], index + 2)
+            if closes(line, heading)
+        ),
         len(lines) + 1,
     )
     return tuple(
@@ -398,10 +426,12 @@ def test_the_testing_recipe_runs_on_an_install_with_no_http_client(
 
     The recipe is about the override, not about a mode, so it has to construct on the bare
     install. Found by its heading, not by a line number: prose edited above the section moves
-    every line, and a guard that quietly matched nothing would pass on an empty section.
+    every line, and a guard that quietly matched nothing would pass on an empty section. The
+    clock subsection's fence is a test module - it imports `TestClient` - and has its own rung.
     """
-    found = fences_under(TESTING_HEADING)
-    assert len(found) == 1, f"{TESTING_HEADING} holds {len(found)} python fences, not one"
+    clock = fences_under(CLOCK_HEADING)
+    found = [snippet for snippet in fences_under(TESTING_HEADING) if snippet not in clock]
+    assert len(found) == 1, f"{TESTING_HEADING} holds {len(found)} recipe fences, not one"
     for library in HTTP_CLIENTS:
         monkeypatch.setitem(sys.modules, library, None)
 
@@ -550,6 +580,36 @@ def test_the_documented_fake_session_serves_the_snippets_own_routes(
     assert refuse_network == []
 
 
+def clock_fence_test(backend: str) -> Callable[[], object]:
+    """The clock fence's one `test_` function, with its `TestClient` bound to `backend`.
+
+    Counted, so a fence that grew a second test or lost its only one fails here rather than
+    running nothing; and kept out of the rung's own frame, which then holds no fence literal.
+    """
+    found = fences_under(CLOCK_HEADING)
+    assert len(found) == 1, f"{CLOCK_HEADING} holds {len(found)} python fences, not one"
+    namespace = run(found[0])
+    tests = [value for name, value in namespace.items() if name.startswith("test_")]
+    assert len(tests) == 1, f"the clock fence defines {len(tests)} test functions, not one"
+    bound = functools.partial(TestClient, backend=backend)  # pyright: ignore[reportArgumentType]
+    namespace["TestClient"] = bound
+    return tests[0]
+
+
+def test_the_clock_fence_turns_a_200_into_a_401(
+    client_backend: str, refuse_network: list[str]
+) -> None:
+    """§Testing's clock subsection, run as the reader runs it: its one test function, called.
+
+    The fence's own assertions are the property - served, then refused once `now` is moved past
+    the thirty-minute session - so this rung makes sure they run, once per backend. A fence whose
+    test stopped moving the clock, or whose verifier lost `now=`, fails its own second assert.
+    """
+    clock_fence_test(client_backend)()
+
+    assert refuse_network == []
+
+
 async def factory_fake_session() -> Session[User]:
     return Session(
         user=User(id=FACTORY_FAKE_ID),
@@ -597,3 +657,123 @@ def test_the_factory_app_is_overridden_through_the_instance_it_built(
     assert all(FACTORY_FAKE_ID in answer.json().values() for answer in served)
     assert refuse_network == []
     assert refuse_database == []
+
+
+SESSION_FACTS = "## What a verified session carries"
+FORWARD = "revoke_upstream"
+FORWARDED_NAME = "__Secure-better-auth.session_token"
+FORWARDED_VALUE = "forwarded-session-token.c2lnbmF0dXJl%2Bc2lnbmF0dXJl%3D"
+FORWARDED_TOKEN = "forwarded-session-token"
+RECIPE_ORIGINS = (ALLOWED_ORIGIN, "https://admin.example.com", "http://localhost:5173")
+"""The allowlist a real verifier admits the forwarded sessions under. More than one entry, so a
+recipe that sent any one literal would send the wrong `Origin` for every other position."""
+ADMITTED_TOKEN = "Kd7Qm2Xv9Lp4Rt1Yw6Nb3Hs8Cj5Fg0Az"
+ADMITTED_COOKIE = urllib.parse.quote(sign(ADMITTED_TOKEN), safe="")
+"""The browser's cookie as Better Auth sets it, percent-encoded - a recipe that decoded it would
+forward something the verifier never accepted."""
+EXPECTED_COOKIE = SecretStr(f"{COOKIE}={ADMITTED_COOKIE}")
+EXPECTED_TOKEN = SecretStr(ADMITTED_TOKEN)
+
+Forward = Callable[[httpx.AsyncClient, Session[User], SecretStr], Awaitable[httpx.Response | None]]
+
+
+def forwarding_recipe() -> Forward:
+    """The one fence under the session-facts heading, run, and the function it defines."""
+    found = fences_under(SESSION_FACTS)
+    assert len(found) == 1, f"{SESSION_FACTS} holds {len(found)} python fences, not one"
+    recipe = run(found[0]).get(FORWARD)
+    assert callable(recipe), f"the fence under {SESSION_FACTS} defines no {FORWARD}"
+    return cast("Forward", recipe)
+
+
+def verified(*, cookie: bool = True, origin: str | None = ALLOWED_ORIGIN) -> Session[User]:
+    """A session shaped as Modes A and C build it, or as a GET or Mode B leaves it."""
+    return Session(
+        user=User(id="u1"),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        token=SecretStr(FORWARDED_TOKEN),
+        cookie=(FORWARDED_NAME, SecretStr(FORWARDED_VALUE)) if cookie else None,
+        origin=origin,
+        raw={},
+    )
+
+
+async def forwarded(session: Session[User]) -> tuple[httpx.Response | None, list[httpx.Request]]:
+    """Run the recipe against an upstream that records each request and says yes."""
+    sent: list[httpx.Request] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"status": True})
+
+    assert session.token is not None
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        response = await forwarding_recipe()(client, session, session.token)
+    return response, sent
+
+
+async def admitted_at(position: int) -> Session[User]:
+    """The session a real `CookieVerifier` builds for a POST from `RECIPE_ORIGINS[position]`."""
+    built = CookieVerifier(
+        secret=COOKIE_SECRET,
+        store=FakeStore(sessions={ADMITTED_TOKEN: stored_session(ADMITTED_TOKEN)}),
+        csrf=OriginCheck(allowed_origins=list(RECIPE_ORIGINS)),
+        secure_cookies=False,
+    )
+    connection = cookie_request(
+        "POST", cookie=f"{COOKIE}={ADMITTED_COOKIE}", origin=RECIPE_ORIGINS[position]
+    )
+    session = await run_cookie_mode(built, connection)
+    assert session is not None
+    return session
+
+
+async def admitted_and_forwarded(
+    position: int,
+) -> tuple[Session[User], httpx.Response | None, list[httpx.Request]]:
+    session = await admitted_at(position)
+    answer, sent = await forwarded(session)
+    return session, answer, sent
+
+
+def secrets_sent(request: httpx.Request) -> tuple[SecretStr, list[str], SecretStr]:
+    """The forwarded cookie, the body's keys and its token - the two credentials masked, so a
+    failing comparison renders `**********` rather than either value."""
+    body = json.loads(request.content)
+    return SecretStr(request.headers["cookie"]), sorted(body), SecretStr(body["token"])
+
+
+@pytest.mark.parametrize("position", range(len(RECIPE_ORIGINS)), ids=RECIPE_ORIGINS)
+def test_the_forwarding_recipe_sends_what_revoke_session_reads(position: int) -> None:
+    """The cookie as accepted, the `Origin` the request matched, and `{token}` - nothing re-read.
+
+    The session comes from a real verifier over a multi-entry allowlist, one request per entry,
+    so a recipe that forwarded a literal instead of `session.origin` is wrong at every position
+    but one.
+    """
+    session, answer, sent = anyio.run(admitted_and_forwarded, position)
+
+    assert session.origin == RECIPE_ORIGINS[position], "the verifier matched another entry"
+    assert answer is not None and answer.status_code == 200
+    (request,) = sent
+    assert request.method == "POST"
+    assert str(request.url) == f"{BASE_URL}/api/auth/revoke-session"
+    assert request.headers["origin"] == RECIPE_ORIGINS[position]
+    cookie, keys, token = secrets_sent(request)
+    assert cookie == EXPECTED_COOKIE
+    assert keys == ["token"]
+    assert token == EXPECTED_TOKEN
+
+
+@pytest.mark.parametrize(
+    ("cookie", "origin"),
+    [(True, None), (False, None), (False, ALLOWED_ORIGIN)],
+    ids=["a GET: no origin", "Mode B: neither", "no cookie"],
+)
+def test_the_forwarding_recipe_sends_nothing_without_a_cookie_and_a_matched_origin(
+    cookie: bool, origin: str | None
+) -> None:
+    answer, sent = anyio.run(forwarded, verified(cookie=cookie, origin=origin))
+
+    assert answer is None
+    assert sent == []

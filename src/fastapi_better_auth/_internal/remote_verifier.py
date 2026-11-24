@@ -40,7 +40,7 @@ from __future__ import annotations
 import hmac
 import time
 from collections.abc import Callable, Sequence
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, TypeVar, cast
 
 import anyio
@@ -52,6 +52,7 @@ from .cookie_parsing import (
     MAX_COOKIE_HEADER_BYTES,
     MAX_COOKIE_PAIRS,
     acceptable_names,
+    accepted_cookie,
     cookie_pairs,
     parse_signed_value,
     resolve_named_cookie,
@@ -65,14 +66,13 @@ from .errors import (
     ConfigurationError,
     InvalidCredential,
     SessionError,
-    SessionExpired,
-    SessionRevoked,
 )
 from .labels import cookie_source
 from .models import Session, User
 from .negative_cache import MAX_REMEMBERED_MISSES, NEGATIVE_TTL, NegativeCache
 from .parsing import parse_user
 from .reasons import fingerprint
+from .refusal_clock import RefusalClock, check_ban, check_expiry
 from .remote_backoff import BackoffLatch
 from .remote_config import (
     MAX_OUTBOUND_CONCURRENCY,
@@ -103,6 +103,7 @@ UserModelT = TypeVar("UserModelT", bound=User)
 
 COOKIE_HEADER = "cookie"
 ACCEPT_JSON = "application/json"
+UPSTREAM_SESSION = "the session upstream returned"
 
 DEFAULT_BASE_PATH = "/api/auth"
 GET_SESSION_PATH = "/get-session"
@@ -203,7 +204,18 @@ class RemoteVerifier:
             request. Either way it reads only whether a `set-cookie` came back, never its value,
             and never replays a real credential.
         clock: A monotonic clock, injected so the cache TTL, the backoff latch and the probe-retry
-            window are testable without sleeping.
+            window are testable without sleeping. It never decides a refusal; `now` does.
+        now: The wall clock the expiry and ban checks read, for a test to move; `None`, the
+            default, is the real time. Not `clock`: that one counts monotonic seconds for caches
+            and back-off, while this one is a date and decides only the two refusals. A callable
+            returning an aware `datetime`, read once per check, which can only make this verifier
+            stricter: expiry is checked against the later of the real time and `now()`, a ban's
+            lapse against the earlier. Moving it forward expires sessions sooner, moving it back
+            changes nothing, and it never shortens a ban - so left wired in production, the worst
+            it can do is expire sessions early. For the same reason it cannot show a ban lapsing:
+            have upstream answer a past `banExpires` for that. A `now()` that raises, or returns
+            anything but an aware `datetime`, refuses the request (the uniform 401, with the
+            exception logged at ERROR).
 
     Raises:
         ConfigurationError: For any unusable configuration, at construction: a `base_url` that is
@@ -212,7 +224,7 @@ class RemoteVerifier:
             `cookie_name`/`secure_prefix`, a non-bool `secure_cookies` or `refuse_unsigned_bearer`,
             a malformed `base_path`, a
             `concurrency`/`queue_timeout`/`negative_ttl`/`max_remembered`/`max_bytes` out of range,
-            or a non-callable `clock`.
+            a non-callable `clock`, or a `now` that is neither `None` nor callable.
     """
 
     def __init__(
@@ -234,6 +246,7 @@ class RemoteVerifier:
         max_bytes: int = MAX_SESSION_BYTES,
         refuse_unsigned_bearer: bool = False,
         clock: Callable[[], float] = time.monotonic,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self._origin = normalize_base_url(base_url)
         self._csrf = validated_policy(csrf, where="RemoteVerifier(csrf=...)")
@@ -254,6 +267,7 @@ class RemoteVerifier:
         self._max_bytes = validated_cap(max_bytes)
         self._refuse_unsigned_bearer = validated_refuse_unsigned_bearer(refuse_unsigned_bearer)
         self._clock = validated_clock(clock)
+        self._refusal_clock = RefusalClock(now, owner="RemoteVerifier")
         self._uri = f"{self._origin}{self._base_path}{GET_SESSION_PATH}{GET_SESSION_QUERY}"
         self.credential_source = cookie_source(self._base)
         self._cache = NegativeCache(
@@ -286,6 +300,11 @@ class RemoteVerifier:
         """The unprefixed cookie name this verifier was configured with. The name it reads and
         documents is `credential_source`'s: this one, or it behind `secure_prefix`."""
         return self._cookie_name
+
+    @property
+    def secure_prefix(self) -> str:
+        """The prefix on the hardened cookie name."""
+        return self._secure_prefix
 
     @property
     def secure_cookies(self) -> bool:
@@ -409,6 +428,8 @@ class RemoteVerifier:
         Returns:
             The verified session. `token` is the raw session token, `expires_at` the upstream
             expiry, and `raw` the get-session session payload - so `impersonatedBy` is reachable.
+            `id` is the session id upstream returned, `cookie` the `(name, value)` pair forwarded,
+            and `origin` the `allowed_origins` entry a shipped CSRF policy matched.
 
         Raises:
             InvalidCredential: A malformed cookie, a signature that verifies against no configured
@@ -426,7 +447,7 @@ class RemoteVerifier:
             name, material = resolve_named_cookie(credential.pairs, self._base)
             token = _rung_one(material)
             marker = fingerprint(token)
-            enforce_policy(self._csrf, credential.facts, token)
+            origin = enforce_policy(self._csrf, credential.facts, token)
             verified = self._rung_two(material, marker)
             if self._cache.holds(material):
                 raise null_outcome(verified, marker)
@@ -439,7 +460,7 @@ class RemoteVerifier:
             response = await self._fetched(outbound, marker)
             self._backoff.observe(response)
             record = self._document(response, material, marker, verified)
-            return self._session(record, token, marker, user_model)
+            return self._session(record, token, marker, user_model, (name, material), origin)
         finally:
             # `credential`/`record`/`response` carry the forwarded cookie/token as frame locals;
             # every verify() exit - success, the D-094/180/210 refusals, and the WP15 cache/latch/
@@ -606,22 +627,29 @@ class RemoteVerifier:
             material = ""
 
     def _session(
-        self, record: StoredSession, token: str, marker: str, user_model: type[UserModelT]
+        self,
+        record: StoredSession,
+        token: str,
+        marker: str,
+        user_model: type[UserModelT],
+        cookie: tuple[str, str],
+        origin: str | None,
     ) -> Session[UserModelT]:
         # parse_session_document guarantees the user is present, so the cast keeps that invariant
-        # local rather than re-checking a branch no reachable document can take. This frame holds
-        # the forwarded token and the record's copy of it; both are dropped before any refusal.
+        # local. This frame holds the forwarded token, the accepted cookie and the record's copy
+        # of the token; all are dropped before any refusal propagates.
         stored = cast("StoredUser", record.user)
         try:
             if not hmac.compare_digest(record.token.encode("utf-8"), token.encode("utf-8")):
                 raise InvalidCredential(
                     reason=f"upstream answered a session naming a different token [{marker}]"
                 )
-            _check_expiry(record, marker)
-            _check_ban(stored, marker)
-            return _build_session(record, stored, token, user_model)
+            check_expiry(record, marker, self._refusal_clock, subject=UPSTREAM_SESSION)
+            check_ban(stored, marker, self._refusal_clock)
+            return _build_session(record, stored, token, user_model, cookie, origin)
         finally:
             token = ""
+            cookie = ("", "")
             del record, stored
 
 
@@ -664,33 +692,20 @@ def _rung_one(material: str) -> str:
     return result
 
 
-def _check_expiry(record: StoredSession, marker: str) -> None:
-    """A session whose upstream `expiresAt` has elapsed. The record carries the token, so this
-    frame reads the one field it needs and drops the record before the refusal (D-094, D-181)."""
-    expires_at = record.expires_at
-    del record
-    if expires_at <= datetime.now(timezone.utc):
-        raise SessionExpired(reason=f"the session upstream returned has expired [{marker}]")
-
-
-def _check_ban(user: StoredUser, marker: str) -> None:
-    """A banned user, unless the ban has lapsed. `banned is None` is unknown, treated as not banned
-    (a deployment without the admin plugin has no ban state); `ban_expires is None` on a banned user
-    is a permanent ban. Mode A's semantics verbatim (D-182)."""
-    if user.banned is None or user.banned is False:
-        return
-    lapsed = user.ban_expires is not None and user.ban_expires <= datetime.now(timezone.utc)
-    if not lapsed:
-        raise SessionRevoked(reason=f"the session's user is banned [{marker}]")
-
-
 def _build_session(
-    record: StoredSession, user: StoredUser, token: str, user_model: type[UserModelT]
+    record: StoredSession,
+    user: StoredUser,
+    token: str,
+    user_model: type[UserModelT],
+    cookie: tuple[str, str],
+    origin: str | None,
 ) -> Session[UserModelT]:
-    # The forwarded token, the record's copy of it, and the payload's own `token` column all live
-    # in this frame; all must be gone before it exits, on the refusal path as well as the return.
+    # The forwarded token, the accepted cookie, the record's copy of the token and the payload's
+    # own `token` column all live in this frame, and all are gone before it exits, refused or
+    # not. The last gate, `parse_user`, runs before `accepted_cookie` builds the pair.
     expires_at = record.expires_at
     impersonated_by = record.impersonated_by
+    session_id = record.id
     raw = record.payload
     del record
     try:
@@ -699,8 +714,12 @@ def _build_session(
             expires_at=expires_at,
             token=SecretStr(token),
             impersonated_by=impersonated_by,
+            id=session_id,
+            cookie=accepted_cookie(*cookie),
+            origin=origin,
             raw=raw,
         )
     finally:
         token = ""
+        cookie = ("", "")
         raw = {}

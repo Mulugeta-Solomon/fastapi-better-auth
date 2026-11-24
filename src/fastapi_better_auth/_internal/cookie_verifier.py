@@ -16,8 +16,8 @@ the store is reached on a CSRF failure. These are named invariants, spy-tested, 
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from typing import Any, TypeVar, cast
 
 from pydantic import SecretStr
@@ -28,9 +28,10 @@ from .cookie_parsing import (
     MAX_COOKIE_PAIRS,
     ParsedCookie,
     acceptable_names,
+    accepted_cookie,
     cookie_pairs,
     parse_signed_value,
-    resolve_cookie_value,
+    resolve_named_cookie,
     session_data_names,
 )
 from .csrf import CsrfFacts, CsrfPolicy, enforce_policy, validated_policy
@@ -40,7 +41,6 @@ from .errors import (
     ConfigurationError,
     InvalidCredential,
     SessionError,
-    SessionExpired,
     SessionRevoked,
 )
 from .labels import cookie_source
@@ -48,6 +48,7 @@ from .models import Session, User
 from .once import Once
 from .parsing import parse_user
 from .reasons import fingerprint, safe_label
+from .refusal_clock import RefusalClock, check_ban, check_expiry
 from .shared_secret import SharedSecret
 from .signing import verify_signature
 from .stores.outage import OutageLatch, report_once
@@ -62,6 +63,7 @@ DEFAULT_COOKIE_NAME = "better-auth.session_token"
 DEFAULT_SECURE_PREFIX = "__Secure-"
 COOKIE_HEADER = "cookie"
 ILLEGAL_IN_A_COOKIE_NAME = frozenset(" \t\r\n;=,")
+STORED_SESSION = "the stored session"
 
 
 class CookieCredential:
@@ -150,13 +152,23 @@ class CookieVerifier:
             plain name, and then the *only* name read is `{cookie_name}`. Never both: accepting the
             plain and the prefixed name at once let a sibling subdomain plant the other name and be
             authenticated as itself (a cross-name session fixation).
+        now: The clock the expiry and ban checks read, for a test to move; `None`, the default, is
+            the real time. A callable returning an aware `datetime`, read once per check, which
+            can only make this verifier stricter: expiry is checked against the later of the real
+            time and `now()`, a ban's lapse against the earlier. Moving it forward expires
+            sessions sooner, moving it back changes nothing, and it never shortens a ban - so left
+            wired in production, the worst it can do is expire sessions early. For the same
+            reason it cannot show a ban lapsing: store a past `ban_expires` for that. A `now()`
+            that raises, or returns anything but an aware `datetime`, refuses the request (the
+            uniform 401, with the exception logged at ERROR).
 
     Raises:
         ConfigurationError: For any unusable configuration, at construction: neither or both of
             `secret`/`secrets`, an empty keyring, a keyring entry or `secret` that is not a
             `SharedSecret`, a `store` that is not a `SessionStore`, a `csrf` that is `None` (which
-            points at `CsrfDisabled`) or not a `CsrfPolicy`, or a `cookie_name` that is blank or
-            carries a character illegal in a cookie name.
+            points at `CsrfDisabled`) or not a `CsrfPolicy`, a `cookie_name` that is blank or
+            carries a character illegal in a cookie name, or a `now` that is neither `None` nor
+            callable.
     """
 
     def __init__(
@@ -169,6 +181,7 @@ class CookieVerifier:
         cookie_name: str = DEFAULT_COOKIE_NAME,
         secure_prefix: str = DEFAULT_SECURE_PREFIX,
         secure_cookies: bool = True,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self._secrets = _validated_keyring(secret, secrets)
         self._store = _validated_store(store)
@@ -176,6 +189,7 @@ class CookieVerifier:
         self._cookie_name = _validated_cookie_name(cookie_name)
         self._secure_prefix = _validated_prefix(secure_prefix)
         self._secure_cookies = _validated_secure_cookies(secure_cookies)
+        self._refusal_clock = RefusalClock(now, owner="CookieVerifier")
         # Exactly one accepted base, never both: the `__Secure-`-prefixed name when the server
         # sets secure cookies (better-auth's production default), or the plain name when it does
         # not. Accepting both is the cross-name fixation D-189 closes.
@@ -269,7 +283,8 @@ class CookieVerifier:
         Returns:
             The verified session. `token` is the raw session token, `expires_at` is the stored
             expiry, and `raw` is the stored session payload - so `impersonatedBy` and the rest are
-            reachable there.
+            reachable there. `id` is the stored session's id, `cookie` the `(name, value)` pair
+            accepted, and `origin` the `allowed_origins` entry a shipped CSRF policy matched.
 
         Raises:
             InvalidCredential: For a malformed cookie or a signature that verifies against no key.
@@ -282,46 +297,51 @@ class CookieVerifier:
         """
         if not isinstance(credential, CookieCredential):
             raise InvalidCredential(reason="cookie credential snapshot is not this verifier's")
-        material = token = signature = ""
+        material = name = token = signature = ""
         parsed: ParsedCookie | None = None
         try:
-            material = resolve_cookie_value(credential.pairs, self._base)
+            name, material = resolve_named_cookie(credential.pairs, self._base)
             parsed = parse_signed_value(material)
             token = parsed.token
             signature = parsed.signature
             marker = fingerprint(token)
-            enforce_policy(self._csrf, credential.facts, token)
+            origin = enforce_policy(self._csrf, credential.facts, token)
             verify_signature(self._secrets, token, signature, marker)
-            return await self._resolved(token, marker, user_model)
+            return await self._resolved(token, marker, user_model, (name, material), origin)
         finally:
             # `credential` is a parameter, and a parameter is a frame local like any other
             # (D-094, D-180): it carries the whole cookie value, signature included.
             credential = None
-            material = token = signature = ""
+            material = name = token = signature = ""
             parsed = None
 
     async def _resolved(
-        self, token: str, marker: str, user_model: type[UserModelT]
+        self,
+        token: str,
+        marker: str,
+        user_model: type[UserModelT],
+        cookie: tuple[str, str],
+        origin: str | None,
     ) -> Session[UserModelT]:
-        # This frame holds the raw token across the store/expiry/ban refusals, and `record` holds
-        # it too - `StoredSession.token` is the raw token the store was found by (D-181). Scrub
-        # both before any of them propagates (D-094).
+        # This frame holds the raw token and the accepted cookie across the store/expiry/ban
+        # refusals, and `record` holds the token too (D-181). Scrub all of them (D-094).
         record: StoredSession | None = None
         stored: StoredUser | None = None
         try:
             record = await self._looked_up(token, marker)
             if record is None:
                 raise SessionRevoked(reason=f"no stored session for this token [{marker}]")
-            _check_expiry(record, marker)
+            check_expiry(record, marker, self._refusal_clock, subject=STORED_SESSION)
             stored = record.user
             if stored is None:
                 stored = await self._looked_up_user(record.user_id, marker)
                 if stored is None:
                     raise SessionRevoked(reason=f"the session's user is absent [{marker}]")
-            _check_ban(stored, marker)
-            return _session(record, stored, token, user_model)
+            check_ban(stored, marker, self._refusal_clock)
+            return _session(record, stored, token, user_model, cookie, origin)
         finally:
             token = ""
+            cookie = ("", "")
             record = stored = None
 
     async def _looked_up(self, token: str, marker: str) -> StoredSession | None:
@@ -374,45 +394,20 @@ def _store_unavailable(marker: str) -> AuthServiceUnavailable:
     return AuthServiceUnavailable(reason=f"session store lookup could not complete [{marker}]")
 
 
-def _check_expiry(record: StoredSession, marker: str) -> None:
-    """A stored session whose `expiresAt` has elapsed - which upstream's findSession does not check.
-
-    The record carries the raw session token, so this frame reads the one field it needs and
-    drops the record before the refusal can put the frame on a traceback (D-094, D-181).
-    """
-    expires_at = record.expires_at
-    del record
-    if expires_at <= datetime.now(timezone.utc):
-        raise SessionExpired(reason=f"the stored session has expired [{marker}]")
-
-
-def _check_ban(user: StoredUser, marker: str) -> None:
-    """A banned user, unless the ban has lapsed. `banned is None` is unknown, treated as not banned.
-
-    `None` means the admin plugin is not installed, so there is no ban state at all - reading its
-    absence as "banned" would refuse every user on a deployment without the plugin. A `ban_expires`
-    of `None` on a banned user is a permanent ban, not a lapsed one.
-
-    Everything else is banned. `StoredUser` refuses a `banned` that is not `bool | None`, but a
-    record can be built outside a store, and a ban check that assumed someone else had validated
-    would be a check with a caller it has never met - so the two "not banned" values are named
-    here and nothing is inferred from truthiness (D-182).
-    """
-    if user.banned is None or user.banned is False:
-        return
-    lapsed = user.ban_expires is not None and user.ban_expires <= datetime.now(timezone.utc)
-    if not lapsed:
-        raise SessionRevoked(reason=f"the session's user is banned [{marker}]")
-
-
 def _session(
-    record: StoredSession, user: StoredUser, token: str, user_model: type[UserModelT]
+    record: StoredSession,
+    user: StoredUser,
+    token: str,
+    user_model: type[UserModelT],
+    cookie: tuple[str, str],
+    origin: str | None,
 ) -> Session[UserModelT]:
-    # The raw token is in this frame three times - `token`, inside `record`, and inside the
-    # payload under upstream's own `token` column - and all three must be gone before it
-    # exits, on the refusal path as well as the return (D-181).
+    # The raw token is in this frame four times - `token`, `record`, `cookie` and the payload's
+    # own `token` column - and all are gone before it exits, refused or not (D-181). The last
+    # gate, `parse_user`, runs before `accepted_cookie` builds the pair.
     expires_at = record.expires_at
     impersonated_by = record.impersonated_by
+    session_id = record.id
     raw: Mapping[str, Any] = record.payload
     del record
     try:
@@ -421,10 +416,14 @@ def _session(
             expires_at=expires_at,
             token=SecretStr(token),
             impersonated_by=impersonated_by,
+            id=session_id,
+            cookie=accepted_cookie(*cookie),
+            origin=origin,
             raw=raw,
         )
     finally:
         token = ""
+        cookie = ("", "")
         raw = {}
 
 
