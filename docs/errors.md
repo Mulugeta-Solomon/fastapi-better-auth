@@ -33,7 +33,7 @@ Two more exceptions are not refusals of this kind:
 
 ## Why the 401s are identical
 
-Every request-time failure is an `HTTPException` subclass, so FastAPI answers it with no handler of is an `HTTPException` subclass, so FastAPI answers it with no handler of
+Every request-time failure is an `HTTPException` subclass, so FastAPI answers it with no handler of
 yours: `401`, the body `{"detail": "Not authenticated"}`, and a `WWW-Authenticate: Bearer` header.
 Missing, malformed, expired, revoked, "the key set could not be fetched" and "the auth service could
 not be reached" are byte-identical on the wire, deliberately — a client must not be able to tell them
