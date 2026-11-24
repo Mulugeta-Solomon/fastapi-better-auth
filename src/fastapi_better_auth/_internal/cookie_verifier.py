@@ -180,7 +180,7 @@ class CookieVerifier:
             verdict on the credential, logged once as a WARNING of the kind
             `LookupDeadlineExceeded` until a lookup completes again. A store that cannot be
             interrupted and answers after the deadline anyway is refused the same way: a late
-            answer is never honoured. A cancellation from outside (a client gone, a server
+            answer is never honoured, nor is a refusal the store raises late. A cancellation from outside (a client gone, a server
             shutting down, a deadline of your own) stays a cancellation. `None` disables it, for
             a caller that enforces its own deadline. A store that blocks a worker thread
             (`SyncStoreAdapter`) is released from the request at the deadline, but the thread
@@ -392,7 +392,12 @@ class CookieVerifier:
             with anyio.CancelScope(deadline=deadline) as scope:
                 try:
                     found = await self._store.fetch_session_by_token(token)
-                except (BetterAuthError, SessionError):
+                except SessionError:
+                    # A store's typed refusal is its verdict only if it came in time (`_past`).
+                    late = _past(deadline)
+                    if not late:
+                        raise
+                except BetterAuthError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - a raw store failure: the uniform refusal
                     late = _past(deadline)
@@ -422,7 +427,11 @@ class CookieVerifier:
         with anyio.CancelScope(deadline=deadline) as scope:
             try:
                 found = await self._store.fetch_user_by_id(user_id)
-            except (BetterAuthError, SessionError):
+            except SessionError:
+                late = _past(deadline)
+                if not late:
+                    raise
+            except BetterAuthError:
                 raise
             except Exception as exc:  # noqa: BLE001 - as _looked_up
                 late = _past(deadline)
@@ -475,8 +484,11 @@ def _past(deadline: float) -> bool:
     The cancel scope alone cannot say: a store that cannot be interrupted - a worker thread with
     no `abandon_on_cancel`, a coroutine that swallows the cancellation - ends after the deadline
     with an answer or an error of its own rather than the cancellation. Whatever it ended with,
-    it overran, and an overrun is never honoured: not as a session, and not as a store error of
-    some other kind. With no deadline it never reads the clock.
+    it overran, and an overrun is never honoured: not as a session, not as a `SessionError` the
+    store raised itself (a late `SessionRevoked` would be a verdict on a credential that may be
+    valid), and not as a store error of some other kind. A deployment fault (`BetterAuthError`)
+    is not an answer and propagates whenever it arrives. With no deadline it never reads the
+    clock.
     """
     return deadline != math.inf and anyio.current_time() >= deadline
 
