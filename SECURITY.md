@@ -16,10 +16,13 @@ Pre-1.0: only the **latest released version** receives fixes.
 ## Better Auth compatibility floor
 
 This library bridges to a Better Auth (TypeScript) server you operate. Run **Better Auth 1.4.9 or
-newer**: earlier versions are affected by CVE-2026-67337, a critical 2FA bypass via the
-`session_data` cookie cache. This library never reads that cookie and warns once if it sees one,
-but it cannot patch the server side — keeping your Better Auth server current is part of your
-deployment's security posture. The versions each release is verified against are listed in
+newer**: earlier versions are affected by CVE-2026-67337 (the Better Auth maintainers' advisory is
+GHSA-xg6x-h9c9-2m83), a critical 2FA bypass via the `session_data` cookie cache. The sources
+disagree on the fixed version: the CVE record says versions before 1.4.9 are affected, and the
+maintainers' advisory names 1.4.6 as the first fixed version. 1.4.9 is fixed by both accounts.
+This library never reads that cookie and warns once if it sees one, but it cannot patch the
+server side — keeping your Better Auth server current is part of your deployment's security
+posture. The versions each release is verified against are listed in
 [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Dependency floors
