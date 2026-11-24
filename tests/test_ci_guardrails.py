@@ -315,6 +315,16 @@ def test_the_reporter_expects_exactly_the_matrix_both_lanes_sweep() -> None:
     assert '--expected-versions "$EXPECTED_VERSIONS"' in writer
 
 
+def test_every_record_and_the_report_name_their_run_attempt() -> None:
+    """A partial re-run mixes attempts in one download; the reporter weighs them by attempt."""
+    text = CANARY.read_text(encoding="utf-8")
+
+    assert text.count("canary_report.py record") == 2
+    assert text.count('--run-attempt "$GITHUB_RUN_ATTEMPT"') == 3
+    (writer,) = [job for job in jobs(CANARY).values() if "issues: write" in job]
+    assert '--run-attempt "$GITHUB_RUN_ATTEMPT"' in writer
+
+
 def test_every_matrix_leg_records_and_uploads_its_verdict() -> None:
     legs = [job for job in jobs(CANARY).values() if "version: [" in job]
 
