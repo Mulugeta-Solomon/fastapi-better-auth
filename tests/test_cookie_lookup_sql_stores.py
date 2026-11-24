@@ -4,14 +4,18 @@ The fakes elsewhere prove what the verifier does with a store that does not answ
 it against `SqlAlchemySessionStore` and `SyncStoreAdapter` themselves, over a real (SQLite)
 database whose driver has been made to stop answering - once mid-lookup, and once during the
 first-use schema discovery a store runs inside its first lookup when `connect()` was never
-called. In each case the request is refused within the deadline, the pooled connection comes
-back, the discovery a cancellation interrupted is not left half done, and the next request is
-served.
+called. In each case the caller is released, the pooled connection comes back, the discovery a
+cancellation interrupted is not left half done, and the next request is served.
+
+Where the case depends on *where* the cancellation lands, the lookup is abandoned by an explicit
+cancel only once the driver has seen it arrive. That is an event, not a 20 ms timer that a busy
+machine can fire before the worker thread has even started. The one deadline-driven case asserts
+only what holds wherever the deadline lands.
 
 The async store runs on asyncio alone, as `test_store_lookup_warning.py` explains (aiosqlite
 drives the event loop directly); the sync adapter runs on both backends. What the sync adapter
 cannot do - interrupt its worker thread - is pinned here too: the DBAPI call is still blocked
-after the refusal, and its connection returns only when the database answers.
+after its caller has gone, and its connection returns only when the database answers.
 """
 
 from __future__ import annotations
@@ -19,13 +23,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import pathlib
-import threading
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any
 
 import anyio
-import anyio.to_thread
 import pytest
 from sqlalchemy import Engine, QueuePool, event
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -36,8 +38,11 @@ from tests.cookies import COOKIE, http, run, sign
 from tests.deadlines import (
     DEADLINE,
     GUARD,
+    LONG,
     OVERRUN_KIND,
     OVERRUN_REASON,
+    WEDGE_BACKSTOP,
+    DriverGate,
     every_slot_returned,
     kinds,
     verifier,
@@ -47,10 +52,12 @@ from tests.stores import SESSION_ID, TOKEN, StoreFixture
 
 COOKIE_PAIR = f"{COOKIE}={sign(TOKEN)}"
 CLEANUP_DELAY = 0.05
-"""Seconds a sync connection takes to go back to its pool, on the worker thread."""
+"""Seconds a sync connection takes to go back to its pool, on the worker thread. It is there so
+that a drain which mistook "the statement returned" for "the worker is done" fails every time.
+It cannot fail a correct test: everything after it waits on an event bounded by `GUARD`."""
 STAGES = ("lookup", "discovery")
-"""Where the driver stops answering: after `connect()`, or before it - so the deadline lands in
-the store's first-use schema discovery."""
+"""Where the driver stops answering: after `connect()`, or before it - so the cancellation lands
+in the store's first-use schema discovery."""
 
 
 def checked_out(engine: Engine) -> int:
@@ -74,65 +81,29 @@ def stage(request: pytest.FixtureRequest) -> str:
     return value
 
 
-async def refused_then_served(
-    store: SqlAlchemySessionStore | SyncStoreAdapter, release: Any
-) -> AuthServiceUnavailable:
-    """One request refused at the deadline, the database released, then one request served."""
-    try:
-        with anyio.fail_after(GUARD), pytest.raises(AuthServiceUnavailable) as caught:
-            await run(verifier(store, lookup_timeout=DEADLINE), http(cookie=COOKIE_PAIR))
-    finally:
-        await release()
+async def abandoned_once_inside(arrived: Callable[[], Awaitable[object]], lookup: Any) -> None:
+    """Start `lookup`, wait until the driver has seen it arrive, then cancel its caller."""
+    with anyio.fail_after(GUARD), anyio.CancelScope() as caller:
+        async with anyio.create_task_group() as group:
+            group.start_soon(lookup)
+            await arrived()
+            caller.cancel()
+    assert caller.cancelled_caught
+
+
+async def served(store: SqlAlchemySessionStore | SyncStoreAdapter) -> None:
     session = await run(verifier(store, lookup_timeout=GUARD), http(cookie=COOKIE_PAIR))
     assert session is not None
     assert session.id == SESSION_ID
-    return caught.value
+
+
+def lookup_through(store: SqlAlchemySessionStore | SyncStoreAdapter) -> Callable[[], Any]:
+    """One cookie request through the verifier, with a deadline no case waits out."""
+    built = verifier(store, lookup_timeout=LONG)
+    return lambda: run(built, http(cookie=COOKIE_PAIR))
 
 
 # ---------------------------------------------------------------- SyncStoreAdapter
-
-
-class BlockingDriver:
-    """Makes a sync engine's driver block inside `do_execute` until released - a database that
-    has stopped answering, met exactly where `SyncStoreAdapter`'s worker thread meets it.
-
-    The wait is itself bounded by `GUARD`, so a test that forgets to release cannot wedge the
-    suite; `entered` and `finished` are how a test sees the thread from outside. `finished` is
-    the statement returning, not the worker being done: the rows are still read and the
-    connection still checked in after it, and returning a connection is made to take
-    `CLEANUP_DELAY` here so that a test which mistakes the one for the other fails every time
-    rather than once in a while.
-    """
-
-    def __init__(
-        self, store: SyncStoreAdapter, engine: Engine, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self.store = store
-        self.entered = threading.Event()
-        self.release = threading.Event()
-        self.finished = threading.Event()
-        event.listen(engine, "checkin", lambda *_: time.sleep(CLEANUP_DELAY))
-        original = engine.dialect.do_execute
-
-        def do_execute(cursor: Any, statement: str, parameters: Any, context: Any = None) -> None:
-            self.entered.set()
-            try:
-                self.release.wait(GUARD)
-                original(cursor, statement, parameters, context)
-            finally:
-                self.finished.set()
-
-        monkeypatch.setattr(engine.dialect, "do_execute", do_execute)
-
-    async def drained(self) -> None:
-        """Release the database and wait for every worker thread to be done, or fail.
-
-        Done means the adapter has its slots back. A worker holds its slot until its thread
-        ends, which is after the rows are read and the connection is checked in, so this cannot
-        return while an abandoned worker still owns a connection.
-        """
-        self.release.set()
-        await every_slot_returned(self.store)
 
 
 @pytest.fixture
@@ -142,57 +113,81 @@ async def sync_fixture(tmp_path: pathlib.Path) -> AsyncIterator[StoreFixture]:
     await fixture.aclose()
 
 
-def sync_store(fixture: StoreFixture) -> tuple[SyncStoreAdapter, Engine]:
-    """A sync store over a fresh database, and the engine under it."""
+async def gated(
+    fixture: StoreFixture, monkeypatch: pytest.MonkeyPatch, *, connect: bool
+) -> tuple[SyncStoreAdapter, Engine, DriverGate]:
+    """A sync store over a fresh database, its engine with a slow check-in, and the gate."""
     store, _ = fixture()
     assert isinstance(store, SyncStoreAdapter)
     engine = fixture.engines[-1]
     assert isinstance(engine, Engine)
-    return store, engine
+    if connect:
+        await store.connect()
+    event.listen(engine, "checkin", lambda *_: time.sleep(CLEANUP_DELAY))
+    return store, engine, DriverGate(engine, monkeypatch)
+
+
+async def drained(store: SyncStoreAdapter, gate: DriverGate) -> None:
+    """Let the database answer and wait until every worker thread has ended (`every_slot_returned`
+    explains why that is what the slots mean), or fail the test."""
+    gate.release.set()
+    await every_slot_returned(store)
 
 
 @pytest.mark.anyio
-async def test_a_hung_sync_adapter_releases_the_request_but_not_its_thread(
+async def test_a_hung_sync_adapter_releases_its_caller_but_not_its_thread(
     sync_fixture: StoreFixture, monkeypatch: pytest.MonkeyPatch, records: list[logging.LogRecord]
 ) -> None:
-    """`SyncStoreAdapter` hands off with `abandon_on_cancel`, so the deadline frees the request -
-    but a thread cannot be interrupted: the DBAPI call is still blocked after the refusal, and
-    finishes (its connection back in the pool) only when the database answers."""
-    store, engine = sync_store(sync_fixture)
-    await store.connect()
-    driver = BlockingDriver(store, engine, monkeypatch)
+    """`SyncStoreAdapter` hands off with `abandon_on_cancel`, so a cancellation frees the caller -
+    but a thread cannot be interrupted: the DBAPI call is still blocked after its caller has gone,
+    and its connection comes back only when the database answers."""
+    store, engine, gate = await gated(sync_fixture, monkeypatch, connect=True)
+    try:
+        await abandoned_once_inside(lambda: gate.entered(1), lookup_through(store))
+        assert gate.inside == 1, "the worker thread was not still blocked in the database"
+        assert checked_out(engine) == 1, "the abandoned thread no longer held its connection"
+    finally:
+        await drained(store, gate)
+
+    assert checked_out(engine) == 0
+    assert kinds(records) == []
+    await served(store)
+
+
+@pytest.mark.anyio
+async def test_a_sync_adapter_recovers_from_an_abandoned_lookup(
+    sync_fixture: StoreFixture, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """Abandoned mid-lookup, or mid-discovery with no `connect()`: once the database answers, the
+    connection is back and the next request is served - discovery included, rerun rather than
+    left half done."""
+    store, engine, gate = await gated(sync_fixture, monkeypatch, connect=stage == "lookup")
+    try:
+        await abandoned_once_inside(lambda: gate.entered(1), lookup_through(store))
+    finally:
+        await drained(store, gate)
+
+    assert checked_out(engine) == 0
+    await served(store)
+
+
+@pytest.mark.anyio
+async def test_a_sync_adapter_overrun_is_refused_and_the_store_recovers(
+    sync_fixture: StoreFixture, monkeypatch: pytest.MonkeyPatch, records: list[logging.LogRecord]
+) -> None:
+    """The verifier's own deadline over the real adapter. It may land before the worker thread has
+    started or while it is blocked in the database; every assertion here holds either way."""
+    store, engine, gate = await gated(sync_fixture, monkeypatch, connect=True)
     try:
         with anyio.fail_after(GUARD), pytest.raises(AuthServiceUnavailable) as caught:
             await run(verifier(store, lookup_timeout=DEADLINE), http(cookie=COOKIE_PAIR))
-        assert await anyio.to_thread.run_sync(driver.entered.wait, GUARD)
-        assert not driver.finished.is_set(), "the worker thread was not still running"
-        assert checked_out(engine) == 1, "the abandoned thread no longer held its connection"
     finally:
-        await driver.drained()
+        await drained(store, gate)
 
     assert OVERRUN_REASON in caught.value.reason
     assert kinds(records) == [OVERRUN_KIND]
     assert checked_out(engine) == 0
-
-
-@pytest.mark.anyio
-async def test_a_sync_adapter_recovers_from_an_overrun(
-    sync_fixture: StoreFixture,
-    monkeypatch: pytest.MonkeyPatch,
-    stage: str,
-    records: list[logging.LogRecord],
-) -> None:
-    """Mid-lookup, or mid-discovery with no `connect()`: refused, then served once it answers."""
-    store, engine = sync_store(sync_fixture)
-    if stage == "lookup":
-        await store.connect()
-    driver = BlockingDriver(store, engine, monkeypatch)
-
-    refusal = await refused_then_served(store, driver.drained)
-
-    assert OVERRUN_REASON in refusal.reason
-    assert kinds(records) == [OVERRUN_KIND]
-    assert checked_out(engine) == 0
+    await served(store)
 
 
 # ---------------------------------------------------------------- SqlAlchemySessionStore
@@ -202,26 +197,24 @@ class AwaitingDriver:
     """Makes an async engine's driver wait inside `do_execute` until released.
 
     SQLAlchemy runs `do_execute` in a greenlet on the event loop, and the aiosqlite adapter awaits
-    its worker from there; `await_only` is that same bridge, so the wait is a real await the
-    deadline can cancel - a database that stopped answering, met where asyncpg would meet it.
+    its worker from there; `await_only` is that same bridge, so the wait is a real await a
+    cancellation can land on - a database that stopped answering, met where asyncpg would meet it.
+    `reached` is set the first time a statement arrives.
     """
 
     def __init__(self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch) -> None:
         self.release = asyncio.Event()
-        self.entered = 0
+        self.reached = asyncio.Event()
         dialect = engine.sync_engine.dialect
         original = dialect.do_execute
 
         def do_execute(cursor: Any, statement: str, parameters: Any, context: Any = None) -> None:
-            self.entered += 1
+            self.reached.set()
             if not self.release.is_set():
-                await_only(asyncio.wait_for(self.release.wait(), GUARD))
+                await_only(asyncio.wait_for(self.release.wait(), WEDGE_BACKSTOP))
             original(cursor, statement, parameters, context)
 
         monkeypatch.setattr(dialect, "do_execute", do_execute)
-
-    async def released(self) -> None:
-        self.release.set()
 
 
 class TestAsyncStore:
@@ -243,7 +236,7 @@ class TestAsyncStore:
         stage: str,
         records: list[logging.LogRecord],
     ) -> None:
-        """The production path: the store's await is cancelled at the deadline, its connection
+        """The production path: the store's await is cancelled inside the driver, its connection
         goes back to the pool rather than leaking, and a discovery the cancellation interrupted
         runs again on the next request instead of being left half done or locked."""
         store, _ = async_fixture()
@@ -253,9 +246,9 @@ class TestAsyncStore:
         assert isinstance(engine, AsyncEngine)
         driver = AwaitingDriver(engine, monkeypatch)
 
-        refusal = await refused_then_served(store, driver.released)
+        await abandoned_once_inside(driver.reached.wait, lookup_through(store))
+        driver.release.set()
 
-        assert driver.entered >= 2
-        assert OVERRUN_REASON in refusal.reason
-        assert kinds(records) == [OVERRUN_KIND]
+        await served(store)
+        assert kinds(records) == []
         assert checked_out(engine.sync_engine) == 0
