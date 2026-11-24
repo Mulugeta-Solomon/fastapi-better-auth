@@ -497,12 +497,20 @@ def bound_result(directory: Path, path: Path) -> LegResult:
 
 
 def read_result(path: Path) -> LegResult:
-    if path.stat().st_size > MAX_RESULT_BYTES:
+    """One leg's file, or Rejected: nothing a hostile file holds may escape as another error."""
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_RESULT_BYTES + 1)
+    except OSError as exc:  # a directory named like the file, a vanished or unreadable path
+        raise Rejected(f"it cannot be read: {type(exc).__name__}") from exc
+    if len(raw) > MAX_RESULT_BYTES:
         raise Rejected(f"it is larger than {MAX_RESULT_BYTES} bytes")
     try:
-        document: object = json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise Rejected("it is not JSON") from exc
+        document: object = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:  # UnicodeDecodeError is a ValueError
+        # Nested arrays well inside the size cap exhaust the decoder's recursion on CPython
+        # 3.10 and 3.11.
+        raise Rejected("it is not decodable JSON") from exc
     if not isinstance(document, dict):
         raise Rejected("it is not a JSON object")
     fields = {str(k): v for k, v in document.items()}  # pyright: ignore[reportUnknownVariableType]
