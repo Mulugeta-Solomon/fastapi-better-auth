@@ -89,6 +89,77 @@ def test_a_missing_leg_comments_on_the_open_unrecorded_issue(
     assert gh.of("create") == []
 
 
+UNRECORDED_HEAD = "canary: a HEAD conformance leg failed without recording its result"
+
+
+def test_a_green_lane_with_a_missing_leg_keeps_its_issue_open_and_fails_the_job(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    """Uploads tolerate a missing file, so a green lane alone does not prove every leg spoke."""
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
+    gh = Gh({40: UNRECORDED_HEAD})
+
+    code = report(
+        script,
+        tmp_path,
+        gh,
+        jobs={"head": "success", "wheel": "skipped"},
+        versions=["1.7.1", "1.7.5"],
+    )
+
+    assert code == 1
+    assert gh.of("close") == []
+    (comment,) = gh.of("comment")
+    body = comment[comment.index("--body") + 1]
+    assert comment[2] == "40"
+    assert "reported success" in body
+    assert "better-auth@1.7.5" in body
+    assert "better-auth@1.7.1" not in body
+
+
+def test_a_green_lane_with_a_missing_leg_files_when_nothing_is_open(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
+    gh = Gh({})
+
+    code = report(
+        script,
+        tmp_path,
+        gh,
+        jobs={"head": "success", "wheel": "skipped"},
+        versions=["1.7.1", "latest"],
+    )
+
+    assert code == 1
+    assert created_titles(gh) == [UNRECORDED_HEAD]
+    assert "better-auth@latest" in unrecorded_body(gh, "head")
+
+
+def test_a_green_lane_covered_in_full_closes_its_issue_and_passes(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    """Coverage may come from an earlier attempt's pass that a partial re-run left in place."""
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
+    record(
+        script, tmp_path, lane="head", version="1.7.5", outcome="success", harness="1.7.5",
+        attempt="2",
+    )  # fmt: skip
+    gh = Gh({40: UNRECORDED_HEAD})
+
+    code = report(
+        script,
+        tmp_path,
+        gh,
+        attempt="2",
+        jobs={"head": "success", "wheel": "skipped"},
+        versions=["1.7.1", "1.7.5"],
+    )
+
+    assert code == 0
+    assert numbers(gh.of("close")) == ["40"]
+
+
 @pytest.mark.parametrize("lane_result", ["cancelled", "skipped"])
 def test_a_cancelled_or_skipped_lane_with_missing_legs_stays_silent(
     script: Report, tmp_path: pathlib.Path, lane_result: str

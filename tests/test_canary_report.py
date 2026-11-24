@@ -337,11 +337,24 @@ def test_an_unrecorded_failure_issue_closes_when_its_lane_is_green(
     script: Report, tmp_path: pathlib.Path
 ) -> None:
     first = Gh({})
-    report(script, tmp_path, first, jobs={"head": "failure", "wheel": "success"})
+    report(
+        script,
+        tmp_path / "first",
+        first,
+        jobs={"head": "failure", "wheel": "skipped"},
+        versions=["1.7.1"],
+    )
     (title,) = created_titles(first)
+    record(script, tmp_path / "second", lane="head", version="1.7.1", outcome="success")
     second = Gh({30: title})
 
-    report(script, tmp_path, second)
+    report(
+        script,
+        tmp_path / "second",
+        second,
+        jobs={"head": "success", "wheel": "skipped"},
+        versions=["1.7.1"],
+    )
 
     assert numbers(second.of("close")) == ["30"]
 
