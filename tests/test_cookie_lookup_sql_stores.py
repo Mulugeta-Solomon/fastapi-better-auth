@@ -33,7 +33,15 @@ from sqlalchemy.util import await_only
 
 from fastapi_better_auth import AuthServiceUnavailable, SqlAlchemySessionStore, SyncStoreAdapter
 from tests.cookies import COOKIE, http, run, sign
-from tests.deadlines import DEADLINE, GUARD, OVERRUN_KIND, OVERRUN_REASON, kinds, verifier
+from tests.deadlines import (
+    DEADLINE,
+    GUARD,
+    OVERRUN_KIND,
+    OVERRUN_REASON,
+    every_slot_returned,
+    kinds,
+    verifier,
+)
 from tests.log_hygiene import capturing
 from tests.stores import SESSION_ID, TOKEN, StoreFixture
 
@@ -96,7 +104,10 @@ class BlockingDriver:
     rather than once in a while.
     """
 
-    def __init__(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+    def __init__(
+        self, store: SyncStoreAdapter, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.store = store
         self.entered = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
@@ -114,9 +125,14 @@ class BlockingDriver:
         monkeypatch.setattr(engine.dialect, "do_execute", do_execute)
 
     async def drained(self) -> None:
-        """Release the thread and wait for it, on the loop that is still open."""
+        """Release the database and wait for every worker thread to be done, or fail.
+
+        Done means the adapter has its slots back. A worker holds its slot until its thread
+        ends, which is after the rows are read and the connection is checked in, so this cannot
+        return while an abandoned worker still owns a connection.
+        """
         self.release.set()
-        await anyio.to_thread.run_sync(self.finished.wait, GUARD)
+        await every_slot_returned(self.store)
 
 
 @pytest.fixture
@@ -126,6 +142,15 @@ async def sync_fixture(tmp_path: pathlib.Path) -> AsyncIterator[StoreFixture]:
     await fixture.aclose()
 
 
+def sync_store(fixture: StoreFixture) -> tuple[SyncStoreAdapter, Engine]:
+    """A sync store over a fresh database, and the engine under it."""
+    store, _ = fixture()
+    assert isinstance(store, SyncStoreAdapter)
+    engine = fixture.engines[-1]
+    assert isinstance(engine, Engine)
+    return store, engine
+
+
 @pytest.mark.anyio
 async def test_a_hung_sync_adapter_releases_the_request_but_not_its_thread(
     sync_fixture: StoreFixture, monkeypatch: pytest.MonkeyPatch, records: list[logging.LogRecord]
@@ -133,11 +158,9 @@ async def test_a_hung_sync_adapter_releases_the_request_but_not_its_thread(
     """`SyncStoreAdapter` hands off with `abandon_on_cancel`, so the deadline frees the request -
     but a thread cannot be interrupted: the DBAPI call is still blocked after the refusal, and
     finishes (its connection back in the pool) only when the database answers."""
-    store, _ = sync_fixture()
+    store, engine = sync_store(sync_fixture)
     await store.connect()
-    engine = sync_fixture.engines[-1]
-    assert isinstance(engine, Engine)
-    driver = BlockingDriver(engine, monkeypatch)
+    driver = BlockingDriver(store, engine, monkeypatch)
     try:
         with anyio.fail_after(GUARD), pytest.raises(AuthServiceUnavailable) as caught:
             await run(verifier(store, lookup_timeout=DEADLINE), http(cookie=COOKIE_PAIR))
@@ -160,12 +183,10 @@ async def test_a_sync_adapter_recovers_from_an_overrun(
     records: list[logging.LogRecord],
 ) -> None:
     """Mid-lookup, or mid-discovery with no `connect()`: refused, then served once it answers."""
-    store, _ = sync_fixture()
+    store, engine = sync_store(sync_fixture)
     if stage == "lookup":
         await store.connect()
-    engine = sync_fixture.engines[-1]
-    assert isinstance(engine, Engine)
-    driver = BlockingDriver(engine, monkeypatch)
+    driver = BlockingDriver(store, engine, monkeypatch)
 
     refusal = await refused_then_served(store, driver.drained)
 
