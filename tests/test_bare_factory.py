@@ -29,11 +29,10 @@ from typing import Any
 
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, Security, WebSocket
-from fastapi.testclient import TestClient
 
 from fastapi_better_auth import BetterAuth, ConfigurationError, Session, User
 from fastapi_better_auth._internal.core import BARE_FACTORY
-from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, client
+from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, TestClient, client
 
 HEADER = "x-cred-a"
 Factory = Callable[..., Callable[..., Awaitable[Any]]]

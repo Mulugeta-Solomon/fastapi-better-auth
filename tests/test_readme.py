@@ -39,8 +39,7 @@ import anyio
 import httpx
 import httpx2
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+from fastapi import FastAPI, testclient
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -58,6 +57,7 @@ from tests.cookies import COOKIE, FakeStore, sign, stored_session
 from tests.cookies import SECRET as COOKIE_SECRET
 from tests.cookies import http as cookie_request
 from tests.cookies import run as run_cookie_mode
+from tests.fakes import TestClient
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
@@ -591,7 +591,8 @@ def clock_fence_test(backend: str) -> Callable[[], object]:
     namespace = run(found[0])
     tests = [value for name, value in namespace.items() if name.startswith("test_")]
     assert len(tests) == 1, f"the clock fence defines {len(tests)} test functions, not one"
-    bound = functools.partial(TestClient, backend=backend)  # pyright: ignore[reportArgumentType]
+    # The class a reader imports, not the typed one the rest of this file uses.
+    bound = functools.partial(testclient.TestClient, backend=backend)  # pyright: ignore[reportArgumentType]
     namespace["TestClient"] = bound
     return tests[0]
 
