@@ -29,19 +29,12 @@ updates:
       harness-npm:
         patterns: ["*"]
   # The harness images, pinned as tag@digest: node in the Dockerfile, Postgres and Redis in
-  # the compose file. Digest refreshes and minor/patch tags come automatically; a major
-  # runtime change (node 24, Postgres 18) is a deliberate edit, not a bot PR.
+  # the compose file.
   - package-ecosystem: docker
     directory: /harness/auth-server
     schedule:
       interval: weekly
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
   - package-ecosystem: docker-compose
     directory: /harness
     schedule:
       interval: weekly
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
