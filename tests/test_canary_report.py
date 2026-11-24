@@ -23,10 +23,11 @@ treats them as untrusted: every field is validated before it can reach an issue 
 
 from __future__ import annotations
 
+import gc
 import json
 import pathlib
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 import pytest
@@ -500,6 +501,77 @@ def test_a_rejected_result_does_not_block_valid_legs_or_the_watch(
     error = capsys.readouterr().err
     assert "::error::" in error
     assert "canary-result-head-1.7.1" in error
+
+
+def plant_and_report(
+    script: Report, tmp_path: pathlib.Path, plant: Callable[[pathlib.Path], object]
+) -> tuple[int, Gh]:
+    """One valid pass on 1.6.30, one planted file on 1.7.1's leg, and a green upstream watch."""
+    record(script, tmp_path, lane="head", version="1.6.30", outcome="success", harness="1.6.30")
+    leg = tmp_path / "canary-result-head-1.7.1"
+    leg.mkdir()
+    plant(leg)
+    gh = Gh({**STALE_OCTOBER, 7: WATCH_TITLE})
+    return report(script, tmp_path, gh, watch="success"), gh
+
+
+def test_a_result_too_deep_to_decode_is_rejected_not_fatal(
+    script: Report,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """4,000 bytes of nested arrays fit the size cap, and CPython 3.10 and 3.11 raise
+    RecursionError decoding them (3.13 parses them). The decoder is made to raise here on every
+    version, so the test does not depend on the interpreter's recursion limits."""
+    deep = "[" * 2000 + "]" * 2000
+    decode = json.loads
+
+    def raising_on_deep(text: str, *args: Any, **kwargs: Any) -> Any:
+        if text == deep:
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+        return decode(text, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", raising_on_deep)
+
+    code, gh = plant_and_report(
+        script, tmp_path, lambda leg: (leg / "canary-result.json").write_text(deep, "utf-8")
+    )
+
+    assert code == 1
+    assert sorted(numbers(gh.of("close"))) == ["7", "96"]
+    assert "canary-result-head-1.7.1" in capsys.readouterr().err
+
+
+def test_a_real_deeply_nested_result_is_rejected_on_every_interpreter(
+    script: Report, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The real payload, undoctored. Garbage is collected first and the collector paused for the
+    parse, so no finalizer can run near the recursion limit and fail the test by timing."""
+    deep = "[" * 2000 + "]" * 2000
+    gc.collect()
+    gc.disable()
+    try:
+        code, gh = plant_and_report(
+            script, tmp_path, lambda leg: (leg / "canary-result.json").write_text(deep, "utf-8")
+        )
+    finally:
+        gc.enable()
+
+    assert code == 1
+    assert sorted(numbers(gh.of("close"))) == ["7", "96"]
+    assert "canary-result-head-1.7.1" in capsys.readouterr().err
+
+
+def test_a_result_path_that_cannot_be_read_is_rejected_not_fatal(
+    script: Report, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A directory named like the result file matches the glob and fails on read (OSError)."""
+    code, gh = plant_and_report(script, tmp_path, lambda leg: (leg / "canary-result.json").mkdir())
+
+    assert code == 1
+    assert sorted(numbers(gh.of("close"))) == ["7", "96"]
+    assert "canary-result-head-1.7.1" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
