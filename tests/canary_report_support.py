@@ -44,10 +44,10 @@ class Gh:
         issues: Mapping[int, str],
         *,
         failing: str = "",
-        created: Mapping[int, str] | None = None,
+        updated: Mapping[int, str] | None = None,
     ) -> None:
         self.issues = dict(issues)
-        self.created = dict(created or {})
+        self.updated = dict(updated or {})
         self.failing = failing
         self.calls: list[list[str]] = []
 
@@ -55,7 +55,7 @@ class Gh:
         call = list(argv)
         if call[:2] == ["issue", "list"]:
             listed = [
-                {"number": n, "title": t, "createdAt": self.created.get(n, OCTOBER)}
+                {"number": n, "title": t, "updatedAt": self.updated.get(n, OCTOBER)}
                 for n, t in self.issues.items()
             ]
             return 0, json.dumps(listed)

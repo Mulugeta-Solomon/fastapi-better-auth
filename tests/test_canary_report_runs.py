@@ -347,7 +347,7 @@ def test_report_refuses_an_implausible_attempt(
     assert gh.calls == []
 
 
-# --- report: a pass closes only what was filed before it ------------------------------------
+# --- report: a pass closes only what nothing has touched since --------------------------------
 
 
 def test_record_writes_when_it_recorded_in_utc(script: Report, tmp_path: pathlib.Path) -> None:
@@ -357,10 +357,11 @@ def test_record_writes_when_it_recorded_in_utc(script: Report, tmp_path: pathlib
     assert written["recorded_at"] == "2026-11-24T12:00:00Z"
 
 
-def test_a_pass_leaves_open_an_issue_filed_after_it_was_recorded(
+def test_a_pass_leaves_open_an_issue_updated_after_it_was_recorded(
     script: Report, tmp_path: pathlib.Path
 ) -> None:
-    """Another run may file after this leg passed; this report must not close that issue."""
+    """Another run may file, or comment a repeat failure, after this leg passed: an older pass
+    must not close past that newer failure. The issue's last update is what is compared."""
     record(
         script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1", now=T0
     )
@@ -370,7 +371,7 @@ def test_a_pass_leaves_open_an_issue_filed_after_it_was_recorded(
             101: "canary: HEAD conformance lane cannot run against better-auth@1.7.1",
             102: "canary: HEAD conformance lane cannot run against better-auth@1.7.1 ",
         },
-        created={95: "2026-11-24T11:00:00Z", 101: "2026-11-24T12:05:00Z"},
+        updated={95: "2026-11-24T11:00:00Z", 101: "2026-11-24T12:05:00Z"},
     )
 
     report(script, tmp_path, gh, now=T0 + dt.timedelta(minutes=10))
@@ -378,7 +379,7 @@ def test_a_pass_leaves_open_an_issue_filed_after_it_was_recorded(
     assert numbers(gh.of("close")) == ["95"]
 
 
-def test_an_issue_filed_in_the_same_second_as_the_pass_stays_open(
+def test_an_issue_updated_in_the_same_second_as_the_pass_stays_open(
     script: Report, tmp_path: pathlib.Path
 ) -> None:
     record(
@@ -386,7 +387,7 @@ def test_an_issue_filed_in_the_same_second_as_the_pass_stays_open(
     )
     gh = Gh(
         {95: "canary: conformance failure against better-auth@1.7.1"},
-        created={95: "2026-11-24T12:00:00Z"},
+        updated={95: "2026-11-24T12:00:00Z"},
     )
 
     report(script, tmp_path, gh, now=T0 + dt.timedelta(minutes=10))
@@ -425,12 +426,47 @@ def test_a_result_recorded_in_the_future_is_rejected_beyond_a_minute_of_skew(
     assert ("::error::" in capsys.readouterr().err) is not accepted
 
 
-@pytest.mark.parametrize("created", ["", "yesterday", "2026-10-15T21:44:29"], ids=str)
-def test_an_issue_list_without_a_usable_creation_time_acts_on_nothing(
-    script: Report, tmp_path: pathlib.Path, created: str
+def test_a_repeat_failure_comment_after_the_pass_keeps_an_old_issue_open(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    """#95 was filed in October, long before the pass, but a newer run commented a repeat
+    failure on it after the pass was recorded: that newer failure is the current truth."""
+    record(
+        script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1", now=T0
+    )
+    gh = Gh(STALE_OCTOBER, updated={95: "2026-11-24T12:00:30Z"})
+
+    report(script, tmp_path, gh, now=T0 + dt.timedelta(minutes=10))
+
+    assert gh.of("close") == []
+
+
+def test_the_issue_list_asks_for_the_last_update(script: Report, tmp_path: pathlib.Path) -> None:
+    asked: list[list[str]] = []
+
+    def gh(argv: Sequence[str]) -> tuple[int, str]:
+        asked.append(list(argv))
+        return 0, "[]"
+
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
+    argv = [
+        "report", "--results-dir", str(tmp_path), "--run-url", RUN_URL,
+        "--upstream-watch", "skipped", "--head-job", "success", "--wheel-job", "skipped",
+        "--expected-versions", '["1.7.1"]', "--run-attempt", "1",
+    ]  # fmt: skip
+
+    script.main(argv, gh=gh)
+
+    (listing,) = [call for call in asked if call[:2] == ["issue", "list"]]
+    assert listing[listing.index("--json") + 1] == "number,title,updatedAt"
+
+
+@pytest.mark.parametrize("updated", ["", "yesterday", "2026-10-15T21:44:29"], ids=str)
+def test_an_issue_list_without_a_usable_update_time_acts_on_nothing(
+    script: Report, tmp_path: pathlib.Path, updated: str
 ) -> None:
     record(script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
-    gh = Gh(STALE_OCTOBER, created={95: created})
+    gh = Gh(STALE_OCTOBER, updated={95: updated})
 
     with pytest.raises(SystemExit):
         report(script, tmp_path, gh)
