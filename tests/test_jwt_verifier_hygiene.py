@@ -127,9 +127,15 @@ def test_the_header_nesting_probe_really_defeats_this_interpreters_json_parser()
     `sys.getrecursionlimit()` up to 3.11, a compile-time constant on 3.12/3.13 (3 000 on
     Windows, 10 000 elsewhere) and stack headroom on 3.14+ - so where it is out of reach
     this skips with the measured depth rather than asserting a fact that is not true there.
+
+    PyJWT >= 2.15 (the floor) reports the overflow as a `DecodeError` raised from the
+    `RecursionError`. The cause is what is asserted: a header refused as "not a json object"
+    is also a `DecodeError`, and would mean the probe never reached the overflow at all.
     """
-    with pytest.raises(RecursionError):
+    with pytest.raises(jwt.DecodeError) as refused_by_pyjwt:
         jwt.get_unverified_header(DEEP_HEADER)
+
+    assert isinstance(refused_by_pyjwt.value.__cause__, RecursionError)
 
 
 @pytest.mark.skipif(not PAYLOAD_OVERFLOWS, reason=out_of_reach("payload", DEEP_PAYLOAD_DEPTH))
