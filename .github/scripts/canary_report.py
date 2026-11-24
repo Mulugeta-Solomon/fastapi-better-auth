@@ -63,6 +63,10 @@ def fail(message: str) -> NoReturn:
     raise SystemExit(1)
 
 
+class Rejected(ValueError):
+    """A value that must not reach an issue; `record` exits on it, `report` skips the file."""
+
+
 def report_line(line: str) -> None:
     print(line)
     destination = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -83,15 +87,15 @@ class LegResult:
     def __post_init__(self) -> None:
         # Everything here ends up in an issue title, a comment, or the step summary.
         if self.lane not in LANES:
-            fail(f"unknown lane {self.lane!r}")
+            raise Rejected(f"unknown lane {self.lane!r}")
         if self.matrix_version not in DIST_TAGS and not VERSION.fullmatch(self.matrix_version):
-            fail(f"implausible matrix version {self.matrix_version!r}")
+            raise Rejected(f"implausible matrix version {self.matrix_version!r}")
         if self.harness_version and not VERSION.fullmatch(self.harness_version):
-            fail(f"implausible harness version {self.harness_version!r}")
+            raise Rejected(f"implausible harness version {self.harness_version!r}")
         if self.wheel_version and not WHEEL_VERSION.fullmatch(self.wheel_version):
-            fail(f"implausible wheel version {self.wheel_version!r}")
+            raise Rejected(f"implausible wheel version {self.wheel_version!r}")
         if self.outcome not in VERDICTS:
-            fail(f"unknown verdict {self.outcome!r}")
+            raise Rejected(f"unknown verdict {self.outcome!r}")
 
     @property
     def leg(self) -> tuple[str, str]:
@@ -321,42 +325,59 @@ def artifact_name(lane: str, matrix_version: str) -> str:
     return f"{ARTIFACT_PREFIX}{lane}-{matrix_version}"
 
 
-def load_results(directory: Path) -> list[LegResult]:
+@dataclass(frozen=True)
+class Loaded:
+    results: tuple[LegResult, ...]
+    rejected: int
+
+
+def load_results(directory: Path) -> Loaded:
     """Every leg's file, each bound to the artifact directory the workflow named for its leg.
 
     A file is accepted only at `<directory>/canary-result-<lane>-<version>/canary-result.json`
     and only if it names that same lane and version: a leg that ran compromised upstream code
     may speak for itself, never for another leg. download-artifact writes a lone pattern match
-    flat, with no artifact name to bind it to, so that layout is refused too; with ten legs that
-    each record unless cancelled, it means nine legs were cancelled, and a red job is right.
+    flat, with no artifact name to bind it to, so that layout is refused too.
+
+    A refused file is reported as an `::error::` and skipped, so its leg simply has no result;
+    it never stops the valid legs or the upstream watch from being acted on.
     """
     if not directory.is_dir():
-        return []
+        return Loaded((), 0)
     results: list[LegResult] = []
+    rejected = 0
     for path in sorted(directory.rglob(RESULT_FILE)):
-        result = read_result(path)
-        if path.parent.parent != directory or path.parent.name != artifact_name(*result.leg):
-            fail(
-                f"{path} names the {result.lane} leg against {result.matrix_version} but is "
-                f"not in that leg's artifact directory {artifact_name(*result.leg)!r}"
-            )
-        results.append(result)
-    return results
+        try:
+            results.append(bound_result(directory, path))
+        except Rejected as exc:
+            rejected += 1
+            print(f"::error::rejected {path}: {exc}", file=sys.stderr)
+    return Loaded(tuple(results), rejected)
+
+
+def bound_result(directory: Path, path: Path) -> LegResult:
+    result = read_result(path)
+    if path.parent.parent != directory or path.parent.name != artifact_name(*result.leg):
+        raise Rejected(
+            f"it names the {result.lane} leg against {result.matrix_version} but is not in "
+            f"that leg's artifact directory {artifact_name(*result.leg)!r}"
+        )
+    return result
 
 
 def read_result(path: Path) -> LegResult:
     if path.stat().st_size > MAX_RESULT_BYTES:
-        fail(f"{path} is larger than {MAX_RESULT_BYTES} bytes")
+        raise Rejected(f"it is larger than {MAX_RESULT_BYTES} bytes")
     try:
         document: object = json.loads(path.read_text(encoding="utf-8"))
-    except ValueError:
-        fail(f"{path} is not JSON")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise Rejected("it is not JSON") from exc
     if not isinstance(document, dict):
-        fail(f"{path} is not a JSON object")
+        raise Rejected("it is not a JSON object")
     fields = {str(k): v for k, v in document.items()}  # pyright: ignore[reportUnknownVariableType]
     expected = set(LegResult.__dataclass_fields__)
     if set(fields) != expected or not all(isinstance(v, str) for v in fields.values()):
-        fail(f"{path} does not hold exactly the string fields {sorted(expected)}")
+        raise Rejected(f"it does not hold exactly the string fields {sorted(expected)}")
     return LegResult(**{key: str(value) for key, value in fields.items()})
 
 
@@ -367,13 +388,16 @@ def record(args: argparse.Namespace) -> int:
         return 0
     if step not in STEP_VERDICTS:
         fail(f"unknown conformance step outcome {step!r}")
-    result = LegResult(
-        lane=args.lane,
-        matrix_version=args.matrix_version,
-        harness_version=args.harness_version,
-        wheel_version=args.wheel_version,
-        outcome=STEP_VERDICTS[step],
-    )
+    try:
+        result = LegResult(
+            lane=args.lane,
+            matrix_version=args.matrix_version,
+            harness_version=args.harness_version,
+            wheel_version=args.wheel_version,
+            outcome=STEP_VERDICTS[step],
+        )
+    except Rejected as exc:
+        fail(str(exc))
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(asdict(result), sort_keys=True), encoding="utf-8")
@@ -396,24 +420,26 @@ def report(args: argparse.Namespace, gh: GhRunner) -> int:
         "head": job_result(args.head_job, "--head-job"),
         "wheel": job_result(args.wheel_job, "--wheel-job"),
     }
-    results = load_results(Path(args.results_dir))
-    for result in results:
+    loaded = load_results(Path(args.results_dir))
+    for result in loaded.results:
         report_line(f"{LANE_NAMES[result.lane]} leg against {result.target}: {result.outcome}")
     if (
         upstream_watch not in {"success", "failure"}
-        and not results
+        and not loaded.results
+        and not loaded.rejected
         and all(value not in {"success", "failure"} for value in job_results.values())
     ):
         report_line("no leg ran and the watch did not decide; nothing to report")
         return 0
     actions = plan(
-        results,
+        loaded.results,
         list_open_issues(gh),
         run_url=run_url,
         upstream_watch=upstream_watch,
         job_results=job_results,
     )
-    return 1 if execute(actions, gh) else 0
+    failures = execute(actions, gh)
+    return 1 if failures or loaded.rejected else 0
 
 
 def parse(argv: Sequence[str] | None) -> argparse.Namespace:
