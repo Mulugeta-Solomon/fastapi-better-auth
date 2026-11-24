@@ -493,34 +493,74 @@ def test_a_tampered_result_file_is_refused_before_any_issue_call(
     assert gh.calls == []
 
 
-def test_two_results_for_one_leg_are_refused(script: Report, tmp_path: pathlib.Path) -> None:
-    record(script, tmp_path, lane="head", version="1.7.1", outcome="success")
-    extra = tmp_path / "duplicate" / "canary-result.json"
-    extra.parent.mkdir()
-    extra.write_bytes(next(tmp_path.rglob("canary-result.json")).read_bytes())
+def result_bytes(script: Report, staging: pathlib.Path, *, lane: str, version: str) -> bytes:
+    """A genuine passing result for one leg, written by `record`, to plant somewhere else."""
+    record(script, staging, lane=lane, version=version, outcome="success", harness=version)
+    return next(staging.rglob("canary-result.json")).read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("directory", "lane", "version"),
+    [
+        ("canary-result-head-1.7.1", "head", "1.6.30"),
+        ("canary-result-head-1.7.1", "wheel", "1.7.1"),
+        ("canary-result-head-1.7.1", "head", "1.7.10"),
+        ("canary-result-wheel-latest", "head", "latest"),
+    ],
+    ids=["other-version", "other-lane", "prefix-version", "other-lane-latest"],
+)
+def test_a_leg_may_only_speak_for_itself(
+    script: Report, tmp_path: pathlib.Path, directory: str, lane: str, version: str
+) -> None:
+    """A leg that ran compromised upstream code must not close, or collide with, another leg.
+
+    The directory is the artifact name the workflow gave the leg, which the leg's own code cannot
+    choose; the file's contents are whatever that code wrote.
+    """
+    planted = result_bytes(script, tmp_path / "staging", lane=lane, version=version)
+    results = tmp_path / "results"
+    (results / directory).mkdir(parents=True)
+    (results / directory / "canary-result.json").write_bytes(planted)
     gh = Gh(STALE_OCTOBER)
 
-    with pytest.raises(SystemExit):
-        report(script, tmp_path, gh)
+    with pytest.raises(SystemExit) as exited:
+        report(script, results, gh)
 
+    assert exited.value.code == 1
     assert gh.calls == []
 
 
-def test_a_single_downloaded_artifact_lands_flat_and_is_still_read(
-    script: Report, tmp_path: pathlib.Path
+@pytest.mark.parametrize(
+    "where",
+    [
+        "canary-result.json",
+        "duplicate/canary-result.json",
+        "canary-result-head-1.7.1/x/canary-result.json",
+    ],
+    ids=["flat", "unnamed-directory", "nested"],
+)
+def test_a_result_outside_its_legs_artifact_directory_is_refused(
+    script: Report, tmp_path: pathlib.Path, where: str
 ) -> None:
-    """download-artifact skips the per-artifact directory when exactly one artifact matches."""
-    record(script, tmp_path / "staging", lane="head", version="1.7.1", outcome="success")
-    flat = tmp_path / "results"
-    flat.mkdir()
-    (flat / "canary-result.json").write_bytes(
-        next((tmp_path / "staging").rglob("canary-result.json")).read_bytes()
-    )
+    """Only `<results>/canary-result-<lane>-<version>/canary-result.json` can be bound to a leg.
+
+    download-artifact v8 does write a lone pattern match flat into the target directory, but a
+    flat file carries no artifact name, so it cannot be bound to the leg that wrote it. With ten
+    legs that each record unless cancelled, one lone artifact means nine legs were cancelled:
+    a red report job is the right answer, not a file trusted for whichever leg it names.
+    """
+    planted = result_bytes(script, tmp_path / "staging", lane="head", version="1.7.1")
+    results = tmp_path / "results"
+    target = results / where
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(planted)
     gh = Gh(STALE_OCTOBER)
 
-    report(script, flat, gh)
+    with pytest.raises(SystemExit) as exited:
+        report(script, results, gh)
 
-    assert numbers(gh.of("close")) == ["95"]
+    assert exited.value.code == 1
+    assert gh.calls == []
 
 
 @pytest.mark.parametrize(
