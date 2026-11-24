@@ -6,28 +6,31 @@ an enclosing deadline fired - must reach the caller as a cancellation. Turned in
 never happened, and on asyncio a task that no longer knows it was cancelled. Each case runs on
 asyncio and trio; the native `Task.cancel()` case is asyncio's alone.
 
-A store that blocks a worker thread cannot be interrupted at all. With `abandon_on_cancel` (as
-`SyncStoreAdapter` hands off) the request is released at the deadline while the thread runs on;
-without it the request waits for the thread, and its late answer is still refused.
+A store that blocks a worker thread cannot be interrupted at all. Without `abandon_on_cancel` the
+request waits for the thread, and its late answer is still refused; the shipped SQL stores, the
+sync adapter's abandoned thread included, are `test_cookie_lookup_sql_stores.py`'s.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import pathlib
 import threading
 import time
-from collections.abc import AsyncIterator, Iterator
-from typing import Any
+from collections.abc import Iterator
 
 import anyio
 import anyio.to_thread
 import pytest
-from sqlalchemy.ext.asyncio import AsyncEngine
 
-from fastapi_better_auth import AuthServiceUnavailable, StoredSession, StoredUser
-from tests.cookies import COOKIE, http, run, sign, stored_session
+from fastapi_better_auth import (
+    AuthServiceUnavailable,
+    CookieVerifier,
+    CsrfDisabled,
+    StoredSession,
+    StoredUser,
+)
+from tests.cookies import http, run, stored_session
 from tests.deadlines import (
     CREDENTIAL,
     DEADLINE,
@@ -40,8 +43,9 @@ from tests.deadlines import (
     verifier,
 )
 from tests.log_hygiene import capturing
-from tests.stores import SESSION_ID, StoreFixture
-from tests.stores import TOKEN as SEEDED_TOKEN
+from tests.refusal_frames import COOKIE_NAME, COOKIE_VALUE, TOKEN, holding, refused, request
+from tests.refusal_frames import SECRET as FRAMES_SECRET
+from tests.refusal_frames import stored_session as frames_session
 
 LONG = 60.0
 """A `lookup_timeout` no case waits out: the cancellation under test always comes first."""
@@ -156,75 +160,6 @@ class TestNativeAsyncioCancel:
 # ---------------------------------------------------------------- stores that block a thread
 
 
-class BlockingDriver:
-    """Makes a sync engine's driver block inside `do_execute` until released - a database that
-    has stopped answering, met exactly where `SyncStoreAdapter`'s worker thread meets it.
-
-    The wait is itself bounded by `GUARD`, so a test that forgets to release cannot wedge the
-    suite; `entered` and `finished` are how a test sees the thread from outside.
-    """
-
-    def __init__(self, store_fixture: StoreFixture, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.entered = threading.Event()
-        self.release = threading.Event()
-        self.finished = threading.Event()
-        engine = store_fixture.engines[-1]
-        assert not isinstance(engine, AsyncEngine)
-        dialect = engine.dialect
-        original = dialect.do_execute
-
-        def do_execute(cursor: Any, statement: str, parameters: Any, context: Any = None) -> None:
-            self.entered.set()
-            try:
-                self.release.wait(GUARD)
-                original(cursor, statement, parameters, context)
-            finally:
-                self.finished.set()
-
-        monkeypatch.setattr(dialect, "do_execute", do_execute)
-
-    async def drained(self) -> None:
-        """Release the thread and wait for it, on the loop that is still open."""
-        self.release.set()
-        await anyio.to_thread.run_sync(self.finished.wait, GUARD)
-
-
-@pytest.fixture
-async def sync_fixture(tmp_path: pathlib.Path) -> AsyncIterator[StoreFixture]:
-    fixture = StoreFixture(tmp_path, "sync")
-    yield fixture
-    await fixture.aclose()
-
-
-@pytest.mark.anyio
-async def test_a_hung_sync_adapter_releases_the_request_but_not_its_thread(
-    sync_fixture: StoreFixture,
-    monkeypatch: pytest.MonkeyPatch,
-    records: list[logging.LogRecord],
-) -> None:
-    """`SyncStoreAdapter` hands off with `abandon_on_cancel`, so the deadline frees the request -
-    but a thread cannot be interrupted: the DBAPI call is still blocked after the refusal, and
-    finishes (its connection back in the pool) only when the database answers. Then the adapter
-    serves the next request normally."""
-    store, _ = sync_fixture()
-    await store.connect()
-    driver = BlockingDriver(sync_fixture, monkeypatch)
-    cookie = f"{COOKIE}={sign(SEEDED_TOKEN)}"
-    try:
-        with anyio.fail_after(GUARD), pytest.raises(AuthServiceUnavailable) as caught:
-            await run(verifier(store, lookup_timeout=DEADLINE), http(cookie=cookie))
-        assert await anyio.to_thread.run_sync(driver.entered.wait, GUARD)
-        assert not driver.finished.is_set(), "the worker thread was not still running"
-    finally:
-        await driver.drained()
-
-    assert OVERRUN_REASON in caught.value.reason
-    assert kinds(records) == [OVERRUN_KIND]
-    session = await run(verifier(store, lookup_timeout=GUARD), http(cookie=cookie))
-    assert session is not None
-    assert session.id == SESSION_ID
-
-
 @pytest.mark.anyio
 async def test_a_thread_that_cannot_be_abandoned_holds_the_request_and_is_still_refused(
     records: list[logging.LogRecord],
@@ -259,3 +194,34 @@ async def test_a_thread_that_cannot_be_abandoned_holds_the_request_and_is_still_
     assert store.completed == 1
     assert OVERRUN_REASON in caught.value.reason
     assert kinds(records) == [OVERRUN_KIND]
+
+
+@pytest.mark.anyio
+async def test_a_refused_late_answer_leaves_the_token_in_no_frame() -> None:
+    """The late record carries the raw token, and the lookup frame held it when the refusal was
+    raised; D-094 walked from the outside, through the resolver FastAPI awaits, finds it gone."""
+
+    class LateRecordStore:
+        async def fetch_session_by_token(self, token: str) -> StoredSession | None:
+            await anyio.to_thread.run_sync(time.sleep, DEADLINE * 2)
+            return frames_session()
+
+        async def fetch_user_by_id(self, user_id: str) -> StoredUser | None:
+            return None
+
+    store = LateRecordStore()
+    connection = request(cookies=[f"{COOKIE_NAME}={COOKIE_VALUE}"])
+    built = CookieVerifier(
+        secret=FRAMES_SECRET,
+        store=store,
+        csrf=CsrfDisabled(reason="this row is not about cross-site request forgery"),
+        secure_cookies=False,
+        lookup_timeout=DEADLINE,
+    )
+
+    with anyio.fail_after(GUARD):
+        refusal = await refused(built, connection)
+
+    assert type(refusal) is AuthServiceUnavailable
+    assert OVERRUN_REASON in refusal.reason
+    assert holding(refusal, TOKEN, ignore=[connection, store]) == []
