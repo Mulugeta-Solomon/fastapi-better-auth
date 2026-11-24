@@ -262,6 +262,7 @@ class JwtVerifier:
             key = await self._key_for(kid, algorithm, marker)
             claims = _decoded(token, key, self, marker)
             _check_subject(claims, marker)
+            _check_not_before(claims, marker)
             _check_lifetime(claims, self._max_token_lifetime, marker)
             return _session(claims, user_model)
         finally:
@@ -380,10 +381,20 @@ def _check_subject(claims: Mapping[str, Any], marker: str) -> None:
         raise InvalidCredential(reason=f"sub identifies nobody {marker}")
 
 
+def _check_not_before(claims: Mapping[str, Any], marker: str) -> None:
+    """An `nbf` that is present must be a NumericDate, as `iat` and `exp` must.
+
+    PyJWT checks `nbf` against the clock through `int()`, which accepts `true`, `"1"` and an
+    integer far past any representable time, so its check passing says nothing about the shape.
+    """
+    if "nbf" in claims and _numeric_date(claims["nbf"]) is None:
+        raise InvalidCredential(reason=f"nbf is not a usable number {marker}")
+
+
 def _check_lifetime(claims: Mapping[str, Any], ceiling: float, marker: str) -> None:
     """A token upstream would never have minted, however well it is signed."""
-    issued = _as_number(claims.get("iat"))
-    expires = _as_number(claims.get("exp"))
+    issued = _numeric_date(claims.get("iat"))
+    expires = _numeric_date(claims.get("exp"))
     if issued is None or expires is None:
         raise InvalidCredential(reason=f"iat or exp is not a number {marker}")
     lifetime = expires - issued
@@ -406,7 +417,7 @@ def _session(claims: Mapping[str, Any], user_model: type[UserModelT]) -> Session
 
 def _expiry(claims: Mapping[str, Any]) -> datetime:
     """`exp` is already proven a number, and bounded by the lifetime ceiling above."""
-    expires = _as_number(claims.get("exp"))
+    expires = _numeric_date(claims.get("exp"))
     assert expires is not None, "the lifetime check runs first"
     return datetime.fromtimestamp(expires, tz=timezone.utc)
 
@@ -424,11 +435,21 @@ def _identified(claims: Mapping[str, Any]) -> Mapping[str, Any]:
     return {**claims, "id": claims.get("sub")}
 
 
-def _as_number(value: object) -> float | None:
-    """`bool` is an `int`, and a claim of `true` is not a time."""
+def _numeric_date(value: object) -> float | None:
+    """A claim as an RFC 7519 NumericDate in seconds, or `None` when it is not a usable one.
+
+    `bool` is an `int`, and a claim of `true` is not a time. A JSON integer has no size limit,
+    so one past the float range is refused here rather than allowed to raise `OverflowError`
+    out of the verifier, and a non-finite float (JSON `Infinity`/`NaN`, which Python's parser
+    accepts) is no time either.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _validated_algorithms(algorithms: object) -> tuple[str, ...]:
