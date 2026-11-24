@@ -12,9 +12,16 @@ ARG BETTER_AUTH_VERSION=""
 # 11, today's registry or `--before` an October date), so the cause is unknown. A few spaced
 # attempts absorb a transient registry or arborist failure; they would NOT have saved the
 # October sweeps, which failed the same way every time. A version that genuinely cannot be
-# installed still fails the build after the last attempt. Which version actually runs is
-# proven afterwards by .github/scripts/harness_better_auth_version.py, not by this step.
+# installed still fails the build after the last attempt. A version equal to both lockfile
+# pins is already installed by `npm ci`, so it skips npm entirely - the 1.7.1 legs crashed on
+# exactly that no-op install. Which version actually runs is proven afterwards by
+# .github/scripts/harness_better_auth_version.py, not by this step.
 RUN if [ -n "$BETTER_AUTH_VERSION" ]; then \
+      pinned=$(node -p 'const d = require("./package.json").dependencies; d["better-auth"] === d.auth ? d.auth : ""'); \
+      if [ "$BETTER_AUTH_VERSION" = "$pinned" ]; then \
+        echo "better-auth@${BETTER_AUTH_VERSION} is the lockfile pin; npm ci already installed it"; \
+        exit 0; \
+      fi; \
       attempt=1; \
       until npm install --no-save "better-auth@${BETTER_AUTH_VERSION}" "auth@${BETTER_AUTH_VERSION}"; do \
         if [ "$attempt" -ge 3 ]; then \

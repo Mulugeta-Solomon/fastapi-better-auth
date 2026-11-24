@@ -267,6 +267,7 @@ def test_the_canary_version_override_is_retried_but_still_fails_loudly() -> None
 
     assert 'npm install --no-save "better-auth@${BETTER_AUTH_VERSION}"' in override
     assert re.search(r"-ge \d", override), "the retry is not bounded"
+    assert '"$BETTER_AUTH_VERSION" = "$pinned"' in override, "the no-op install is not skipped"
     assert "exit 1" in override
 
 
