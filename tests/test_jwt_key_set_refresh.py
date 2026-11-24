@@ -83,8 +83,7 @@ async def test_one_request_refreshes_a_stale_set_and_the_rest_are_answered_from_
         for _ in range(CROWD):
             group.start_soon(request)
         await _until(
-            lambda: transport.calls >= 2
-            and (len(outcomes) >= CROWD - 1 or _queued(verifier) >= 1)
+            lambda: transport.calls >= 2 and (len(outcomes) >= CROWD - 1 or _queued(verifier) >= 1)
         )
 
         assert _queued(verifier) == 0, "a request with a held kid is queued on the refresh"
@@ -258,8 +257,9 @@ def test_the_single_refresher_holds_for_a_verifier_built_outside_the_loop(
             for _ in range(CROWD):
                 group.start_soon(request)
             await _until(
-                lambda: transport.calls >= 2
-                and (len(outcomes) >= CROWD - 1 or _queued(verifier) >= 1)
+                lambda: (
+                    transport.calls >= 2 and (len(outcomes) >= CROWD - 1 or _queued(verifier) >= 1)
+                )
             )
             assert _queued(verifier) == 0
             assert len(outcomes) == CROWD - 1
