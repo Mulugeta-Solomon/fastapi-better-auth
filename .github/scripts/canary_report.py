@@ -8,16 +8,20 @@ nothing: a cancelled leg files nothing.
 
 `report` runs in the one job that may write issues, one canary run at a time. It reads every
 leg's file, the upstream watch's job result and the expected matrix, lists the open `canary`
-issues with their creation times, and then:
+issues with their last-update times, and then:
 
 - a failure files an issue, or comments on the open issue with that title, so a repeat failure
   is never silent;
-- a pass closes the open issues its own leg filed before the pass was recorded - an issue filed
-  later stays open. The comment says the leg passed when it retested the combination the title
+- a pass closes the open issues its own leg filed that were last updated before the pass was
+  recorded. An issue filed, or commented with a repeat failure, after the pass stays open, so an
+  older pass never closes past a newer failure. This is deliberately conservative: anything
+  else that touches the issue after the pass (a human comment, a label) also keeps it open
+  until the next pass. The comment says the leg passed when it retested the combination the title
   names, and says the issue is superseded, not retested, when the title names an older wheel or
   an older resolution of `latest`;
 - a lane whose job failed names, in one issue, every expected leg with no usable result, however
-  many other legs recorded failures; a green lane closes that issue;
+  many other legs recorded failures. A green lane closes that issue only when every expected leg
+  is covered; a green lane with a gap keeps it open, names the gap and fails the job;
 - on a partial re-run, results from earlier attempts are weighed by attempt: an earlier pass
   covers its leg and closes only when the lane is green, an earlier failure is stale.
 
@@ -163,7 +167,7 @@ class LegResult:
 class OpenIssue:
     number: int
     title: str
-    created: dt.datetime
+    updated: dt.datetime
 
 
 @dataclass(frozen=True)
@@ -241,7 +245,7 @@ def close_matching(
     pattern: re.Pattern[str], open_issues: Sequence[OpenIssue], comment: str
 ) -> list[Action]:
     """Close every open issue whose title the pattern matches (the watch and unrecorded ones;
-    a leg's pass closes through `plan_leg`, which also checks when each issue was filed)."""
+    a leg's pass closes through `plan_leg`, which also checks when each issue was last updated)."""
     return [
         Close(candidate.number, comment)
         for candidate in sorted(open_issues, key=lambda issue: issue.number)
@@ -311,7 +315,7 @@ def plan_leg(result: LegResult, context: Context) -> list[Action]:
     return [
         Close(issue.number, close_comment(result, match, context.run_url))
         for issue in sorted(context.open_issues, key=lambda issue: issue.number)
-        if (match := pattern.fullmatch(issue.title)) and issue.created < result.recorded
+        if (match := pattern.fullmatch(issue.title)) and issue.updated < result.recorded
     ]
 
 
@@ -421,7 +425,7 @@ def run_gh(argv: Sequence[str]) -> tuple[int, str]:
 
 def list_open_issues(gh: GhRunner) -> list[OpenIssue]:
     argv = ["issue", "list", "--state", "open", "--label", LABEL, "--limit", ISSUE_LIMIT]
-    code, output = gh([*argv, "--json", "number,title,createdAt"])
+    code, output = gh([*argv, "--json", "number,title,updatedAt"])
     if code != 0:
         fail("cannot list the open canary issues; acting on nothing rather than guessing")
     try:
@@ -436,11 +440,11 @@ def list_open_issues(gh: GhRunner) -> list[OpenIssue]:
             fail("gh issue list returned a non-object entry")
         number: object = entry.get("number")  # pyright: ignore[reportUnknownMemberType]
         title: object = entry.get("title")  # pyright: ignore[reportUnknownMemberType]
-        created: object = entry.get("createdAt")  # pyright: ignore[reportUnknownMemberType]
-        if not (isinstance(number, int) and isinstance(title, str) and isinstance(created, str)):
-            fail("gh issue list returned an entry without a number, a title and a createdAt")
+        updated: object = entry.get("updatedAt")  # pyright: ignore[reportUnknownMemberType]
+        if not (isinstance(number, int) and isinstance(title, str) and isinstance(updated, str)):
+            fail("gh issue list returned an entry without a number, a title and an updatedAt")
         try:
-            issues.append(OpenIssue(number, title, parse_timestamp(created)))
+            issues.append(OpenIssue(number, title, parse_timestamp(updated)))
         except Rejected as exc:
             fail(f"gh issue list returned issue #{number} with {exc}")
     return issues

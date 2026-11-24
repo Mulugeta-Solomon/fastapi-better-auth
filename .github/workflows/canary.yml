@@ -191,10 +191,11 @@ jobs:
 
   report:
     # The only job that can write issues. It reads the legs' verdicts and the upstream watch's
-    # result and files, comments on, or closes issues - nothing else. A pass closes only what
-    # was filed before it; a refused verdict is an ::error:: that leaves its leg missing and
-    # fails this job without blocking the others. Only main files issues: a branch dispatch's
-    # failures are its dispatcher's to read. A cancelled run reports nothing.
+    # result and files, comments on, or closes issues - nothing else. A pass closes only issues
+    # nothing has updated since it was recorded; a refused verdict, or a green lane missing an
+    # expected leg, is an ::error:: that fails this job without blocking the others. Only main
+    # files issues: a branch dispatch's failures are its dispatcher's to read. A cancelled run
+    # reports nothing.
     name: file or close canary issues
     needs: [upstream-check, conformance, published-wheel]
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
