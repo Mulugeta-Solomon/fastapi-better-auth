@@ -202,7 +202,11 @@ jobs:
           UPSTREAM_WATCH: ${{ needs.upstream-check.result }}
           HEAD_JOB: ${{ needs.conformance.result }}
           WHEEL_JOB: ${{ needs.published-wheel.result }}
+          # The same list as both matrices above (a guardrail test holds the three equal): a
+          # failed lane names every one of these that left no usable result.
+          EXPECTED_VERSIONS: '["1.6.30", "1.7.1", "1.7.5", "1.7.6", "latest"]'
         run: >-
           python3 .github/scripts/canary_report.py report --results-dir canary-results
           --run-url "$RUN_URL" --upstream-watch "$UPSTREAM_WATCH"
           --head-job "$HEAD_JOB" --wheel-job "$WHEEL_JOB"
+          --expected-versions "$EXPECTED_VERSIONS"
