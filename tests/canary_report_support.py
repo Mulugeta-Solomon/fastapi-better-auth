@@ -22,7 +22,6 @@ STALE_OCTOBER = {
     97: "canary: published-wheel lane cannot run against better-auth@1.6.30",
     98: "canary: published-wheel lane cannot run against better-auth@1.7.1",
 }
-ALL_GREEN = {"head": "success", "wheel": "success"}
 OCTOBER = "2026-10-15T21:44:29Z"
 T0 = dt.datetime(2026, 11, 24, 12, 0, 0, tzinfo=dt.timezone.utc)
 LANE_NAMES = {"head": "HEAD conformance", "wheel": "published-wheel"}
@@ -121,12 +120,13 @@ def report(
     gh: Gh,
     *,
     watch: str = "skipped",
-    jobs: Mapping[str, str] = ALL_GREEN,
+    jobs: Mapping[str, str] | None = None,
     versions: Sequence[str] | None = None,
     attempt: str = "1",
     now: dt.datetime | None = None,
 ) -> int:
     expected = recorded_versions(results) if versions is None else list(versions)
+    lanes = {**default_jobs(results), **(jobs or {})}
     argv = [
         "report",
         "--results-dir",
@@ -136,15 +136,26 @@ def report(
         "--upstream-watch",
         watch,
         "--head-job",
-        jobs["head"],
+        lanes["head"],
         "--wheel-job",
-        jobs["wheel"],
+        lanes["wheel"],
         "--expected-versions",
         json.dumps(expected),
         "--run-attempt",
         attempt,
     ]
     return script.main(argv, gh=gh, clock=None if now is None else (lambda: now))
+
+
+def default_jobs(results: pathlib.Path) -> dict[str, str]:
+    """A lane a test leaves unnamed is green when it recorded something and skipped otherwise:
+    a green lane that recorded nothing is a coverage gap, which only coverage tests want."""
+    recorded: set[str] = (
+        {path.name.split("-")[2] for path in results.glob("canary-result-*-*") if path.is_dir()}
+        if results.is_dir()
+        else set()
+    )
+    return {lane: "success" if lane in recorded else "skipped" for lane in ("head", "wheel")}
 
 
 def recorded_versions(results: pathlib.Path) -> list[str]:

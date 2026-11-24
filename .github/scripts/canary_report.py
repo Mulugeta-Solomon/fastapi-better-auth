@@ -343,22 +343,46 @@ def close_comment(result: LegResult, title: re.Match[str], run_url: str) -> str:
     )
 
 
-def plan_coverage(lane: str, results: Sequence[LegResult], context: Context) -> list[Action]:
-    """A failed lane names every expected leg with no usable result; a green lane closes that.
+def missing_legs(lane: str, results: Sequence[LegResult], context: Context) -> list[str]:
+    """Expected versions this lane has no covering result for, in matrix order."""
+    covered = {r.matrix_version for r in results if r.lane == lane and context.covers(r)}
+    return [version for version in context.expected if version not in covered]
 
-    Checked per leg, so another leg's recorded failure never hides a missing one. A cancelled or
-    skipped lane says nothing.
+
+def coverage_gaps(results: Sequence[LegResult], context: Context) -> dict[str, list[str]]:
+    """Green lanes that still miss a leg: uploads tolerate a missing file, so `success` alone
+    does not prove every leg spoke. Each one fails the report job, as a rejection does."""
+    gaps = {
+        lane: missing_legs(lane, results, context)
+        for lane in LANES
+        if context.job_results[lane] == "success"
+    }
+    return {lane: missing for lane, missing in gaps.items() if missing}
+
+
+def plan_coverage(lane: str, results: Sequence[LegResult], context: Context) -> list[Action]:
+    """A lane with a gap names every expected leg with no usable result; full coverage closes.
+
+    Checked per leg, so another leg's recorded failure never hides a missing one. A green lane
+    closes the issue only when every expected leg is covered; a green lane with a gap keeps it
+    open and says so. A cancelled or skipped lane says nothing.
     """
+    job = context.job_results[lane]
+    if job not in {"success", "failure"}:
+        return []
     title = unrecorded_title(lane)
-    if context.job_results[lane] == "success":
+    missing = missing_legs(lane, results, context)
+    named = ", ".join(f"better-auth@{version}" for version in missing)
+    if job == "success" and not missing:
         comment = f"Every {LANE_NAMES[lane]} leg recorded its result in {context.run_url}."
         return close_matching(re.compile(re.escape(title)), context.open_issues, comment)
-    if context.job_results[lane] != "failure":
-        return []
-    covered = {r.matrix_version for r in results if r.lane == lane and context.covers(r)}
-    missing = [version for version in context.expected if version not in covered]
-    if missing:
-        named = ", ".join(f"better-auth@{version}" for version in missing)
+    if job == "success":
+        body = (
+            f"The {LANE_NAMES[lane]} lane reported success, yet these legs left no usable "
+            f"result: {named}. Until each records one, the lane proves nothing about them. "
+            f"Run: {context.run_url}"
+        )
+    elif missing:
         body = (
             f"These {LANE_NAMES[lane]} legs left no usable result: {named}. A leg lands here "
             "when it failed before recording, its result was rejected by the reporter, or it "
@@ -631,7 +655,12 @@ def report(args: argparse.Namespace, gh: GhRunner, clock: Clock) -> int:
     )
     actions = plan(loaded.results, context)
     failures = execute(actions, gh)
-    return 1 if failures or loaded.rejected else 0
+    gaps = coverage_gaps(loaded.results, context)
+    for lane, missing in gaps.items():
+        named = ", ".join(missing)
+        print(f"::error::the {lane} lane reported success but left no result for {named}",
+              file=sys.stderr)  # fmt: skip
+    return 1 if failures or loaded.rejected or gaps else 0
 
 
 def parse(argv: Sequence[str] | None) -> argparse.Namespace:

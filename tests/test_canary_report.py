@@ -33,7 +33,6 @@ from typing import Any, cast
 import pytest
 
 from tests.canary_report_support import (
-    ALL_GREEN,
     RUN_URL,
     SCRIPT,
     STALE_OCTOBER,
@@ -123,7 +122,7 @@ def test_a_conformance_failure_files_an_issue_naming_the_leg(
     record(script, tmp_path, lane="head", version="1.7.5", outcome="failure", harness="1.7.5")
     gh = Gh({})
 
-    assert report(script, tmp_path, gh, jobs={"head": "failure", "wheel": "success"}) == 0
+    assert report(script, tmp_path, gh, jobs={"head": "failure"}) == 0
 
     assert created_titles(gh) == ["canary: conformance failure against better-auth@1.7.5"]
     body = gh.of("create")[0]
@@ -137,7 +136,7 @@ def test_a_harness_that_could_not_start_is_not_filed_as_a_conformance_failure(
     record(script, tmp_path, lane="head", version="1.6.30", outcome="skipped")
     gh = Gh({})
 
-    report(script, tmp_path, gh, jobs={"head": "failure", "wheel": "success"})
+    report(script, tmp_path, gh, jobs={"head": "failure"})
 
     assert created_titles(gh) == [
         "canary: HEAD conformance lane cannot run against better-auth@1.6.30"
@@ -162,7 +161,7 @@ def test_the_wheel_lane_keeps_its_two_titles(
     record(script, tmp_path, lane="wheel", version="1.7.6", outcome=outcome, wheel=wheel)
     gh = Gh({})
 
-    report(script, tmp_path, gh, jobs={"head": "success", "wheel": "failure"})
+    report(script, tmp_path, gh, jobs={"wheel": "failure"})
 
     assert created_titles(gh) == [title]
 
@@ -188,7 +187,7 @@ def test_a_failure_whose_issue_is_open_comments_instead_of_staying_silent(
     record(script, tmp_path, lane="head", version="1.7.1", outcome="failure", harness="1.7.1")
     gh = Gh(STALE_OCTOBER)
 
-    report(script, tmp_path, gh, jobs={"head": "failure", "wheel": "success"})
+    report(script, tmp_path, gh, jobs={"head": "failure"})
 
     assert gh.of("create") == []
     comments = gh.of("comment")
@@ -255,7 +254,7 @@ def test_a_conformance_failure_does_not_close_the_legs_other_issue(
     record(script, tmp_path, lane="head", version="1.7.1", outcome="skipped")
     gh = Gh(STALE_OCTOBER)
 
-    report(script, tmp_path, gh, jobs={"head": "failure", "wheel": "success"})
+    report(script, tmp_path, gh, jobs={"head": "failure"})
 
     assert gh.of("close") == []
     assert created_titles(gh) == [
@@ -312,7 +311,7 @@ def test_a_cancelled_leg_files_nothing(script: Report, tmp_path: pathlib.Path) -
     record(script, tmp_path, lane="head", version="1.7.1", outcome="cancelled")
     gh = Gh({})
 
-    report(script, tmp_path, gh, jobs={"head": "cancelled", "wheel": "success"})
+    report(script, tmp_path, gh, jobs={"head": "cancelled"})
 
     assert gh.calls == []
 
@@ -324,7 +323,7 @@ def test_a_lane_that_failed_without_recording_a_failure_still_files(
     """A leg whose record or upload step itself broke must not read as green."""
     record(script, tmp_path, lane=lane, version="1.7.5", outcome="success", harness="1.7.5")
     gh = Gh({})
-    jobs = {**ALL_GREEN, lane: "failure"}
+    jobs = {lane: "failure"}
 
     report(script, tmp_path, gh, jobs=jobs)
 
@@ -420,7 +419,9 @@ def test_a_tampered_result_file_is_rejected_and_its_leg_left_alone(
 
     assert report(script, tmp_path, gh) == 1
 
-    assert gh.calls == []
+    # The refused leg closes nothing; if its lane is green, its gap is reported, nothing else.
+    assert gh.of("close") == []
+    assert all("without recording its result" in title for title in created_titles(gh))
     assert "::error::" in capsys.readouterr().err
 
 
@@ -462,7 +463,9 @@ def test_a_leg_may_only_speak_for_itself(
 
     assert report(script, results, gh) == 1
 
-    assert gh.calls == []
+    # The refused leg closes nothing; if its lane is green, its gap is reported, nothing else.
+    assert gh.of("close") == []
+    assert all("without recording its result" in title for title in created_titles(gh))
     assert "::error::" in capsys.readouterr().err
 
 
@@ -494,7 +497,9 @@ def test_a_result_outside_its_legs_artifact_directory_is_refused(
 
     assert report(script, results, gh) == 1
 
-    assert gh.calls == []
+    # The refused leg closes nothing; if its lane is green, its gap is reported, nothing else.
+    assert gh.of("close") == []
+    assert all("without recording its result" in title for title in created_titles(gh))
     assert "::error::" in capsys.readouterr().err
 
 

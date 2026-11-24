@@ -57,7 +57,7 @@ def test_every_missing_leg_is_named_even_when_another_leg_recorded_a_failure(
         script,
         tmp_path,
         gh,
-        jobs={"head": "failure", "wheel": "success"},
+        jobs={"head": "failure"},
         versions=["1.6.30", "1.7.1", "1.7.5", "latest"],
     )
 
@@ -79,7 +79,7 @@ def test_a_missing_leg_comments_on_the_open_unrecorded_issue(
         script,
         tmp_path,
         gh,
-        jobs={"head": "success", "wheel": "failure"},
+        jobs={"wheel": "failure"},
         versions=["1.7.5", "1.7.6"],
     )
 
@@ -170,7 +170,7 @@ def test_a_cancelled_or_skipped_lane_with_missing_legs_stays_silent(
         script,
         tmp_path,
         gh,
-        jobs={"head": lane_result, "wheel": "success"},
+        jobs={"head": lane_result},
         versions=["1.7.1", "1.7.5"],
     )
 
@@ -274,7 +274,7 @@ def test_an_earlier_pass_covers_its_leg_but_closes_nothing_when_the_lane_failed(
         tmp_path,
         gh,
         attempt="2",
-        jobs={"head": "failure", "wheel": "success"},
+        jobs={"head": "failure"},
         versions=["1.7.1", "1.7.5"],
     )
 
@@ -296,7 +296,7 @@ def test_an_earlier_failure_is_stale_files_nothing_and_counts_as_missing(
         tmp_path,
         gh,
         attempt="2",
-        jobs={"head": "failure", "wheel": "success"},
+        jobs={"head": "failure"},
         versions=["1.7.1"],
     )
 
@@ -314,7 +314,7 @@ def test_a_current_attempt_result_is_used_as_before(script: Report, tmp_path: pa
     )  # fmt: skip
     gh = Gh(STALE_OCTOBER)
 
-    report(script, tmp_path, gh, attempt="2", jobs={"head": "failure", "wheel": "success"})
+    report(script, tmp_path, gh, attempt="2", jobs={"head": "failure"})
 
     assert numbers(gh.of("comment")) == ["95"]
 
