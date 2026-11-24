@@ -14,3 +14,27 @@ updates:
     groups:
       python:
         patterns: ["*"]
+  # The conformance harness's Node server. better-auth and auth are a deliberate conformance
+  # pin: they move together with COMPATIBILITY.md, both canary matrices and
+  # VERIFIED_BETTER_AUTH in src, which tests/test_verified_better_auth.py holds in sync, so a
+  # bot bump of them alone would fail that test. Everything else here is ordinary.
+  - package-ecosystem: npm
+    directory: /harness/auth-server
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "better-auth"
+      - dependency-name: "auth"
+    groups:
+      harness-npm:
+        patterns: ["*"]
+  # The harness images, pinned as tag@digest: node in the Dockerfile, Postgres and Redis in
+  # the compose file.
+  - package-ecosystem: docker
+    directory: /harness/auth-server
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker-compose
+    directory: /harness
+    schedule:
+      interval: weekly
