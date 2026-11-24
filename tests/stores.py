@@ -33,6 +33,7 @@ import aiosqlite
 import pytest
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from fastapi_better_auth import SqlAlchemySessionStore, SyncStoreAdapter
 
@@ -199,7 +200,10 @@ def build_schema(
 
 
 def async_engine(path: pathlib.Path) -> AsyncEngine:
-    return create_async_engine(f"sqlite+aiosqlite:///{path}")
+    # The pool is named rather than left to the dialect: SQLAlchemy 2.0.0 gives a file-backed
+    # aiosqlite engine a `NullPool`, later releases an `AsyncAdaptedQueuePool`, and a test that
+    # asks the pool what it has handed out needs the same answer on every supported version.
+    return create_async_engine(f"sqlite+aiosqlite:///{path}", poolclass=AsyncAdaptedQueuePool)
 
 
 def sync_engine(path: pathlib.Path) -> Engine:
