@@ -361,7 +361,31 @@ def test_the_e2e_defaults_follow_the_compose_defaults() -> None:
     conftest = E2E_CONFTEST.read_text(encoding="utf-8")
 
     for variable, default, _ in published_ports().values():
-        assert f'"{variable}", "{default}"' in conftest, variable
+        assert f'harness_port("{variable}", "{default}")' in conftest, variable
+
+
+@pytest.mark.parametrize("value", [None, "", "   "], ids=["unset", "empty", "blank"])
+def test_an_unset_or_empty_port_variable_falls_back_to_the_compose_default(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    """Compose's `${VAR:-default}` treats an empty variable as unset; the fixtures must too, or
+    an empty `HARNESS_AUTH_PORT=` builds `http://localhost:` and every e2e leg errors."""
+    from tests.e2e import conftest
+
+    for variable, default, _ in published_ports().values():
+        if value is None:
+            monkeypatch.delenv(variable, raising=False)
+        else:
+            monkeypatch.setenv(variable, value)
+        assert conftest.harness_port(variable, str(default)) == str(default)
+
+
+def test_a_set_port_variable_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.e2e import conftest
+
+    monkeypatch.setenv("HARNESS_POSTGRES_PORT", "25432")
+
+    assert conftest.harness_port("HARNESS_POSTGRES_PORT", "15432") == "25432"
 
 
 def test_each_leg_uploads_under_the_name_the_reporter_binds_it_to() -> None:
