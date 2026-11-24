@@ -136,8 +136,14 @@ async def test_an_overflow_inside_pyjwt_is_a_credential_refusal_whatever_its_ver
 async def test_an_integer_past_the_digit_limit_is_a_credential_refusal() -> None:
     """CPython refuses to parse an integer literal over `sys.get_int_max_str_digits()` digits
     (4300 by default) with a `ValueError`. The token still fits the size cap, so it is a real
-    probe of the parse, which runs with the limit in force as it does in production."""
-    limit = sys.get_int_max_str_digits()
+    probe of the parse, which runs with the limit in force as it does in production.
+
+    The limit, and the function that reads it, arrived in Python 3.10.7; an older 3.10 has
+    neither, so there is nothing to probe there."""
+    read_limit = getattr(sys, "get_int_max_str_digits", None)
+    if read_limit is None:
+        pytest.skip("this Python has no int/str digit limit (added in 3.10.7)")
+    limit: int = read_limit()
     assert limit, "the int/str digit limit is switched off; this probe would prove nothing"
     token = _signed("exp", "9" * (limit + 1))
     assert len(token) <= MAX_TOKEN_BYTES, "over the size cap, the parse is never reached"
