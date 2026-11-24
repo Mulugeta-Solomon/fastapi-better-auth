@@ -75,8 +75,9 @@ class StatusScript:
     """An upstream whose bare probe GET answers a scripted status sequence, then repeats the last.
 
     `200` in the script is the healthy answer, `200 null`; any other status comes back with
-    `BODY_SENTINEL` as its body. The advisory bearer GET answers per `bearer` (healthy by default)
-    and a cookie'd request - the real fetch - answers the session document. Each kind is counted
+    `BODY_SENTINEL` as its body. The advisory bearer GET answers per `bearer` (healthy by default),
+    with a `set-cookie` header when `bearer_sets_cookie` (the permissive posture's tell), and a
+    cookie'd request - the real fetch - answers the session document. Each kind is counted
     on its own, so a test can tell "no probe ran" from "no request was verified".
     """
 
@@ -86,6 +87,7 @@ class StatusScript:
         assert statuses, "a script with no statuses can only mislead"
         self._statuses = list(statuses)
         self.bearer = bearer
+        self.bearer_sets_cookie = False
         self._gate = gate
         self.bare = 0
         self.bearer_calls = 0
@@ -102,7 +104,7 @@ class StatusScript:
             return json_reply(document()).response()
         if "authorization" in headers:
             self.bearer_calls += 1
-            return _answer(self.bearer)
+            return _answer(self.bearer, set_cookie=self.bearer_sets_cookie)
         self.bare += 1
         status = self._statuses[min(self.bare - 1, len(self._statuses) - 1)]
         if self._gate is not None:
@@ -113,13 +115,18 @@ class StatusScript:
         raise AssertionError("get-session is a GET")  # pragma: no cover
 
 
-def _answer(status: int) -> TransportResponse:
+def _answer(status: int, *, set_cookie: bool = False) -> TransportResponse:
+    extra = {"set-cookie": f"{COOKIE_NAME}=CLEARED-SENTINEL; Max-Age=0"} if set_cookie else {}
     if status == HEALTHY:
         return TransportResponse(
-            status_code=200, headers={"content-type": "application/json"}, content=b"null"
+            status_code=200,
+            headers={"content-type": "application/json", **extra},
+            content=b"null",
         )
     return TransportResponse(
-        status_code=status, headers={"content-type": "text/plain"}, content=BODY_SENTINEL
+        status_code=status,
+        headers={"content-type": "text/plain", **extra},
+        content=BODY_SENTINEL,
     )
 
 
@@ -293,6 +300,80 @@ async def test_the_bearer_rung_under_the_gate_treats_a_transient_status_as_an_ou
     session = await run(v)
 
     assert session.user.id == "u1"
+
+
+@pytest.mark.parametrize("status", TRANSIENT)
+async def test_under_the_gate_a_set_cookie_outranks_a_transient_status(status: int) -> None:
+    """A `set-cookie` on the manufactured-bearer request is the evidence the gate exists to catch,
+    whatever status sits beside it: a `503` that also set a cookie still shows an upstream that
+    accepts unsigned bearer tokens. So it is the remembered `ConfigurationError` it always was -
+    not an outage to retry - and a later healthy, cookie-free answer cannot make the verifier
+    ready."""
+    clock = Clock()
+    transport = StatusScript(HEALTHY, bearer=status)
+    transport.bearer_sets_cookie = True
+    v = verifier(transport, clock=clock, refuse_unsigned_bearer=True)
+
+    with pytest.raises(ConfigurationError) as caught:
+        await run(v)
+    assert "requireSignature" in str(caught.value)
+    assert "CLEARED-SENTINEL" not in str(caught.value)
+    probes = transport.bare
+
+    transport.bearer = HEALTHY
+    transport.bearer_sets_cookie = False
+    clock.advance(PROBE_RETRY_INTERVAL * 10)
+    with pytest.raises(ConfigurationError):
+        await run(v)
+    with pytest.raises(ConfigurationError):
+        await v.prepare()
+
+    assert transport.bare == probes, "a remembered contract failure is never re-probed"
+    assert transport.fetches == 0, "nothing was verified"
+
+
+@pytest.mark.parametrize("status", TRANSIENT)
+async def test_under_the_gate_a_transient_status_without_set_cookie_recovers(status: int) -> None:
+    clock = Clock()
+    transport = StatusScript(HEALTHY, bearer=status)
+    v = verifier(transport, clock=clock, refuse_unsigned_bearer=True)
+
+    with pytest.raises(AuthServiceUnavailable):
+        await run(v)
+    transport.bearer = HEALTHY
+    clock.advance(PROBE_RETRY_INTERVAL)
+    session = await run(v)
+
+    assert session.user.id == "u1"
+
+
+@pytest.mark.parametrize("status", TRANSIENT)
+async def test_the_advisory_rung_warns_on_a_set_cookie_whatever_the_status(
+    status: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Off, nothing changes: a transient bearer answer that sets a cookie warns once and serves,
+    exactly as before the transient ruling."""
+    transport = StatusScript(HEALTHY, bearer=status)
+    transport.bearer_sets_cookie = True
+
+    with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
+        session = await run(verifier(transport))
+
+    assert session.user.id == "u1"
+    assert [r for r in caplog.records if "requireSignature" in r.getMessage()]
+
+
+@pytest.mark.parametrize("status", TRANSIENT)
+async def test_the_advisory_rung_ignores_a_transient_status_without_set_cookie(
+    status: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    transport = StatusScript(HEALTHY, bearer=status)
+
+    with caplog.at_level(logging.WARNING, logger="fastapi_better_auth"):
+        session = await run(verifier(transport))
+
+    assert session.user.id == "u1"
+    assert not caplog.records, "the advisory rung neither warns nor reports an outage"
 
 
 async def test_the_advisory_bearer_rung_still_ignores_a_transient_status() -> None:
