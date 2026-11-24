@@ -12,7 +12,7 @@ from starlette.requests import HTTPConnection
 
 from .errors import ConfigurationError, InvalidCredential, SessionExpired
 from .httpx_transports import default_transport, usable_default
-from .jwks import CACHE_TTL, SUPPORTED_ALGORITHMS, Jwk, JwksClient
+from .jwks import CACHE_TTL, MAX_STALE, SUPPORTED_ALGORITHMS, Jwk, JwksClient
 from .models import Session, User
 from .parsing import parse_user
 from .reasons import fingerprint, safe_label
@@ -123,11 +123,19 @@ class JwtVerifier:
         max_token_lifetime: The largest `exp - iat` a token may declare, in seconds.
             Defaults to 900 plus `leeway`, which is upstream's own token lifetime.
         cache_ttl: How long a fetched key set stays fresh, in seconds; at least 60.
+        max_stale: How long past its last successful fetch a key set is still honoured while
+            refetching it fails, in seconds; 86400 (a day) by default, and never below
+            `cache_ttl`. Past it the key set is not honoured - a key upstream withdrew during
+            the outage would otherwise keep verifying - and every token is answered
+            `AuthServiceUnavailable` until a refetch succeeds. There is no way to switch the
+            bound off; pass a longer explicit duration if a day does not cover your outages.
 
     Raises:
         ConfigurationError: For any unusable configuration, at construction: a `base_url`
             that is not an origin, an algorithm this library will not verify, a leeway or
-            lifetime outside its bounds, a transport that is not one, or a missing `httpx`.
+            lifetime outside its bounds, a `cache_ttl` below its floor, a `max_stale` that is
+            not a finite number of seconds at least `cache_ttl`, a transport that is not one,
+            or a missing `httpx`.
     """
 
     def __init__(
@@ -139,6 +147,7 @@ class JwtVerifier:
         leeway: float = 0.0,
         max_token_lifetime: float | None = None,
         cache_ttl: float = CACHE_TTL,
+        max_stale: float = MAX_STALE,
     ) -> None:
         self.credential_source = CREDENTIAL_SOURCE
         self._origin = normalize_base_url(base_url)
@@ -155,6 +164,7 @@ class JwtVerifier:
             transport=self._transport,
             algorithms=self._algorithms,
             cache_ttl=cache_ttl,
+            max_stale=max_stale,
         )
 
     @property

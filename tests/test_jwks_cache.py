@@ -3,9 +3,11 @@
 The wire and key-loading rules live in `test_jwks_client.py`; this file is the other half — the
 freshness cache, the single-flight lock (proven on both backends, including a leader cancelled
 mid-fetch), the bounded negative cache for unknown kids, the refetch window, and the one bargain
-staleness buys: a key we hold verifies what it signed, while a kid we cannot confirm is unavailable
-rather than unknown. The transport is a double (see `tests/transports.py`) because what is under
-test is the policy, not the socket.
+staleness buys: a key we hold verifies what it signed for at most `max_stale` past the last
+successful fetch, while a kid we cannot confirm is unavailable rather than unknown. The transport
+is a double (see `tests/transports.py`) because what is under test is the policy, not the socket.
+The bound itself, and who waits for a stale set's refresh, are driven through `JwtVerifier` in
+`test_jwt_key_set_staleness.py`.
 """
 
 from __future__ import annotations
@@ -376,7 +378,12 @@ async def test_what_the_client_remembers_about_unknown_kids_is_bounded() -> None
 
 @pytest.mark.anyio
 async def test_a_stale_key_set_still_verifies_the_kids_it_carries() -> None:
-    """Upstream being unreachable must not log out every user holding a valid token."""
+    """Upstream being unreachable must not log out every user holding a valid token - for a
+    bounded time. The rule now: a stale set verifies the kids it carries for at most
+    `max_stale` (a day by default) past its last successful fetch, and past that it is not
+    honoured at all. This replaces the earlier unbounded rule, under which a stale set was
+    honoured for as long as refetches kept failing, by the maintainers' decision of 2026-11-24;
+    the bound's edges are pinned in `test_jwt_key_set_staleness.py`."""
     clock = Clock()
     keys, transport = client(json_reply(KEY_SET), TimeoutError("upstream down"), clock=clock)
 

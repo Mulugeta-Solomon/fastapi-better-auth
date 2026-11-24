@@ -9,10 +9,14 @@ only the key set ages.
 
 from __future__ import annotations
 
+import inspect
+from typing import Any
+
 import pytest
 
-from fastapi_better_auth import AuthServiceUnavailable, User
-from fastapi_better_auth._internal.jwks import CACHE_TTL, REFETCH_INTERVAL
+from fastapi_better_auth import AuthServiceUnavailable, ConfigurationError, User
+from fastapi_better_auth._internal.jwks import CACHE_TTL, MAX_STALE, REFETCH_INTERVAL
+from fastapi_better_auth._internal.jwt_verifier import JwtVerifier
 from tests.jwks_fixtures import wind_jwks_clock
 from tests.jwt_fixtures import KEY_SET, SIGNER, build
 from tests.tokens import claims
@@ -158,3 +162,83 @@ async def test_a_key_set_past_the_bound_recovers_on_the_next_successful_refresh(
 
     assert (await verifier.verify(token, User)).user.id == claims()["sub"]
     assert transport.calls == 3
+
+
+@pytest.mark.anyio
+async def test_an_explicit_max_stale_is_the_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bound is configurable next to `cache_ttl`, both shorter and longer than a day."""
+    clock = wind_jwks_clock(monkeypatch)
+    short, _ = build(json_reply(KEY_SET), DOWN, max_stale=3600)
+    long, _ = build(json_reply(KEY_SET), DOWN, max_stale=3 * DAY)
+    token = SIGNER.sign(claims())
+
+    await short.verify(token, User)
+    await long.verify(token, User)
+    clock.advance(3601)
+
+    with pytest.raises(AuthServiceUnavailable):
+        await short.verify(token, User)
+    clock.advance(2 * DAY)
+    assert (await long.verify(token, User)).user.id == claims()["sub"]
+
+
+def test_max_stale_defaults_to_a_day() -> None:
+    assert inspect.signature(JwtVerifier).parameters["max_stale"].default == DAY
+    assert MAX_STALE == DAY
+
+
+@pytest.mark.parametrize(
+    ("cache_ttl", "max_stale"),
+    [(300, 300), (300, 301), (60, 60.0), (3600, DAY)],
+    ids=["equal", "just-above", "float", "an-hour-ttl"],
+)
+def test_a_max_stale_no_shorter_than_the_cache_ttl_is_accepted(
+    cache_ttl: float, max_stale: float
+) -> None:
+    build(cache_ttl=cache_ttl, max_stale=max_stale)
+
+
+@pytest.mark.parametrize(
+    ("cache_ttl", "max_stale"),
+    [
+        (300, 299),
+        (300, 0),
+        (300, -1),
+        (2 * DAY, None),
+        (300, None),
+        (300, float("inf")),
+        (300, float("nan")),
+        (300, "86400"),
+        (300, True),
+    ],
+    ids=[
+        "below-the-ttl",
+        "zero",
+        "negative",
+        "a-ttl-over-the-default-bound",
+        "none-is-not-unbounded",
+        "inf",
+        "nan",
+        "a-string",
+        "a-bool",
+    ],
+)
+def test_a_max_stale_that_is_not_a_finite_bound_at_least_the_ttl_is_refused(
+    cache_ttl: float, max_stale: Any
+) -> None:
+    """There is no way to switch the bound off - not `None`, not infinity - and a bound below
+    the TTL contradicts it. A `cache_ttl` above the one-day default needs an explicit bound."""
+    with pytest.raises(ConfigurationError) as caught:
+        build(cache_ttl=cache_ttl, max_stale=max_stale)
+
+    assert "max_stale" in str(caught.value)
+
+
+def test_the_default_bound_refuses_a_cache_ttl_longer_than_a_day() -> None:
+    """The upgrade edge, stated: a deployment that set `cache_ttl` above a day and nothing else
+    no longer starts, and the message says which option to set."""
+    with pytest.raises(ConfigurationError) as caught:
+        build(cache_ttl=2 * DAY)
+
+    assert "max_stale" in str(caught.value)
+    assert "cache_ttl" in str(caught.value)

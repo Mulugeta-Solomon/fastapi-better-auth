@@ -24,6 +24,7 @@ MAX_JWKS_BYTES = 64 * 1024
 MAX_KEYS = 32
 CACHE_TTL = 300.0
 MIN_CACHE_TTL = 60.0
+MAX_STALE = 86400.0
 MIN_RSA_KEY_BITS = 2048
 NEGATIVE_TTL = 60.0
 REFETCH_INTERVAL = 10.0
@@ -81,10 +82,13 @@ class JwksClient:
     did not contain is remembered so it cannot cost a second one, and no more than one fetch
     happens per refetch window however many new `kid`s arrive.
 
-    Availability is bought exactly once: when a refetch fails, keys already fetched keep
-    verifying tokens they signed. It buys nothing else - a `kid` that is not in the key set on
-    hand is never accepted, and when the set is stale the honest answer is that it cannot be
-    confirmed rather than that it is unknown.
+    Availability is bought exactly once, and for a bounded time: when a refetch fails, keys
+    already fetched keep verifying tokens they signed for at most `max_stale` seconds past the
+    last successful fetch. Past that, the set on hand may carry a key upstream has since
+    withdrawn - after a compromise, say - so it is no longer honoured and every lookup is
+    unavailable until a refetch succeeds. It buys nothing else - a `kid` that is not in the
+    key set on hand is never accepted, and when the set is stale the honest answer is that it
+    cannot be confirmed rather than that it is unknown.
 
     Internal. Nothing here is public API; `JwtVerifier` owns the one instance there is.
 
@@ -95,6 +99,9 @@ class JwksClient:
         algorithms: The verifier's allowlist. A published key outside it is ignored rather
             than refused, because upstream may rotate through an algorithm we do not accept.
         cache_ttl: Seconds a fetched key set stays fresh. At least `MIN_CACHE_TTL`.
+        max_stale: Seconds past its last successful fetch a key set is still honoured while
+            refetches fail; at exactly that age it still is, a moment later it is not. At
+            least `cache_ttl`, finite, and never `None`: there is no way to switch the bound off.
         negative_ttl: Seconds an unknown `kid` is remembered for.
         refetch_interval: The floor between two upstream fetches.
         max_bytes: The body cap handed to the transport.
@@ -103,7 +110,8 @@ class JwksClient:
             waiting for it. `None`, the default, reads `monotonic_clock`.
 
     Raises:
-        ConfigurationError: If the transport is not one, or `cache_ttl` is below the floor.
+        ConfigurationError: If the transport is not one, `cache_ttl` is below the floor, or
+            `max_stale` is not a finite number of seconds at least `cache_ttl`.
     """
 
     def __init__(
@@ -113,6 +121,7 @@ class JwksClient:
         transport: Transport,
         algorithms: Sequence[str],
         cache_ttl: float = CACHE_TTL,
+        max_stale: float = MAX_STALE,
         negative_ttl: float = NEGATIVE_TTL,
         refetch_interval: float = REFETCH_INTERVAL,
         max_bytes: int = MAX_JWKS_BYTES,
@@ -123,6 +132,7 @@ class JwksClient:
         self._transport = _validated_transport(transport)
         self._algorithms = tuple(algorithms)
         self._cache_ttl = _validated_ttl(cache_ttl)
+        self._max_stale = _validated_max_stale(max_stale, self._cache_ttl)
         self._negative_ttl = float(negative_ttl)
         self._refetch_interval = float(refetch_interval)
         self._max_bytes = max_bytes
@@ -169,7 +179,7 @@ class JwksClient:
             # inside the window the negative cache still short-circuits, so a flood is bounded.
             if self._may_fetch():
                 await self._refresh()
-            elif self._is_remembered(kid):
+            elif self._honoured() is not None and self._is_remembered(kid):
                 return None
             return self._answer(kid)
 
@@ -185,6 +195,18 @@ class JwksClient:
     def _is_fresh(self) -> bool:
         return self._fetched_at is not None and self._now() - self._fetched_at < self._cache_ttl
 
+    def _honoured(self) -> Mapping[str, Jwk] | None:
+        """The key set on hand, while it is young enough to answer from; `None` once it is not.
+
+        Every read that answers a lookup goes through here, so no path can serve a set past
+        `max_stale`. The age is measured on the monotonic clock from the last *successful*
+        fetch: a failed refetch confirms nothing about which keys upstream still publishes.
+        """
+        keys, fetched_at = self._keys, self._fetched_at
+        if keys is None or fetched_at is None or self._now() - fetched_at > self._max_stale:
+            return None
+        return keys
+
     def _may_fetch(self) -> bool:
         """One fetch per window, whoever asks. A generated `kid` is not a fetch trigger."""
         if self._attempted_at is None:
@@ -192,7 +214,7 @@ class JwksClient:
         return self._now() - self._attempted_at >= self._refetch_interval
 
     async def _refresh(self) -> None:
-        """Attempt a fetch. A failure with keys already on hand is survivable; the first is not."""
+        """Attempt a fetch. A failure is survivable while the set on hand is honoured, not after."""
         # A cancelled attempt produced no answer, so it must not spend the window a bystander is
         # gated behind; a COMPLETED refusal keeps the stamp so a failing upstream stays rate-
         # limited (D-084/D-196). Only the cancellation exception rolls back - never a refusal.
@@ -202,7 +224,7 @@ class JwksClient:
         try:
             keys = await self._fetched()
         except AuthServiceUnavailable:
-            if self._keys is None:
+            if self._honoured() is None:
                 raise
             logger.warning("jwks refresh failed for %s; serving the key set on hand", self._uri)
             return
@@ -214,13 +236,18 @@ class JwksClient:
         self._missing.clear()
 
     def _answer(self, kid: str) -> Jwk | None:
-        keys = self._keys
+        keys = self._honoured()
         found = None if keys is None else keys.get(kid)
         if found is not None:
             return found
         if keys is not None and self._is_fresh():
             self._remember(kid)
             return None
+        if keys is None and self._keys is not None:
+            raise AuthServiceUnavailable(
+                reason=f"the key set for {self._uri} is past max_stale={self._max_stale:g}s"
+                f" since its last successful fetch; kid={safe_label(kid)} unconfirmed"
+            )
         raise AuthServiceUnavailable(
             reason=f"no fresh key set for {self._uri}; kid={safe_label(kid)} unconfirmed"
         )
@@ -398,3 +425,22 @@ def _validated_ttl(cache_ttl: object) -> float:
             " cache's name, and upstream's rate limit is then part of your auth path."
         )
     return float(cache_ttl)
+
+
+def _validated_max_stale(max_stale: object, cache_ttl: float) -> float:
+    """A finite bound no shorter than the cache TTL. There is deliberately no "off" value."""
+    if isinstance(max_stale, bool) or not isinstance(max_stale, (int, float)):
+        raise ConfigurationError(
+            f"max_stale must be a number of seconds; got {type(max_stale).__name__}. There is no"
+            " way to switch the bound off: a key set honoured forever keeps a key upstream"
+            " withdrew verifying tokens for as long as the key set cannot be refetched. Pass a"
+            " long explicit duration if a day is too short for your outages."
+        )
+    if not math.isfinite(max_stale) or max_stale < cache_ttl:
+        raise ConfigurationError(
+            f"max_stale must be a finite number of seconds no shorter than cache_ttl"
+            f" ({cache_ttl:g}); got {max_stale!r}. It bounds how long a key set is honoured past"
+            " its last successful fetch, and a set is honoured for cache_ttl without a refetch"
+            " at all, so a shorter bound would refuse fresh keys."
+        )
+    return float(max_stale)
