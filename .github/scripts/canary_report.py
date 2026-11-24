@@ -19,6 +19,7 @@ with an argument list. Standard library only: the report job never installs the 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import re
@@ -30,6 +31,7 @@ from pathlib import Path
 from typing import NoReturn
 
 GhRunner = Callable[[Sequence[str]], tuple[int, str]]
+Clock = Callable[[], dt.datetime]
 
 LABEL = "canary"
 LABEL_COLOR = "D93F0B"
@@ -54,6 +56,10 @@ DIST_TAGS = frozenset({"latest"})
 VERSION = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.]{1,32})?")
 WHEEL_VERSION = re.compile(r"[0-9][0-9A-Za-z.+!-]{0,63}")
 ATTEMPT = re.compile(r"[1-9][0-9]{0,5}")
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+CLOCK_SKEW = dt.timedelta(seconds=60)
+"""How far a leg's clock may run ahead of the report job's before its result is refused."""
 RUN_URL = re.compile(r"https://[A-Za-z0-9.-]+/[\w.-]+/[\w.-]+/actions/runs/\d+(?:/attempts/\d+)?")
 WATCH_TITLE = "canary: upstream release watch cannot read the npm registry"
 RESOLVED = r"(?: \([^()]*\))?"
@@ -66,6 +72,21 @@ def fail(message: str) -> NoReturn:
 
 class Rejected(ValueError):
     """A value that must not reach an issue; `record` exits on it, `report` skips the file."""
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def parse_timestamp(value: str) -> dt.datetime:
+    """`YYYY-MM-DDTHH:MM:SSZ` and nothing else: UTC, whole seconds, a real calendar date."""
+    if not TIMESTAMP.fullmatch(value):
+        raise Rejected(f"implausible timestamp {value!r}")
+    try:
+        parsed = dt.datetime.strptime(value, TIMESTAMP_FORMAT)
+    except ValueError as exc:
+        raise Rejected(f"implausible timestamp {value!r}") from exc
+    return parsed.replace(tzinfo=dt.timezone.utc)
 
 
 def report_line(line: str) -> None:
@@ -85,6 +106,7 @@ class LegResult:
     wheel_version: str
     outcome: str
     attempt: str
+    recorded_at: str
 
     def __post_init__(self) -> None:
         # Everything here ends up in an issue title, a comment, or the step summary.
@@ -100,6 +122,11 @@ class LegResult:
             raise Rejected(f"unknown verdict {self.outcome!r}")
         if not ATTEMPT.fullmatch(self.attempt):
             raise Rejected(f"implausible run attempt {self.attempt!r}")
+        parse_timestamp(self.recorded_at)
+
+    @property
+    def recorded(self) -> dt.datetime:
+        return parse_timestamp(self.recorded_at)
 
     @property
     def leg(self) -> tuple[str, str]:
@@ -121,6 +148,7 @@ class LegResult:
 class OpenIssue:
     number: int
     title: str
+    created: dt.datetime
 
 
 @dataclass(frozen=True)
@@ -195,12 +223,18 @@ def file_or_comment(issue: Create, open_issues: Sequence[OpenIssue], run_url: st
 
 
 def close_matching(
-    pattern: re.Pattern[str], open_issues: Sequence[OpenIssue], comment: str
+    pattern: re.Pattern[str],
+    open_issues: Sequence[OpenIssue],
+    comment: str,
+    *,
+    before: dt.datetime | None = None,
 ) -> list[Action]:
+    """Close every open issue the pattern owns - when `before` is given, only those filed
+    strictly before it, so a pass never closes what another run filed after the pass."""
     return [
         Close(candidate.number, comment)
         for candidate in sorted(open_issues, key=lambda issue: issue.number)
-        if pattern.fullmatch(candidate.title)
+        if pattern.fullmatch(candidate.title) and (before is None or candidate.created < before)
     ]
 
 
@@ -266,7 +300,8 @@ def plan_leg(result: LegResult, context: Context) -> list[Action]:
         f"The {LANE_NAMES[result.lane]} leg against {result.target} passed in "
         f"{context.run_url} ({result.ran}); closing."
     )
-    return close_matching(owned_by(*result.leg), context.open_issues, comment)
+    pattern = owned_by(*result.leg)
+    return close_matching(pattern, context.open_issues, comment, before=result.recorded)
 
 
 def plan_coverage(lane: str, results: Sequence[LegResult], context: Context) -> list[Action]:
@@ -323,7 +358,7 @@ def run_gh(argv: Sequence[str]) -> tuple[int, str]:
 
 def list_open_issues(gh: GhRunner) -> list[OpenIssue]:
     argv = ["issue", "list", "--state", "open", "--label", LABEL, "--limit", ISSUE_LIMIT]
-    code, output = gh([*argv, "--json", "number,title"])
+    code, output = gh([*argv, "--json", "number,title,createdAt"])
     if code != 0:
         fail("cannot list the open canary issues; acting on nothing rather than guessing")
     try:
@@ -338,9 +373,13 @@ def list_open_issues(gh: GhRunner) -> list[OpenIssue]:
             fail("gh issue list returned a non-object entry")
         number: object = entry.get("number")  # pyright: ignore[reportUnknownMemberType]
         title: object = entry.get("title")  # pyright: ignore[reportUnknownMemberType]
-        if not isinstance(number, int) or not isinstance(title, str):
-            fail("gh issue list returned an entry without a number and a title")
-        issues.append(OpenIssue(number, title))
+        created: object = entry.get("createdAt")  # pyright: ignore[reportUnknownMemberType]
+        if not (isinstance(number, int) and isinstance(title, str) and isinstance(created, str)):
+            fail("gh issue list returned an entry without a number, a title and a createdAt")
+        try:
+            issues.append(OpenIssue(number, title, parse_timestamp(created)))
+        except Rejected as exc:
+            fail(f"gh issue list returned issue #{number} with {exc}")
     return issues
 
 
@@ -434,7 +473,7 @@ def read_result(path: Path) -> LegResult:
     return LegResult(**{key: str(value) for key, value in fields.items()})
 
 
-def record(args: argparse.Namespace) -> int:
+def record(args: argparse.Namespace, clock: Clock) -> int:
     step: str = args.conformance_outcome
     if step == "cancelled":
         print("the conformance step was cancelled; recording nothing")
@@ -449,6 +488,7 @@ def record(args: argparse.Namespace) -> int:
             wheel_version=args.wheel_version,
             outcome=STEP_VERDICTS[step],
             attempt=args.run_attempt,
+            recorded_at=clock().astimezone(dt.timezone.utc).strftime(TIMESTAMP_FORMAT),
         )
     except Rejected as exc:
         fail(str(exc))
@@ -477,7 +517,7 @@ def expected_versions(value: str) -> tuple[str, ...]:
     return tuple(versions)
 
 
-def admissible(loaded: Loaded, expected: Sequence[str], attempt: int) -> Loaded:
+def admissible(loaded: Loaded, expected: Sequence[str], attempt: int, now: dt.datetime) -> Loaded:
     """Drop, as rejected, results no expected leg of this run attempt could have written."""
     kept: list[LegResult] = []
     rejected = loaded.rejected
@@ -486,6 +526,8 @@ def admissible(loaded: Loaded, expected: Sequence[str], attempt: int) -> Loaded:
             why = "the matrix does not list that version"
         elif int(result.attempt) > attempt:
             why = f"it claims attempt {result.attempt}, after this report's attempt {attempt}"
+        elif result.recorded > now + CLOCK_SKEW:
+            why = f"it claims to be recorded at {result.recorded_at}, in the future"
         else:
             kept.append(result)
             continue
@@ -510,7 +552,7 @@ def job_result(value: str, what: str) -> str:
     return value
 
 
-def report(args: argparse.Namespace, gh: GhRunner) -> int:
+def report(args: argparse.Namespace, gh: GhRunner, clock: Clock) -> int:
     run_url: str = args.run_url
     if not RUN_URL.fullmatch(run_url):
         fail(f"implausible run URL {run_url!r}")
@@ -521,7 +563,7 @@ def report(args: argparse.Namespace, gh: GhRunner) -> int:
     }
     expected = expected_versions(args.expected_versions)
     attempt = run_attempt(args.run_attempt)
-    loaded = admissible(load_results(Path(args.results_dir)), expected, attempt)
+    loaded = admissible(load_results(Path(args.results_dir)), expected, attempt, clock())
     for result in loaded.results:
         report_line(f"{LANE_NAMES[result.lane]} leg against {result.target}: {result.outcome}")
     if (
@@ -570,11 +612,14 @@ def parse(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None, gh: GhRunner | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None, gh: GhRunner | None = None, clock: Clock | None = None
+) -> int:
     args = parse(argv)
+    now = utc_now if clock is None else clock
     if args.command == "record":
-        return record(args)
-    return report(args, run_gh if gh is None else gh)
+        return record(args, now)
+    return report(args, run_gh if gh is None else gh, now)
 
 
 if __name__ == "__main__":

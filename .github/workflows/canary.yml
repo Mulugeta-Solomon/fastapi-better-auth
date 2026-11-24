@@ -9,6 +9,15 @@ on:
     - cron: "37 18 * * *"
   workflow_dispatch:
 
+# One canary run at a time, so two reports never interleave: neither can file a title the
+# other is filing, nor close what the other just filed. A run in progress is never cancelled
+# (a cancelled run reports nothing). GitHub keeps one pending run per group, so a third run
+# queued behind a pending second replaces it; that is fine, since a cancelled run reports
+# nothing and the newer run sweeps the same matrix.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 # Read-only everywhere. The legs build images that `npm install` upstream Better Auth and run
 # pytest, so none of them holds a write token; only the `report` job at the end can write
 # issues, and it runs nothing but the reporter script.
