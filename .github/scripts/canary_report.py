@@ -23,7 +23,9 @@ issues with their last-update times, and then:
   many other legs recorded failures. A green lane closes that issue only when every expected leg
   is covered; a green lane with a gap keeps it open, names the gap and fails the job;
 - on a partial re-run, results from earlier attempts are weighed by attempt: an earlier pass
-  covers its leg and closes only when the lane is green, an earlier failure is stale.
+  covers its leg and closes only when the lane is green, an earlier failure is stale; a failed
+  lane warns (no issue) about every leg covered only by an earlier pass, which on a full re-run
+  may hide a leg that died before recording.
 
 The leg files were written by jobs that ran npm-installed upstream code and pytest, so they are
 untrusted. Every field is validated before it can reach an issue title, a file counts only for
@@ -353,6 +355,21 @@ def missing_legs(lane: str, results: Sequence[LegResult], context: Context) -> l
     return [version for version in context.expected if version not in covered]
 
 
+def carried_legs(lane: str, results: Sequence[LegResult], context: Context) -> list[str]:
+    """Expected versions this lane covers only with a pass from an earlier attempt.
+
+    On "Re-run all jobs" such a leg may have died before recording in this attempt; on "Re-run
+    failed jobs" it simply was not re-run. Nothing available tells the two apart, so this only
+    feeds a warning when the lane failed, never an issue.
+    """
+    carried = {
+        r.matrix_version
+        for r in results
+        if r.lane == lane and r.outcome == "passed" and not context.is_current(r)
+    }
+    return [version for version in context.expected if version in carried]
+
+
 def coverage_gaps(results: Sequence[LegResult], context: Context) -> dict[str, list[str]]:
     """Green lanes that still miss a leg: uploads tolerate a missing file, so `success` alone
     does not prove every leg spoke. Each one fails the report job, as a rejection does."""
@@ -664,7 +681,25 @@ def report(args: argparse.Namespace, gh: GhRunner, clock: Clock) -> int:
         named = ", ".join(missing)
         print(f"::error::the {lane} lane reported success but left no result for {named}",
               file=sys.stderr)  # fmt: skip
+    warn_carried(loaded.results, context)
     return 1 if failures or loaded.rejected or gaps else 0
+
+
+def warn_carried(results: Sequence[LegResult], context: Context) -> None:
+    """One warning per failed lane whose legs are covered only by an earlier attempt's pass, for
+    the person who started the re-run. It changes no issue and no exit code."""
+    for lane in LANES:
+        if context.job_results[lane] != "failure":
+            continue
+        carried = carried_legs(lane, results, context)
+        if not carried:
+            continue
+        named = ", ".join(f"better-auth@{version}" for version in carried)
+        print(
+            f"::warning::the {lane} lane failed and {named} has only an earlier attempt's pass; "
+            "if it was re-run in this attempt, it failed before recording",
+            file=sys.stderr,
+        )
 
 
 def parse(argv: Sequence[str] | None) -> argparse.Namespace:

@@ -195,7 +195,8 @@ jobs:
     # nothing has updated since it was recorded; a refused verdict, or a green lane missing an
     # expected leg, is an ::error:: that fails this job without blocking the others. Only main
     # files issues: a branch dispatch's failures are its dispatcher's to read. A cancelled run
-    # reports nothing.
+    # reports nothing. On a re-run, a failed lane warns (no issue) about legs covered only by
+    # an earlier attempt's pass.
     name: file or close canary issues
     needs: [upstream-check, conformance, published-wheel]
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
