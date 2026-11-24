@@ -62,7 +62,8 @@ CLOCK_SKEW = dt.timedelta(seconds=60)
 """How far a leg's clock may run ahead of the report job's before its result is refused."""
 RUN_URL = re.compile(r"https://[A-Za-z0-9.-]+/[\w.-]+/[\w.-]+/actions/runs/\d+(?:/attempts/\d+)?")
 WATCH_TITLE = "canary: upstream release watch cannot read the npm registry"
-RESOLVED = r"(?: \([^()]*\))?"
+RESOLVED = r"(?: \((?P<resolved>[^()]*)\))?"
+UNRESOLVED = "unresolved"
 
 
 def fail(message: str) -> NoReturn:
@@ -136,7 +137,7 @@ class LegResult:
     def target(self) -> str:
         target = f"better-auth@{self.matrix_version}"
         if self.matrix_version in DIST_TAGS:
-            target += f" ({self.harness_version or 'unresolved'})"
+            target += f" ({self.harness_version or UNRESOLVED})"
         return target
 
     @property
@@ -178,7 +179,7 @@ def owned_by(lane: str, matrix_version: str) -> re.Pattern[str]:
     if lane == "head":
         kinds = "conformance failure|HEAD conformance lane cannot run"
     else:
-        kinds = r"published wheel \S+ fails conformance|published-wheel lane cannot run"
+        kinds = r"published wheel (?P<wheel>\S+) fails conformance|published-wheel lane cannot run"
     return re.compile(f"canary: (?:{kinds}) against {target}")
 
 
@@ -223,18 +224,14 @@ def file_or_comment(issue: Create, open_issues: Sequence[OpenIssue], run_url: st
 
 
 def close_matching(
-    pattern: re.Pattern[str],
-    open_issues: Sequence[OpenIssue],
-    comment: str,
-    *,
-    before: dt.datetime | None = None,
+    pattern: re.Pattern[str], open_issues: Sequence[OpenIssue], comment: str
 ) -> list[Action]:
-    """Close every open issue the pattern owns - when `before` is given, only those filed
-    strictly before it, so a pass never closes what another run filed after the pass."""
+    """Close every open issue whose title the pattern matches (the watch and unrecorded ones;
+    a leg's pass closes through `plan_leg`, which also checks when each issue was filed)."""
     return [
         Close(candidate.number, comment)
         for candidate in sorted(open_issues, key=lambda issue: issue.number)
-        if pattern.fullmatch(candidate.title) and (before is None or candidate.created < before)
+        if pattern.fullmatch(candidate.title)
     ]
 
 
@@ -296,12 +293,40 @@ def plan_leg(result: LegResult, context: Context) -> list[Action]:
     elif result.outcome != "passed":
         issue = failure_issue(result, context.run_url)
         return [file_or_comment(issue, context.open_issues, context.run_url)]
-    comment = (
-        f"The {LANE_NAMES[result.lane]} leg against {result.target} passed in "
-        f"{context.run_url} ({result.ran}); closing."
-    )
     pattern = owned_by(*result.leg)
-    return close_matching(pattern, context.open_issues, comment, before=result.recorded)
+    return [
+        Close(issue.number, close_comment(result, match, context.run_url))
+        for issue in sorted(context.open_issues, key=lambda issue: issue.number)
+        if (match := pattern.fullmatch(issue.title)) and issue.created < result.recorded
+    ]
+
+
+def close_comment(result: LegResult, title: re.Match[str], run_url: str) -> str:
+    """Recovered when the leg retested what the title names; superseded when it did not.
+
+    The title names a Better Auth version only for `latest` (an `unresolved` one names none)
+    and a wheel version only on a wheel conformance failure. Either differing from what the leg
+    ran means the titled combination was not retested: it closes all the same, because only the
+    latest release is supported, but the comment says so instead of claiming a pass.
+    """
+    lane = LANE_NAMES[result.lane]
+    titled_auth = title.group("resolved") or ""
+    titled_wheel = title.groupdict().get("wheel") or ""
+    tested = f"better-auth {result.harness_version or '(unread)'}"
+    if result.lane == "wheel":
+        tested += f", wheel {result.wheel_version or 'unknown'}"
+    auth_differs = titled_auth not in {"", UNRESOLVED, result.harness_version}
+    wheel_differs = bool(titled_wheel) and titled_wheel != result.wheel_version
+    if not (auth_differs or wheel_differs):
+        return f"The {lane} leg against {result.target} passed in {run_url} ({tested}); closing."
+    titled = f"better-auth {titled_auth or result.matrix_version}"
+    if titled_wheel:
+        titled += f", wheel {titled_wheel}"
+    return (
+        f"Superseded, not recovered: the {lane} leg against better-auth@{result.matrix_version} "
+        f"passed in {run_url} running {tested}, but the combination this issue names "
+        f"({titled}) was not retested. Closing because only the latest release is supported."
+    )
 
 
 def plan_coverage(lane: str, results: Sequence[LegResult], context: Context) -> list[Action]:
