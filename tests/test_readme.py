@@ -407,6 +407,47 @@ def test_the_extractor_catches_a_snippet_that_stopped_working(tmp_path: pathlib.
         run(extracted[0])
 
 
+MODULE_LEVEL_GENERIC = """\
+import sys
+
+from fastapi_better_auth import Session, User
+
+
+class Member(User):
+    pass
+
+
+MemberSession = Session[Member]
+importable = sys.modules[__name__].__dict__ is globals()
+"""
+"""What a reader's module does at top level: parametrize a generic model, and be importable.
+
+Pydantic 2.14 registers a module-level `Session[Member]` in `sys.modules[__name__]`, so a
+snippet that runs in a namespace no module owns fails where the reader's file would not.
+"""
+
+
+def test_a_snippet_runs_as_an_importable_module_and_leaves_none_behind() -> None:
+    snippet = Snippet(document="RUNNER.md", line=1, code=MODULE_LEVEL_GENERIC)
+    before = set(sys.modules)
+
+    namespace = run(snippet)
+
+    assert namespace["importable"] is True
+    assert namespace["MemberSession"].__module__ == namespace["__name__"]
+    assert set(sys.modules) - before == set()
+
+
+def test_a_snippet_that_fails_leaves_no_module_behind() -> None:
+    snippet = Snippet(document="RUNNER.md", line=2, code="raise RuntimeError('fence')")
+    before = set(sys.modules)
+
+    with pytest.raises(RuntimeError, match="fence"):
+        run(snippet)
+
+    assert set(sys.modules) - before == set()
+
+
 @pytest.mark.parametrize("snippet", ALL_SNIPPETS, ids=[snippet.id for snippet in ALL_SNIPPETS])
 @pytest.mark.usefixtures("snippet_environment")
 def test_every_snippet_runs(
