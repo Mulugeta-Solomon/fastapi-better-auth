@@ -3,7 +3,8 @@
 A real, version-pinned Better Auth server (`better-auth@1.7.1` on Hono/Node) with Postgres and
 Redis. The e2e lane runs against it to prove the wire-format invariants this library depends on —
 compatibility is tested, never assumed. `auth-server/` is also the reference implementation of the
-"tiny Node sidecar" topology from the main README.
+"tiny Node sidecar" topology described in
+[Choosing a mode](../docs/choosing-a-mode.md#do-i-need-to-run-a-node-service).
 
 ## Run
 
@@ -21,7 +22,7 @@ that silently tested nothing is worse than a red one).
 the Better Auth CLI apply DDL at start-up is safe here and keeps the schema matched to the pinned
 version. In a real deployment the FastAPI side's migration tool owns every table and `auth migrate`
 must never run against that database — see [Who owns the database
-schema](../README.md#who-owns-the-database-schema) for the rule and the reason.
+schema](../docs/better-auth-server.md#who-owns-the-database-schema) for the rule and the reason.
 
 ## Services
 

@@ -102,8 +102,8 @@ at the version cited. A file cited at 1.7.5 with no 1.7.6 line beside it is byte
   columns are read changes: the dialect's own introspector reads the tables, or, if that throws,
   `PRAGMA table_info` reads each table Better Auth expects, and the findings are returned unfiltered
   like every other dialect's (`@better-auth/kysely-adapter@1.7.6` `dist/index.mjs:253`,
-  `dist/sqlite-introspector-DSCAP82F.mjs:53-60`). A deployment that owns its migrations (the
-  README's "Who owns the database schema") runs its drift check before the deploy, not after it.
+  `dist/sqlite-introspector-DSCAP82F.mjs:53-60`). A deployment that owns its migrations
+  ([Who owns the database schema](docs/better-auth-server.md#who-owns-the-database-schema)) runs its drift check before the deploy, not after it.
   From 1.7.6 upstream ships one: `auth check schema` exits 0 when the schema passes, 1 on a
   mismatch and 2 when it cannot validate (`auth@1.7.6` `dist/index.mjs:1308-1325`; the command at
   `:1331-1332`), and it works with runtime validation off, because the Kysely adapter registers its
@@ -116,8 +116,8 @@ at the version cited. A file cited at 1.7.5 with no 1.7.6 line beside it is byte
   `advanced.ipAddress.trustedProxies` (`@1.7.5` `:180-190`). A request with no usable address still
   keys on the shared `no-trusted-ip` bucket (`rate-limiter/index.mjs:233`, `:245`), and the warning
   about it fires once per process, on the first such request while the limiter is on, never at boot
-  (`:241-244`, `:290`). The README's
-  "The shared rate-limit bucket" holds at 1.7.5 and 1.7.6 as written: its `create-context.mjs` lines
+  (`:241-244`, `:290`).
+  [The shared rate-limit bucket](docs/mode-c-remote.md#the-shared-rate-limit-bucket) holds at 1.7.5 and 1.7.6 as written: its `create-context.mjs` lines
   sit where they do at 1.7.5 (`better-auth@1.7.6` `dist/context/create-context.mjs:172-174`).
 
 ## Python
@@ -146,6 +146,7 @@ lockfile and would never exercise a floor.
 | `pydantic` | `>=2.7` |
 | `pyjwt[crypto]` | `>=2.15.0` (a deeply nested token is a `DecodeError`; see SECURITY.md) |
 | `anyio` | `>=4.1` |
+| `exceptiongroup` (Python 3.10 only) | `>=1.2` |
 | `httpx` (extra `[httpx]`) | `>=0.27` |
 | `httpx2` (extra `[httpx2]`) | `>=2.0` |
 | `sqlalchemy[asyncio]` (extra `[sqlalchemy]`) | `>=2.0` |
