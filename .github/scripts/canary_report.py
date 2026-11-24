@@ -359,8 +359,9 @@ def carried_legs(lane: str, results: Sequence[LegResult], context: Context) -> l
     """Expected versions this lane covers only with a pass from an earlier attempt.
 
     On "Re-run all jobs" such a leg may have died before recording in this attempt; on "Re-run
-    failed jobs" it simply was not re-run. Nothing available tells the two apart, so this only
-    feeds a warning when the lane failed, never an issue.
+    failed jobs" it simply was not re-run. Only each job's start time tells the two apart, and
+    the reporter is not given that (it would need `actions: read` and a binding from job names
+    to legs), so this only feeds a warning when the lane failed, never an issue.
     """
     carried = {
         r.matrix_version
