@@ -38,6 +38,7 @@ Internal module, public class: `RemoteVerifier` is exported from the package roo
 from __future__ import annotations
 
 import hmac
+import re
 import time
 from collections.abc import Callable, Sequence
 from datetime import datetime
@@ -114,6 +115,10 @@ MAX_TOKEN_BYTES = 4096
 
 PROBE_RETRY_INTERVAL = 10.0
 
+COOKIE_OCTETS = re.compile(r"[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]+")
+"""RFC 6265 §4.1.1 `cookie-octet`, one or more: printable US-ASCII minus DQUOTE, `,`, `;` and `\\`.
+No CTL, no whitespace, nothing above 0x7E - so nothing that could split or extend a header."""
+
 
 class RemoteCredential:
     """What `extract` hands `verify`: the matched cookie pairs, and the CSRF snapshot.
@@ -160,7 +165,11 @@ class RemoteVerifier:
     **The outbound request is pinned at construction (D-010).** The URI is
     `{base_url}{base_path}/get-session?disableCookieCache=true&disableRefresh=true`, and the headers
     are exactly `cookie` (the one the browser sent, under its own name, value verbatim) and `accept:
-    application/json`. Nothing is ever taken from the incoming request - not the `Authorization`
+    application/json`. A value is forwarded only once it is all RFC 6265 cookie-octets, so no CR,
+    LF, comma, whitespace or non-ASCII byte a client chose can reach the outbound header; anything
+    else is refused like a malformed cookie with no upstream call. That is structure, not
+    authenticity: without a secret, a well-formed forged cookie is still forwarded.
+    Nothing is ever taken from the incoming request - not the `Authorization`
     header (forwarding it would let a client authenticate a bearer token this verifier never
     extracted), not `Origin`, `Host`, or any `X-Forwarded-*`.
 
@@ -670,10 +679,17 @@ class RemoteVerifier:
 def _rung_one(material: str) -> str:
     """The always-on structural rung: the loosest rule that still filters garbage, zero outbound.
 
-    Byte cap, strict `unquote`, a last-dot split into a non-empty token and a non-empty signature,
-    and a token byte cap. The 32-alnum token rule is deliberately dropped: `advanced.database`
-    makes token shape operator-defined. One frame holds every credential local, scrubbed in
-    `finally`; the returned token is the caller's to scrub.
+    Byte cap (cookie mode's `MAX_COOKIE_BYTES`), RFC 6265 cookie-octets, strict `unquote`, a
+    last-dot split into a non-empty token and a non-empty signature, and a token byte cap. The
+    32-alnum token rule is deliberately dropped: `advanced.database` makes token shape
+    operator-defined. One frame holds every credential local, scrubbed in `finally`; the returned
+    token is the caller's to scrub.
+
+    The octet rule reads `material` as it arrived - still percent-encoded, which is exactly the
+    form forwarded upstream - so it is a rule about what may enter the outbound `cookie:` header,
+    not a token shape: `%0D%0A` is six octets and travels inert, while a raw CR, LF, space, comma,
+    DQUOTE, backslash, control byte or non-ASCII character is refused before anything is sent.
+    Better Auth's own value is `encodeURIComponent` output, which is always octets.
     """
     marker = fingerprint(material)
     decoded = token = signature = ""
@@ -682,6 +698,10 @@ def _rung_one(material: str) -> str:
         if length > MAX_COOKIE_BYTES:
             raise InvalidCredential(
                 reason=f"cookie value is {length} bytes, over the cap [{marker}]"
+            )
+        if not COOKIE_OCTETS.fullmatch(material):
+            raise InvalidCredential(
+                reason=f"cookie value carries a byte outside the RFC 6265 cookie-octet set [{marker}]"
             )
         decoded = unquoted_strictly(material)
         if decoded is None:
