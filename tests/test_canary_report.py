@@ -23,6 +23,7 @@ treats them as untrusted: every field is validated before it can reach an issue 
 
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
 import json
 import pathlib
@@ -43,6 +44,8 @@ STALE_OCTOBER = {
     98: "canary: published-wheel lane cannot run against better-auth@1.7.1",
 }
 ALL_GREEN = {"head": "success", "wheel": "success"}
+OCTOBER = "2026-10-15T21:44:29Z"
+T0 = dt.datetime(2026, 11, 24, 12, 0, 0, tzinfo=dt.timezone.utc)
 LANE_NAMES = {"head": "HEAD conformance", "wheel": "published-wheel"}
 
 
@@ -51,21 +54,32 @@ class Report(Protocol):
         self,
         argv: Sequence[str] | None = None,
         gh: Callable[[Sequence[str]], tuple[int, str]] | None = None,
+        clock: Callable[[], dt.datetime] | None = None,
     ) -> int: ...
 
 
 class Gh:
     """Stands in for the `gh` CLI: serves one issue list and records every other call."""
 
-    def __init__(self, issues: Mapping[int, str], *, failing: str = "") -> None:
+    def __init__(
+        self,
+        issues: Mapping[int, str],
+        *,
+        failing: str = "",
+        created: Mapping[int, str] | None = None,
+    ) -> None:
         self.issues = dict(issues)
+        self.created = dict(created or {})
         self.failing = failing
         self.calls: list[list[str]] = []
 
     def __call__(self, argv: Sequence[str]) -> tuple[int, str]:
         call = list(argv)
         if call[:2] == ["issue", "list"]:
-            listed = [{"number": n, "title": t} for n, t in self.issues.items()]
+            listed = [
+                {"number": n, "title": t, "createdAt": self.created.get(n, OCTOBER)}
+                for n, t in self.issues.items()
+            ]
             return 0, json.dumps(listed)
         self.calls.append(call)
         if self.failing and call[:2] == ["issue", self.failing]:
@@ -104,6 +118,7 @@ def record(
     harness: str = "",
     wheel: str = "",
     attempt: str = "1",
+    now: dt.datetime | None = None,
 ) -> int:
     """One leg's `record` call, into its own subdirectory the way download-artifact lays it out."""
     out = results / f"canary-result-{lane}-{version}" / "canary-result.json"
@@ -124,7 +139,7 @@ def record(
         "--out",
         str(out),
     ]
-    return script.main(argv)
+    return script.main(argv, clock=None if now is None else (lambda: now))
 
 
 def report(
@@ -136,6 +151,7 @@ def report(
     jobs: Mapping[str, str] = ALL_GREEN,
     versions: Sequence[str] | None = None,
     attempt: str = "1",
+    now: dt.datetime | None = None,
 ) -> int:
     expected = recorded_versions(results) if versions is None else list(versions)
     argv = [
@@ -155,7 +171,7 @@ def report(
         "--run-attempt",
         attempt,
     ]
-    return script.main(argv, gh=gh)
+    return script.main(argv, gh=gh, clock=None if now is None else (lambda: now))
 
 
 def recorded_versions(results: pathlib.Path) -> list[str]:
@@ -701,6 +717,97 @@ def test_report_refuses_an_implausible_attempt(
     assert gh.calls == []
 
 
+# --- report: a pass closes only what was filed before it ------------------------------------
+
+
+def test_record_writes_when_it_recorded_in_utc(script: Report, tmp_path: pathlib.Path) -> None:
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", now=T0)
+
+    written = json.loads(next(tmp_path.rglob("canary-result.json")).read_text(encoding="utf-8"))
+    assert written["recorded_at"] == "2026-11-24T12:00:00Z"
+
+
+def test_a_pass_leaves_open_an_issue_filed_after_it_was_recorded(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    """Another run may file after this leg passed; this report must not close that issue."""
+    record(
+        script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1", now=T0
+    )
+    gh = Gh(
+        {
+            95: "canary: conformance failure against better-auth@1.7.1",
+            101: "canary: HEAD conformance lane cannot run against better-auth@1.7.1",
+            102: "canary: HEAD conformance lane cannot run against better-auth@1.7.1 ",
+        },
+        created={95: "2026-11-24T11:00:00Z", 101: "2026-11-24T12:05:00Z"},
+    )
+
+    report(script, tmp_path, gh, now=T0 + dt.timedelta(minutes=10))
+
+    assert numbers(gh.of("close")) == ["95"]
+
+
+def test_an_issue_filed_in_the_same_second_as_the_pass_stays_open(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    record(
+        script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1", now=T0
+    )
+    gh = Gh(
+        {95: "canary: conformance failure against better-auth@1.7.1"},
+        created={95: "2026-11-24T12:00:00Z"},
+    )
+
+    report(script, tmp_path, gh, now=T0 + dt.timedelta(minutes=10))
+
+    assert gh.of("close") == []
+
+
+@pytest.mark.parametrize(
+    ("ahead", "accepted"),
+    [(dt.timedelta(seconds=60), True), (dt.timedelta(seconds=61), False)],
+    ids=["within-skew", "future"],
+)
+def test_a_result_recorded_in_the_future_is_rejected_beyond_a_minute_of_skew(
+    script: Report,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    ahead: dt.timedelta,
+    accepted: bool,
+) -> None:
+    """Runner clocks are NTP-synced but not identical; a minute absorbs that, not more."""
+    record(
+        script,
+        tmp_path,
+        lane="head",
+        version="1.7.1",
+        outcome="success",
+        harness="1.7.1",
+        now=T0 + ahead,
+    )
+    gh = Gh(STALE_OCTOBER)
+
+    code = report(script, tmp_path, gh, now=T0)
+
+    assert code == (0 if accepted else 1)
+    assert numbers(gh.of("close")) == (["95"] if accepted else [])
+    assert ("::error::" in capsys.readouterr().err) is not accepted
+
+
+@pytest.mark.parametrize("created", ["", "yesterday", "2026-10-15T21:44:29"], ids=str)
+def test_an_issue_list_without_a_usable_creation_time_acts_on_nothing(
+    script: Report, tmp_path: pathlib.Path, created: str
+) -> None:
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
+    gh = Gh(STALE_OCTOBER, created={95: created})
+
+    with pytest.raises(SystemExit):
+        report(script, tmp_path, gh)
+
+    assert gh.calls == []
+
+
 # --- report: untrusted input and failed calls are loud --------------------------------------
 
 
@@ -711,6 +818,7 @@ VALID_DOCUMENT = {
     "wheel_version": "",
     "outcome": "passed",
     "attempt": "1",
+    "recorded_at": "2026-11-01T00:00:00Z",
 }
 
 
@@ -728,6 +836,11 @@ def without(key: str) -> dict[str, str]:
         {**VALID_DOCUMENT, "attempt": "1\n"},
         {**VALID_DOCUMENT, "attempt": 1},
         {**VALID_DOCUMENT, "extra": "x"},
+        without("recorded_at"),
+        {**VALID_DOCUMENT, "recorded_at": "2026-11-01 00:00:00"},
+        {**VALID_DOCUMENT, "recorded_at": "2026-11-01T00:00:00+00:00"},
+        {**VALID_DOCUMENT, "recorded_at": "2026-13-01T00:00:00Z"},
+        {**VALID_DOCUMENT, "recorded_at": "2026-11-01T00:00:00Z\n"},
         ["not", "an", "object"],
     ],
     ids=[
@@ -738,6 +851,11 @@ def without(key: str) -> dict[str, str]:
         "attempt-newline",
         "attempt-not-a-string",
         "extra-field",
+        "no-recorded-at",
+        "recorded-at-space",
+        "recorded-at-offset",
+        "recorded-at-month-13",
+        "recorded-at-newline",
         "not-an-object",
     ],
 )

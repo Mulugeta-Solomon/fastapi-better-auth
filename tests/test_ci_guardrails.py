@@ -315,6 +315,18 @@ def test_the_reporter_expects_exactly_the_matrix_both_lanes_sweep() -> None:
     assert '--expected-versions "$EXPECTED_VERSIONS"' in writer
 
 
+def test_one_canary_run_at_a_time_and_none_cancelled_mid_flight() -> None:
+    """Two runs reporting at once could both file one title, or one could close what the other
+    just filed. Queued, never cancelled in progress: a cancelled run would report nothing."""
+    head = CANARY.read_text(encoding="utf-8").split("\njobs:\n", 1)[0]
+
+    assert (
+        "\nconcurrency:\n"
+        "  group: ${{ github.workflow }}-${{ github.ref }}\n"
+        "  cancel-in-progress: false\n"
+    ) in head
+
+
 def test_every_record_and_the_report_name_their_run_attempt() -> None:
     """A partial re-run mixes attempts in one download; the reporter weighs them by attempt."""
     text = CANARY.read_text(encoding="utf-8")
