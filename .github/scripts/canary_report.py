@@ -53,6 +53,7 @@ JOB_RESULTS = frozenset({"success", "failure", "cancelled", "skipped"})
 DIST_TAGS = frozenset({"latest"})
 VERSION = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.]{1,32})?")
 WHEEL_VERSION = re.compile(r"[0-9][0-9A-Za-z.+!-]{0,63}")
+ATTEMPT = re.compile(r"[1-9][0-9]{0,5}")
 RUN_URL = re.compile(r"https://[A-Za-z0-9.-]+/[\w.-]+/[\w.-]+/actions/runs/\d+(?:/attempts/\d+)?")
 WATCH_TITLE = "canary: upstream release watch cannot read the npm registry"
 RESOLVED = r"(?: \([^()]*\))?"
@@ -83,6 +84,7 @@ class LegResult:
     harness_version: str
     wheel_version: str
     outcome: str
+    attempt: str
 
     def __post_init__(self) -> None:
         # Everything here ends up in an issue title, a comment, or the step summary.
@@ -96,6 +98,8 @@ class LegResult:
             raise Rejected(f"implausible wheel version {self.wheel_version!r}")
         if self.outcome not in VERDICTS:
             raise Rejected(f"unknown verdict {self.outcome!r}")
+        if not ATTEMPT.fullmatch(self.attempt):
+            raise Rejected(f"implausible run attempt {self.attempt!r}")
 
     @property
     def leg(self) -> tuple[str, str]:
@@ -209,6 +213,19 @@ class Context:
     upstream_watch: str
     job_results: Mapping[str, str]
     expected: tuple[str, ...]
+    attempt: int
+
+    def is_current(self, result: LegResult) -> bool:
+        return int(result.attempt) == self.attempt
+
+    def covers(self, result: LegResult) -> bool:
+        """A leg is covered by a current result, or by an earlier pass a re-run left in place.
+
+        "Re-run failed jobs" re-runs only failed legs, so a leg that passed keeps its earlier
+        attempt's artifact, and that pass is still the truth. An earlier failure is stale by
+        construction - a failed leg is always re-run - so it covers nothing.
+        """
+        return self.is_current(result) or result.outcome == "passed"
 
 
 def plan(results: Sequence[LegResult], context: Context) -> list[Action]:
@@ -237,7 +254,12 @@ def plan_watch(context: Context) -> list[Action]:
 
 
 def plan_leg(result: LegResult, context: Context) -> list[Action]:
-    if result.outcome != "passed":
+    if not context.is_current(result):
+        # An earlier pass may close only when the lane is green: then every leg's latest
+        # attempt passed. An earlier failure files and comments nothing by itself.
+        if result.outcome != "passed" or context.job_results[result.lane] != "success":
+            return []
+    elif result.outcome != "passed":
         issue = failure_issue(result, context.run_url)
         return [file_or_comment(issue, context.open_issues, context.run_url)]
     comment = (
@@ -259,7 +281,7 @@ def plan_coverage(lane: str, results: Sequence[LegResult], context: Context) -> 
         return close_matching(re.compile(re.escape(title)), context.open_issues, comment)
     if context.job_results[lane] != "failure":
         return []
-    covered = {r.matrix_version for r in results if r.lane == lane}
+    covered = {r.matrix_version for r in results if r.lane == lane and context.covers(r)}
     missing = [version for version in context.expected if version not in covered]
     if missing:
         named = ", ".join(f"better-auth@{version}" for version in missing)
@@ -268,7 +290,9 @@ def plan_coverage(lane: str, results: Sequence[LegResult], context: Context) -> 
             "when it failed before recording, its result was rejected by the reporter, or it "
             f"only has a stale result from an earlier attempt; read the run. Run: {context.run_url}"
         )
-    elif not any(r.lane == lane and r.outcome != "passed" for r in results):
+    elif not any(
+        r.lane == lane and r.outcome != "passed" and context.is_current(r) for r in results
+    ):
         body = (
             f"The {LANE_NAMES[lane]} lane failed, yet every leg recorded a pass, so the reporter "
             f"cannot say which leg failed or why; read the run. Run: {context.run_url}"
@@ -424,6 +448,7 @@ def record(args: argparse.Namespace) -> int:
             harness_version=args.harness_version,
             wheel_version=args.wheel_version,
             outcome=STEP_VERDICTS[step],
+            attempt=args.run_attempt,
         )
     except Rejected as exc:
         fail(str(exc))
@@ -452,21 +477,31 @@ def expected_versions(value: str) -> tuple[str, ...]:
     return tuple(versions)
 
 
-def expected_only(loaded: Loaded, expected: Sequence[str]) -> Loaded:
-    """A result for a leg the matrix does not list cannot be tied to any expected leg."""
+def admissible(loaded: Loaded, expected: Sequence[str], attempt: int) -> Loaded:
+    """Drop, as rejected, results no expected leg of this run attempt could have written."""
     kept: list[LegResult] = []
     rejected = loaded.rejected
     for result in loaded.results:
-        if result.matrix_version in expected:
+        if result.matrix_version not in expected:
+            why = "the matrix does not list that version"
+        elif int(result.attempt) > attempt:
+            why = f"it claims attempt {result.attempt}, after this report's attempt {attempt}"
+        else:
             kept.append(result)
             continue
         rejected += 1
         print(
             f"::error::rejected the {result.lane} result for better-auth@"
-            f"{result.matrix_version}: the matrix does not list that version",
+            f"{result.matrix_version}: {why}",
             file=sys.stderr,
         )
     return Loaded(tuple(kept), rejected)
+
+
+def run_attempt(value: str) -> int:
+    if not ATTEMPT.fullmatch(value):
+        fail(f"--run-attempt is not a positive integer: {value!r}")
+    return int(value)
 
 
 def job_result(value: str, what: str) -> str:
@@ -485,7 +520,8 @@ def report(args: argparse.Namespace, gh: GhRunner) -> int:
         "wheel": job_result(args.wheel_job, "--wheel-job"),
     }
     expected = expected_versions(args.expected_versions)
-    loaded = expected_only(load_results(Path(args.results_dir)), expected)
+    attempt = run_attempt(args.run_attempt)
+    loaded = admissible(load_results(Path(args.results_dir)), expected, attempt)
     for result in loaded.results:
         report_line(f"{LANE_NAMES[result.lane]} leg against {result.target}: {result.outcome}")
     if (
@@ -502,6 +538,7 @@ def report(args: argparse.Namespace, gh: GhRunner) -> int:
         upstream_watch=upstream_watch,
         job_results=job_results,
         expected=expected,
+        attempt=attempt,
     )
     actions = plan(loaded.results, context)
     failures = execute(actions, gh)
@@ -518,6 +555,7 @@ def parse(argv: Sequence[str] | None) -> argparse.Namespace:
     leg.add_argument("--harness-version", default="")
     leg.add_argument("--wheel-version", default="")
     leg.add_argument("--conformance-outcome", required=True, help="steps.<id>.outcome")
+    leg.add_argument("--run-attempt", required=True, help="GITHUB_RUN_ATTEMPT")
     leg.add_argument("--out", required=True)
     summary = commands.add_parser("report", help="file, comment on, or close issues")
     summary.add_argument("--results-dir", required=True)
@@ -528,6 +566,7 @@ def parse(argv: Sequence[str] | None) -> argparse.Namespace:
     summary.add_argument(
         "--expected-versions", required=True, help="the matrix both lanes sweep, as a JSON list"
     )
+    summary.add_argument("--run-attempt", required=True, help="GITHUB_RUN_ATTEMPT")
     return parser.parse_args(argv)
 
 
