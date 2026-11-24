@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 from sqlalchemy import BIGINT, INTEGER, SMALLINT, Connection, Integer
 from sqlalchemy.dialects import mysql
+from sqlalchemy.dialects.postgresql import asyncpg
 from sqlalchemy.types import TypeEngine
 
 from fastapi_better_auth._internal.stores import sqlalchemy_core
@@ -84,6 +85,19 @@ class TestWidths:
 
         assert bound_user_id(built, str(low - 1)) is None
         assert bound_user_id(built, str(high + 1)) is None
+
+
+@pytest.mark.parametrize(
+    ("column_type", "cast"),
+    [(SMALLINT(), "SMALLINT"), (INTEGER(), "INTEGER"), (BIGINT(), "BIGINT")],
+)
+def test_the_width_changes_no_statement(column_type: TypeEngine[Any], cast: str) -> None:
+    """Compiled, not executed: the range gates the bind, the bind still casts to the column's type."""
+    with_dialect = plan(column_type, "postgresql").user_statement.compile(dialect=asyncpg.dialect())
+    without = plan(column_type, "").user_statement.compile(dialect=asyncpg.dialect())
+
+    assert str(with_dialect) == str(without)
+    assert f'"user".id = $1::{cast}' in str(with_dialect)
 
 
 # --- through the real store, on SQLite --------------------------------------------------------

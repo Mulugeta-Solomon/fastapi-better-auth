@@ -40,10 +40,16 @@ class IdKind(Enum):
 
 INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
-"""The widest integer id column any supported database has (a Postgres `bigint`, a SQLite integer).
+"""The ceiling on every integer id bind, whatever the column (a Postgres `bigint`, a SQLite integer).
 
-A value outside it names no row anywhere, and binding one is not a harmless miss: `sqlite3`
-raises `OverflowError`, which is not a database error the store translates."""
+A value outside it is never bound: `sqlite3` raises `OverflowError` for one, which is not a
+database error the store translates. A narrower column narrows it further (`IntegerRange`)."""
+
+IntegerRange = tuple[int, int]
+"""The inclusive `(low, high)` an integer id column holds, decided from its reflected type and
+dialect by `sqlalchemy_core`; this module takes the range, never the type."""
+
+INT64_RANGE: IntegerRange = (INT64_MIN, INT64_MAX)
 
 MAX_INTEGER_TEXT = len(str(INT64_MIN))
 """The longest canonical text of an in-range integer id: 20 characters, minus sign included."""
@@ -69,14 +75,18 @@ def read_id(kind: IdKind, value: object) -> str | None:
     return as_text(value)
 
 
-def bind_id(kind: IdKind, candidate: str) -> str | int | uuid.UUID | None:
+def bind_id(
+    kind: IdKind, candidate: str, integer_range: IntegerRange = INT64_RANGE
+) -> str | int | uuid.UUID | None:
     """The value to compare a column of this kind against, or `None` when no row can hold `candidate`.
 
     Only the canonical form is accepted, so the id a row is found under is always the id the row
-    answers with - which is what lets the store's identity re-check compare the two as text.
+    answers with - which is what lets the store's identity re-check compare the two as text. An
+    integer outside `integer_range` (held to int64 as well) is `None` too: bound, it is not a miss
+    but a driver error - asyncpg refuses an int4 parameter past int32 before anything is sent.
     """
     if kind is IdKind.INTEGER:
-        return _integer_value(candidate)
+        return _integer_value(candidate, integer_range)
     if kind is IdKind.UUID:
         return _uuid_value(candidate)
     return candidate
@@ -98,7 +108,7 @@ def _uuid_text(value: object) -> str | None:
     return None
 
 
-def _integer_value(candidate: str) -> int | None:
+def _integer_value(candidate: str, integer_range: IntegerRange) -> int | None:
     # The length cap runs first: `int()` of a long enough digit string raises `ValueError`
     # (Python's int-from-text limit) instead of answering a number to range-check.
     if (
@@ -108,7 +118,8 @@ def _integer_value(candidate: str) -> int | None:
     ):
         return None
     value = int(candidate)
-    return value if INT64_MIN <= value <= INT64_MAX else None
+    low, high = max(integer_range[0], INT64_MIN), min(integer_range[1], INT64_MAX)
+    return value if low <= value <= high else None
 
 
 def _uuid_value(candidate: str) -> uuid.UUID | None:

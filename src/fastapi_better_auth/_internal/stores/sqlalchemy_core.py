@@ -58,7 +58,8 @@ from ..errors import AuthServiceUnavailable, ConfigurationError
 from ..reasons import fingerprint
 from .diagnostics import drifted, unusable
 from .records import StoredSession, StoredUser
-from .sql_ids import IdKind, bind_id, read_id
+from .sql_ids import INT64_RANGE, IdKind, IntegerRange, bind_id, read_id
+from .sql_widths import integer_range
 from .upstream import as_db_flag, as_moment, as_text
 
 # Re-exported so `sqlalchemy_store` can name the exception class in an `except` without importing
@@ -158,10 +159,15 @@ Types = Mapping[str, Mapping[str, "TypeEngine[Any]"]]
 
 @dataclass(frozen=True)
 class Discovered:
-    """What one reflection pass read: the columns, and their types."""
+    """What one reflection pass read: the columns, their types, and the dialect that read them.
+
+    The dialect is part of the answer because a type class does not fix a width: SQLite's
+    `INTEGER` holds 64 bits and Postgres's 32 (`sql_widths`).
+    """
 
     columns: Columns
     types: Types = field(default_factory=dict[str, Mapping[str, "TypeEngine[Any]"]])
+    dialect: str | None = None
 
 
 @dataclass(frozen=True)
@@ -171,10 +177,14 @@ class IdColumn:
     The bind type is the *reflected* one, never a family stand-in: Postgres drivers that cast
     their parameters (asyncpg renders `$1::BIGINT`) would otherwise cast a `bigint` id to
     `integer` and fail on every id past 2**31.
+
+    `integer_range` is what an integer column holds on its dialect; a lookup outside it is a miss
+    before any statement, because bound it is a driver error rather than an empty result.
     """
 
     kind: IdKind = IdKind.TEXT
     bind_type: TypeEngine[Any] | None = None
+    integer_range: IntegerRange = INT64_RANGE
 
 
 TEXT_ID = IdColumn()
@@ -260,13 +270,18 @@ def kind_of(column_type: TypeEngine[Any] | None) -> IdKind:
 
 
 def _id_columns(
-    types: Mapping[str, TypeEngine[Any]], names: tuple[str, ...]
+    types: Mapping[str, TypeEngine[Any]], names: tuple[str, ...], dialect: str | None
 ) -> dict[str, IdColumn]:
     found: dict[str, IdColumn] = {}
     for name in names:
         reflected_type = types.get(name)
         kind = kind_of(reflected_type)
-        found[name] = TEXT_ID if kind is IdKind.TEXT else IdColumn(kind, reflected_type)
+        if kind is IdKind.TEXT:
+            found[name] = TEXT_ID
+        elif kind is IdKind.INTEGER:
+            found[name] = IdColumn(kind, reflected_type, integer_range(reflected_type, dialect))
+        else:
+            found[name] = IdColumn(kind, reflected_type)
     return found
 
 
@@ -301,6 +316,7 @@ def plan_for(
     present: Columns,
     *,
     types: Types | None = None,
+    dialect: str | None = None,
     session_allowed: tuple[str, ...] | None = None,
     user_allowed: tuple[str, ...] | None = None,
 ) -> Plan:
@@ -324,6 +340,8 @@ def plan_for(
 
     `types` is what reflection said about each column's type, read for the id columns alone;
     without it (or for a column it does not name) an id is text, the default Better Auth id.
+    `dialect` (the reflecting dialect's name) fixes how wide an integer id column is; without it
+    the width is the signed 64-bit bound.
     """
     session_columns = _accepted(
         session_table,
@@ -337,8 +355,8 @@ def plan_for(
         user_table, present, USER_REQUIRED, USER_OPTIONAL, USER_ADMIN, allowed=user_allowed
     )
     reflected_types = types or {}
-    session_ids = _id_columns(reflected_types.get(session_table, {}), SESSION_IDS)
-    user_ids = _id_columns(reflected_types.get(user_table, {}), USER_IDS)
+    session_ids = _id_columns(reflected_types.get(session_table, {}), SESSION_IDS, dialect)
+    user_ids = _id_columns(reflected_types.get(user_table, {}), USER_IDS, dialect)
     metadata = MetaData(schema=schema)
     session = Table(
         session_table,
@@ -444,7 +462,8 @@ def bound_user_id(plan: Plan, user_id: str) -> str | int | uuid.UUID | None:
     the text came from the caller, not from a stored row, so there is nothing to tell an
     operator that a lookup by an unknown id would not equally have to tell them.
     """
-    return bind_id(plan.user_id().kind, user_id)
+    id_column = plan.user_id()
+    return bind_id(id_column.kind, user_id, id_column.integer_range)
 
 
 def session_from(rows: Sequence[Mapping[str, Any]], plan: Plan, token: str) -> StoredSession | None:
@@ -602,7 +621,7 @@ def reflected(connection: Connection, names: Sequence[str], schema: str | None) 
         columns = inspector.get_columns(name, schema=schema)
         found[name] = tuple(str(column["name"]) for column in columns)
         types[name] = {str(column["name"]): column["type"] for column in columns}
-    return Discovered(columns=found, types=types)
+    return Discovered(columns=found, types=types, dialect=connection.dialect.name)
 
 
 def rows(result: Any) -> list[Mapping[str, Any]]:

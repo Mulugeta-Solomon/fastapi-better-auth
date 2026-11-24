@@ -144,6 +144,7 @@ class _CoreStore(ABC):
                     self._schema,
                     discovered.columns,
                     types=discovered.types,
+                    dialect=discovered.dialect,
                     session_allowed=session_allowed,
                     user_allowed=user_allowed,
                 )
