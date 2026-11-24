@@ -328,8 +328,11 @@ class JwksClient:
         if len(entries) > self._max_keys:
             raise self._unusable(f"it carries {len(entries)} keys, over the {self._max_keys} cap")
         keys: dict[str, Jwk] = {}
-        for entry in entries:
-            self._collect(entry, keys)
+        unloadable = sum(0 if self._collect(entry, keys) else 1 for entry in entries)
+        if unloadable and not keys:
+            # Every key that should have loaded did not: a corrupt set, not an empty one, and
+            # answering "unknown kid" would send the operator hunting for a rotation instead.
+            raise self._unusable(f"none of its keys loaded ({unloadable} would not)")
         return keys
 
     def _check_answer(self, response: TransportResponse) -> None:
@@ -358,7 +361,14 @@ class JwksClient:
             raise self._unusable("it is not a JSON object")
         return cast("Mapping[str, Any]", parsed)
 
-    def _collect(self, entry: object, keys: dict[str, Jwk]) -> None:
+    def _collect(self, entry: object, keys: dict[str, Jwk]) -> bool:
+        """Add one published entry to `keys` if it is usable; `False` only if it would not load.
+
+        An entry under an allowed `alg` whose material will not load is skipped, not refused:
+        one key upstream mispublished - or published for a curve this library does not
+        verify - costs the tokens that key signed, never the whole set. Its kid then answers
+        as unknown. An entry that is not even shaped like a key still refuses the document.
+        """
         if not isinstance(entry, dict):
             raise self._unusable("one of its keys is not an object")
         published = cast("Mapping[str, Any]", entry)
@@ -369,19 +379,21 @@ class JwksClient:
         if not isinstance(algorithm, str) or not algorithm:
             raise self._unusable(f"key {safe_label(kid)} declares no 'alg'")
         loader = LOADERS.get(algorithm)
-        if loader is None or algorithm not in self._algorithms:
-            return
-        if kid in keys:
-            return
+        if loader is None or algorithm not in self._algorithms or kid in keys:
+            return True
         declared = _not_for_verifying(published)
         if declared is not None:
             self._skipped(kid, declared)
-            return
-        key = self._loaded(loader, published, kid)
+            return True
+        key = _loaded(loader, published)
+        if key is None:
+            self._skipped(kid, "load")
+            return False
         if loader is RSAAlgorithm and _rsa_bits(key) < MIN_RSA_KEY_BITS:
             self._skipped(kid, "size")
-            return
+            return True
         keys[kid] = Jwk(kid=kid, algorithm=algorithm, key=key, jwk=published)
+        return True
 
     def _skipped(self, kid: str, why: str) -> None:
         """One key dropped from an otherwise usable set - the correct blast radius.
@@ -395,15 +407,20 @@ class JwksClient:
             why,
         )
 
-    def _loaded(self, loader: type[Algorithm], published: Mapping[str, Any], kid: str) -> Any:
-        try:
-            return loader.from_jwk(dict(published))
-        except Exception:  # noqa: BLE001 - every library failure here means the same thing
-            failure = self._unusable(f"key {safe_label(kid)} did not load")
-        raise failure from None  # outside the handler, as in `_fetched`
-
     def _unusable(self, why: str) -> AuthServiceUnavailable:
         return AuthServiceUnavailable(reason=f"jwks at {self._uri} is unusable: {why}")
+
+
+def _loaded(loader: type[Algorithm], published: Mapping[str, Any]) -> Any | None:
+    """The loaded public key, or `None` when this entry's material will not load.
+
+    Nothing of the failure is kept: the library's exception can quote the material it choked
+    on, and the caller's warning names the key by a sanitized `kid` and one reason word only.
+    """
+    try:
+        return loader.from_jwk(dict(published))
+    except Exception:  # noqa: BLE001 - every library failure here means the same thing
+        return None
 
 
 def _not_for_verifying(published: Mapping[str, Any]) -> str | None:
