@@ -20,13 +20,14 @@ import asyncio
 import logging
 import pathlib
 import threading
+import time
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import anyio
 import anyio.to_thread
 import pytest
-from sqlalchemy import Engine, QueuePool
+from sqlalchemy import Engine, QueuePool, event
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.util import await_only
 
@@ -37,6 +38,8 @@ from tests.log_hygiene import capturing
 from tests.stores import SESSION_ID, TOKEN, StoreFixture
 
 COOKIE_PAIR = f"{COOKIE}={sign(TOKEN)}"
+CLEANUP_DELAY = 0.05
+"""Seconds a sync connection takes to go back to its pool, on the worker thread."""
 STAGES = ("lookup", "discovery")
 """Where the driver stops answering: after `connect()`, or before it - so the deadline lands in
 the store's first-use schema discovery."""
@@ -86,13 +89,18 @@ class BlockingDriver:
     has stopped answering, met exactly where `SyncStoreAdapter`'s worker thread meets it.
 
     The wait is itself bounded by `GUARD`, so a test that forgets to release cannot wedge the
-    suite; `entered` and `finished` are how a test sees the thread from outside.
+    suite; `entered` and `finished` are how a test sees the thread from outside. `finished` is
+    the statement returning, not the worker being done: the rows are still read and the
+    connection still checked in after it, and returning a connection is made to take
+    `CLEANUP_DELAY` here so that a test which mistakes the one for the other fails every time
+    rather than once in a while.
     """
 
     def __init__(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
         self.entered = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
+        event.listen(engine, "checkin", lambda *_: time.sleep(CLEANUP_DELAY))
         original = engine.dialect.do_execute
 
         def do_execute(cursor: Any, statement: str, parameters: Any, context: Any = None) -> None:
