@@ -1638,6 +1638,130 @@ def client():
         yield http
 ```
 
+### Moving the verifier's clock
+
+`CookieVerifier` and `RemoteVerifier` refuse a session whose `expiresAt` has passed themselves; no
+store this library ships filters on it. So when your auth service shortens a session — a
+thirty-minute cap set in a `session.create.before` hook, say — this check is what enforces the cap,
+and your suite can prove it without waiting thirty minutes. Pass `now=`, a callable returning an
+aware `datetime`, and move it forward:
+
+```python
+import base64
+import hashlib
+import hmac
+from datetime import datetime, timedelta, timezone
+from typing import Annotated
+from urllib.parse import quote
+
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+
+from fastapi_better_auth import (
+    BetterAuth,
+    CookieVerifier,
+    OriginCheck,
+    Session,
+    SharedSecret,
+    StoredSession,
+    StoredUser,
+    User,
+)
+
+# Literals only so this page runs; in production read the secret from the environment.
+SECRET = "replace-this-with-your-own-32-plus-character-secret"
+TOKEN = "q7Rk2mVx9LpT4sWc8NbZ1hYd6GfJ3eAu"
+APP_ORIGIN = "https://app.example.com"
+
+
+class MovableClock:
+    """The clock the verifier's expiry and ban checks read, moved by the test."""
+
+    def __init__(self) -> None:
+        self.ahead = timedelta()
+
+    def __call__(self) -> datetime:
+        return datetime.now(timezone.utc) + self.ahead
+
+
+class DictSessionStore:
+    def __init__(self) -> None:
+        self.sessions: dict[str, StoredSession] = {}
+
+    async def fetch_session_by_token(self, token: str) -> StoredSession | None:
+        return self.sessions.get(token)
+
+    async def fetch_user_by_id(self, user_id: str) -> StoredUser | None:
+        return None
+
+
+clock = MovableClock()
+store = DictSessionStore()
+auth = BetterAuth(
+    verifiers=[
+        CookieVerifier(
+            secret=SharedSecret(SECRET),
+            store=store,
+            csrf=OriginCheck(allowed_origins=[APP_ORIGIN]),
+            now=clock,
+        )
+    ]
+)
+CurrentSession = Annotated[Session[User], Depends(auth.current_session())]
+
+app = FastAPI()
+
+
+@app.post("/profile")
+async def update_profile(session: CurrentSession) -> User:
+    return session.user
+
+
+def session_cookie(token: str) -> str:
+    """The value Better Auth sets: the token, a dot and its HMAC-SHA256, URL-encoded."""
+    digest = hmac.new(SECRET.encode(), token.encode(), hashlib.sha256).digest()
+    return quote(f"{token}.{base64.b64encode(digest).decode()}", safe="")
+
+
+def test_a_session_past_the_thirty_minute_cap_is_refused() -> None:
+    store.sessions[TOKEN] = StoredSession(
+        token=TOKEN,
+        user_id="u1",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        payload={"id": "s1", "userId": "u1", "token": TOKEN},
+        user=StoredUser(id="u1", payload={"id": "u1", "email": "tester@example.com"}),
+    )
+    headers = {
+        "Cookie": f"__Secure-better-auth.session_token={session_cookie(TOKEN)}",
+        "Origin": APP_ORIGIN,
+    }
+    with TestClient(app) as client:
+        assert client.post("/profile", headers=headers).status_code == 200
+        clock.ahead = timedelta(minutes=31)
+        assert client.post("/profile", headers=headers).status_code == 401
+```
+
+**`now` can only make the verifier stricter.** Expiry is checked against whichever is later, the
+real time or `now()`; a ban's lapse against whichever is earlier. Moving `now` forward expires
+sessions sooner, and moving it back changes nothing. So a test clock left wired into production can
+get exactly one thing wrong — expire sessions early — and can never admit a session the real clock
+refuses, or cut a ban short. The same rule means `now` cannot show a ban lapsing: for that, store a
+user whose `banExpires` is already in the past, and the real clock lapses it. A `now` that is not
+callable is refused at construction. One that raises, or returns anything but an aware `datetime`,
+fails closed: the request is the uniform `401`, and the exception is logged at ERROR with its
+traceback.
+
+`RemoteVerifier` takes the same `now=` and applies it to the `expiresAt` and `banExpires` that
+get-session returns. Its `clock=` is a different thing: monotonic seconds for its caches and
+back-off, which never decide a refusal.
+
+**Mode B has no `now=`.** PyJWT checks `exp`, `nbf` and `iat` against its own reading of the clock,
+inside `jwt.decode`, and takes no clock from its caller, so this library has none to hand it. A
+patch that replaces `datetime.now` for the whole process does reach it: with time-machine 3.5.1 and
+PyJWT 2.13.0, `time_machine.travel()` to 901 seconds after a token was issued made `JwtVerifier`
+refuse it as expired. That patch moves every clock in the process, in both directions, so keep it
+inside the test that needs it.
+
 ## Do I need to run a Node service?
 
 Better Auth itself always runs in a Node/TypeScript process — sign-up, sign-in, OAuth, 2FA, and

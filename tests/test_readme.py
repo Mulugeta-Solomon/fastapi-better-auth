@@ -25,10 +25,11 @@ a snippet that reaches upstream to decide a forgery names the route it did it fr
 
 from __future__ import annotations
 
+import functools
 import pathlib
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple
 
@@ -85,6 +86,7 @@ BASE_URL = "https://auth.example.com"
 BROKEN_SNIPPET = "```python\nfrom fastapi_better_auth import BetterAuht\n```\n"
 
 TESTING_HEADING = "## Testing"
+CLOCK_HEADING = "### Moving the verifier's clock"
 HTTP_CLIENTS = ("httpx", "httpx2")
 """The two libraries a bare `fastapi-better-auth-bridge` install has neither of (#65)."""
 
@@ -165,12 +167,23 @@ def snippets(path: pathlib.Path) -> tuple[Snippet, ...]:
 ALL_SNIPPETS = tuple(snippet for path in DOCUMENTS for snippet in snippets(path))
 
 
+def closes(line: str, heading: str) -> bool:
+    """Whether `line` is a heading at `heading`'s level or above: a `##` section ends at the next
+    `##`, a `###` subsection at the next `###` or `##`. The page has no other levels."""
+    level = len(heading) - len(heading.lstrip("#"))
+    return any(line.startswith("#" * depth + " ") for depth in range(2, level + 1))
+
+
 def fences_under(heading: str) -> tuple[Snippet, ...]:
-    """The README's python fences between `heading` and the next `## ` heading, in page order."""
+    """The README's python fences between `heading` and the next heading closing it, in page order."""
     lines = README.read_text(encoding="utf-8").splitlines()
     index = lines.index(heading)
     end = next(
-        (number for number, line in enumerate(lines[index + 1 :], index + 2) if line[:3] == "## "),
+        (
+            number
+            for number, line in enumerate(lines[index + 1 :], index + 2)
+            if closes(line, heading)
+        ),
         len(lines) + 1,
     )
     return tuple(
@@ -398,10 +411,12 @@ def test_the_testing_recipe_runs_on_an_install_with_no_http_client(
 
     The recipe is about the override, not about a mode, so it has to construct on the bare
     install. Found by its heading, not by a line number: prose edited above the section moves
-    every line, and a guard that quietly matched nothing would pass on an empty section.
+    every line, and a guard that quietly matched nothing would pass on an empty section. The
+    clock subsection's fence is a test module - it imports `TestClient` - and has its own rung.
     """
-    found = fences_under(TESTING_HEADING)
-    assert len(found) == 1, f"{TESTING_HEADING} holds {len(found)} python fences, not one"
+    clock = fences_under(CLOCK_HEADING)
+    found = [snippet for snippet in fences_under(TESTING_HEADING) if snippet not in clock]
+    assert len(found) == 1, f"{TESTING_HEADING} holds {len(found)} recipe fences, not one"
     for library in HTTP_CLIENTS:
         monkeypatch.setitem(sys.modules, library, None)
 
@@ -547,6 +562,36 @@ def test_the_documented_fake_session_serves_the_snippets_own_routes(
                     assert client.request(method, path).status_code == 401, f"cleared: {where}"
 
     assert driven, "no snippet documents a fake session for a route to be served under"
+    assert refuse_network == []
+
+
+def clock_fence_test(backend: str) -> Callable[[], object]:
+    """The clock fence's one `test_` function, with its `TestClient` bound to `backend`.
+
+    Counted, so a fence that grew a second test or lost its only one fails here rather than
+    running nothing; and kept out of the rung's own frame, which then holds no fence literal.
+    """
+    found = fences_under(CLOCK_HEADING)
+    assert len(found) == 1, f"{CLOCK_HEADING} holds {len(found)} python fences, not one"
+    namespace = run(found[0])
+    tests = [value for name, value in namespace.items() if name.startswith("test_")]
+    assert len(tests) == 1, f"the clock fence defines {len(tests)} test functions, not one"
+    bound = functools.partial(TestClient, backend=backend)  # pyright: ignore[reportArgumentType]
+    namespace["TestClient"] = bound
+    return tests[0]
+
+
+def test_the_clock_fence_turns_a_200_into_a_401(
+    client_backend: str, refuse_network: list[str]
+) -> None:
+    """§Testing's clock subsection, run as the reader runs it: its one test function, called.
+
+    The fence's own assertions are the property - served, then refused once `now` is moved past
+    the thirty-minute session - so this rung makes sure they run, once per backend. A fence whose
+    test stopped moving the clock, or whose verifier lost `now=`, fails its own second assert.
+    """
+    clock_fence_test(client_backend)()
+
     assert refuse_network == []
 
 
