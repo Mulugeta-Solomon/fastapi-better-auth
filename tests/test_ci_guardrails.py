@@ -199,7 +199,43 @@ def test_publish_waits_for_main_ancestry_and_the_full_test_workflow() -> None:
     build_needs = re.search(r"needs: \[(.*)\]", release["build"])
     assert build_needs is not None
     assert {part.strip() for part in build_needs.group(1).split(",")} == {guard, calls[0]}
-    assert re.search(r"^    needs: build$", release["publish"], re.MULTILINE)
+    publish_needs = re.search(r"^    needs: \[(.*)\]$", release["publish"], re.MULTILINE)
+    assert publish_needs is not None
+    assert {part.strip() for part in publish_needs.group(1).split(",")} == {
+        guard,
+        calls[0],
+        "build",
+    }
+
+
+def test_release_can_be_rehearsed_by_dispatch_without_publishing() -> None:
+    """PR CI never runs release.yml, and `v*` tags are immutable: a bug first found on the real
+    release burns the tag. A dispatch runs on-main, the tests and build, and never publish."""
+    head = RELEASE.read_text(encoding="utf-8").split("\njobs:\n", 1)[0]
+    release = jobs(RELEASE)
+
+    assert "\n  release:\n    types: [published]\n" in head
+    assert "\n  workflow_dispatch:\n" in head
+    publish_if = re.findall(r"^    if: (.*)$", release["publish"], re.MULTILINE)
+    assert publish_if == ["github.event_name == 'release'"]
+    for name in ("on-main", "tests", "build"):
+        assert not re.search(r"^    if: ", release[name], re.MULTILINE), name
+
+
+def test_only_the_tag_guard_is_skipped_on_a_dispatch() -> None:
+    """There is no tag on a dispatch; every other build guard runs either way."""
+    build_steps = steps(jobs(RELEASE)["build"])
+    conditions = {
+        step.splitlines()[0]: re.findall(r"^        if: (.*)$", step, re.MULTILINE)
+        for step in build_steps
+    }
+
+    tag_guard = [line for line in conditions if "git tag must equal" in line]
+    assert len(tag_guard) == 1
+    assert conditions[tag_guard[0]] == ["github.event_name != 'workflow_dispatch'"]
+    others = {line: found for line, found in conditions.items() if line not in tag_guard}
+    assert others
+    assert all(found == [] for found in others.values()), others
 
 
 def test_only_the_checkout_free_publish_job_can_mint_the_pypi_token() -> None:
