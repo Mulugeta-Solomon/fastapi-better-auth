@@ -103,6 +103,7 @@ def record(
     outcome: str,
     harness: str = "",
     wheel: str = "",
+    attempt: str = "1",
 ) -> int:
     """One leg's `record` call, into its own subdirectory the way download-artifact lays it out."""
     out = results / f"canary-result-{lane}-{version}" / "canary-result.json"
@@ -118,6 +119,8 @@ def record(
         wheel,
         "--conformance-outcome",
         outcome,
+        "--run-attempt",
+        attempt,
         "--out",
         str(out),
     ]
@@ -132,6 +135,7 @@ def report(
     watch: str = "skipped",
     jobs: Mapping[str, str] = ALL_GREEN,
     versions: Sequence[str] | None = None,
+    attempt: str = "1",
 ) -> int:
     expected = recorded_versions(results) if versions is None else list(versions)
     argv = [
@@ -148,6 +152,8 @@ def report(
         jobs["wheel"],
         "--expected-versions",
         json.dumps(expected),
+        "--run-attempt",
+        attempt,
     ]
     return script.main(argv, gh=gh)
 
@@ -554,7 +560,7 @@ def test_an_implausible_expected_matrix_is_refused_before_any_call(
     argv = [
         "report", "--results-dir", str(tmp_path), "--run-url", RUN_URL,
         "--upstream-watch", "failure", "--head-job", "success", "--wheel-job", "success",
-        "--expected-versions", versions,
+        "--expected-versions", versions, "--run-attempt", "1",
     ]  # fmt: skip
 
     with pytest.raises(SystemExit) as exited:
@@ -575,30 +581,165 @@ def test_the_canary_label_is_ensured_before_an_issue_is_created(
     assert verbs.index(["label", "create"]) < verbs.index(["issue", "create"])
 
 
+# --- report: re-runs ------------------------------------------------------------------------
+#
+# "Re-run failed jobs" re-runs only the failed legs (and the report job); a leg that passed keeps
+# its earlier attempt's artifact. download-artifact then hands the report a mix of attempts.
+
+
+@pytest.mark.parametrize("attempt", ["0", "-1", "x", "", "1.5"])
+def test_record_refuses_an_implausible_attempt(
+    script: Report, tmp_path: pathlib.Path, attempt: str
+) -> None:
+    with pytest.raises(SystemExit) as exited:
+        record(script, tmp_path, lane="head", version="1.7.1", outcome="success", attempt=attempt)
+
+    assert exited.value.code == 1
+    assert list(tmp_path.rglob("canary-result.json")) == []
+
+
+def test_record_writes_its_attempt(script: Report, tmp_path: pathlib.Path) -> None:
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", attempt="3")
+
+    written = json.loads(next(tmp_path.rglob("canary-result.json")).read_text(encoding="utf-8"))
+    assert written["attempt"] == "3"
+
+
+def test_an_earlier_pass_closes_when_its_lane_is_green(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    """Lane success on attempt 2 means every leg's latest attempt passed, this one included."""
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
+    gh = Gh(STALE_OCTOBER)
+
+    report(script, tmp_path, gh, attempt="2")
+
+    assert numbers(gh.of("close")) == ["95"]
+
+
+def test_an_earlier_pass_covers_its_leg_but_closes_nothing_when_the_lane_failed(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
+    gh = Gh(STALE_OCTOBER)
+
+    report(
+        script,
+        tmp_path,
+        gh,
+        attempt="2",
+        jobs={"head": "failure", "wheel": "success"},
+        versions=["1.7.1", "1.7.5"],
+    )
+
+    assert gh.of("close") == []
+    body = unrecorded_body(gh, "head")
+    assert "better-auth@1.7.5" in body
+    assert "better-auth@1.7.1" not in body
+
+
+def test_an_earlier_failure_is_stale_files_nothing_and_counts_as_missing(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    """A failed leg is always re-run; its attempt-1 file only means attempt 2 left nothing."""
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="failure", harness="1.7.1")
+    gh = Gh(STALE_OCTOBER)
+
+    report(
+        script,
+        tmp_path,
+        gh,
+        attempt="2",
+        jobs={"head": "failure", "wheel": "success"},
+        versions=["1.7.1"],
+    )
+
+    assert gh.of("comment") == []
+    assert created_titles(gh) == [
+        "canary: a HEAD conformance leg failed without recording its result"
+    ]
+    assert "better-auth@1.7.1" in unrecorded_body(gh, "head")
+
+
+def test_a_current_attempt_result_is_used_as_before(script: Report, tmp_path: pathlib.Path) -> None:
+    record(
+        script, tmp_path, lane="head", version="1.7.1", outcome="failure", harness="1.7.1",
+        attempt="2",
+    )  # fmt: skip
+    gh = Gh(STALE_OCTOBER)
+
+    report(script, tmp_path, gh, attempt="2", jobs={"head": "failure", "wheel": "success"})
+
+    assert numbers(gh.of("comment")) == ["95"]
+
+
+def test_a_result_from_a_later_attempt_than_the_report_is_rejected(
+    script: Report, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record(
+        script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1",
+        attempt="3",
+    )  # fmt: skip
+    gh = Gh(STALE_OCTOBER)
+
+    assert report(script, tmp_path, gh, attempt="2") == 1
+
+    assert gh.of("close") == []
+    assert "::error::" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("attempt", ["0", "x", ""])
+def test_report_refuses_an_implausible_attempt(
+    script: Report, tmp_path: pathlib.Path, attempt: str
+) -> None:
+    gh = Gh({})
+
+    with pytest.raises(SystemExit) as exited:
+        report(script, tmp_path, gh, watch="failure", attempt=attempt)
+
+    assert exited.value.code == 1
+    assert gh.calls == []
+
+
 # --- report: untrusted input and failed calls are loud --------------------------------------
+
+
+VALID_DOCUMENT = {
+    "lane": "head",
+    "matrix_version": "1.7.1",
+    "harness_version": "",
+    "wheel_version": "",
+    "outcome": "passed",
+    "attempt": "1",
+}
+
+
+def without(key: str) -> dict[str, str]:
+    return {k: v for k, v in VALID_DOCUMENT.items() if k != key}
 
 
 @pytest.mark.parametrize(
     "document",
     [
-        {"lane": "head", "matrix_version": "1.7.1", "outcome": "passed"},
-        {
-            "lane": "head",
-            "matrix_version": "1.7.1\nx",
-            "harness_version": "",
-            "wheel_version": "",
-            "outcome": "passed",
-        },
-        {
-            "lane": "head",
-            "matrix_version": "1.7.1",
-            "harness_version": "",
-            "wheel_version": "",
-            "outcome": "fine",
-        },
+        without("harness_version"),
+        {**VALID_DOCUMENT, "matrix_version": "1.7.1\nx"},
+        {**VALID_DOCUMENT, "outcome": "fine"},
+        {**VALID_DOCUMENT, "attempt": "0"},
+        {**VALID_DOCUMENT, "attempt": "1\n"},
+        {**VALID_DOCUMENT, "attempt": 1},
+        {**VALID_DOCUMENT, "extra": "x"},
         ["not", "an", "object"],
     ],
-    ids=["missing-fields", "newline", "unknown-outcome", "not-an-object"],
+    ids=[
+        "missing-field",
+        "newline",
+        "unknown-outcome",
+        "attempt-zero",
+        "attempt-newline",
+        "attempt-not-a-string",
+        "extra-field",
+        "not-an-object",
+    ],
 )
 def test_a_tampered_result_file_is_rejected_and_its_leg_left_alone(
     script: Report, capsys: pytest.CaptureFixture[str], tmp_path: pathlib.Path, document: object
@@ -729,6 +870,8 @@ def test_an_implausible_run_url_is_refused(
         "success",
         "--expected-versions",
         '["1.7.1"]',
+        "--run-attempt",
+        "1",
     ]
 
     with pytest.raises(SystemExit):
@@ -761,6 +904,8 @@ def test_an_unreadable_issue_list_acts_on_nothing(script: Report, tmp_path: path
                 "success",
                 "--expected-versions",
                 '["1.7.1"]',
+                "--run-attempt",
+                "1",
             ],
             gh=broken,
         )
