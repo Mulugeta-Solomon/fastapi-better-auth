@@ -148,8 +148,10 @@ class RedisSessionStore:
     JSON, not an object, no session, no user, no usable `expiresAt`, or a stored session naming a
     *different* token than the key it was found under: all of them answer `None`. The last is
     compared in constant time and is the one that matters - honouring it would authenticate
-    whoever wrote that key. A failure of Redis itself propagates untranslated, because a store
-    cannot know what an unreachable cache means to the request that needed it.
+    whoever wrote that key. A failure of Redis itself - on either read - propagates untranslated,
+    because a store cannot know what an unreachable cache means to the request that needed it;
+    the frames it unwinds through here hold neither the token, the key nor the stored document by
+    then. The client's own frames are its own: redis-py's hold the key it was asked for.
 
     The token is compared as UTF-8 bytes. A `str` carrying an unpaired surrogate cannot be
     encoded and raises rather than returning a miss - but it is unreachable through the real entry
@@ -205,24 +207,35 @@ class RedisSessionStore:
         if not token.strip():
             return None
         key = f"{self._prefix}{token}"
-        value = await self._client.get(key)
-        if value is None:
-            return None
-        document = self._document(value, key)
-        if document is None:
-            return None
-        record = self._record(document, token, key)
-        if record is None:
-            return None
-        return await self._unless_revoked(record, key)
+        value: object = None
+        document: Mapping[str, Any] | None = None
+        record: StoredSession | None = None
+        try:
+            value = await self._client.get(key)
+            if value is None:
+                return None
+            document = self._document(value, key)
+            if document is None:
+                return None
+            record = self._record(document, token, key)
+            if record is None:
+                return None
+            return await self._unless_revoked(record, key)
+        finally:
+            # A client failure propagates through this frame untranslated, and a reporter that
+            # captures frame locals would find the token, the key built from it and the stored
+            # document here (D-094). The return value is already computed; these are not it.
+            token = key = ""
+            value = document = record = None
 
     async def fetch_user_by_id(self, user_id: str) -> StoredUser | None:
         """Always a miss, and never a command.
 
         Better Auth's secondary storage holds sessions, an `active-sessions-<userId>` list and a
-        `revoked-sessions-before-<userId>` watermark; there is no user keyed by id to read. A session fetched from this store always carries
-        its user, so the sanctioned flow never asks - and answering by guessing a key, or by
-        reaching for a database, is the fallback D-008 forbids.
+        `revoked-sessions-before-<userId>` watermark; there is no user keyed by id to read. A
+        session fetched from this store always carries its user, so the sanctioned flow never
+        asks - and answering by guessing a key, or by reaching for a database, is the fallback
+        D-008 forbids.
         """
         return None
 
@@ -252,9 +265,14 @@ class RedisSessionStore:
         a miss, a malformed value or a mismatched token never costs this second read. A revoked
         or unreadable verdict is a miss, indistinguishable from an absent key to the caller.
         """
-        watermark = await self._client.get(watermark_key(self._prefix, record.user_id))
-        verdict = judge(watermark, record.payload, key)
-        return record if verdict is Verdict.STANDING else None
+        try:
+            watermark = await self._client.get(watermark_key(self._prefix, record.user_id))
+            standing = judge(watermark, record.payload, key) is Verdict.STANDING
+            return record if standing else None
+        finally:
+            # A failed watermark read unwinds through here holding the whole record (D-094).
+            del record
+            key = ""
 
     def _document(self, value: object, key: str) -> Mapping[str, Any] | None:
         if not isinstance(value, (bytes, bytearray, str)):
