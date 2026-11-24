@@ -31,11 +31,15 @@ schema](../README.md#who-owns-the-database-schema) for the rule and the reason.
 | `auth-redis` | 3101 | `--profile redis`: sessions in Redis secondary storage — the Postgres session table may stay empty |
 | `auth-strict` | 3102 | `--profile strict`: `bearer({ requireSignature: true })` |
 | `auth-throttled` | 3103 | `--profile throttled`: a real rate limit on `/get-session` (3 per 10 s) |
-| `postgres` | 55432 | Exposed for vector capture and session manipulation in tests |
-| `redis` | 56379 | Used only by the `redis` profile |
+| `postgres` | 15432 | Exposed for vector capture and session manipulation in tests |
+| `redis` | 16379 | Used only by the `redis` profile |
 
 Every port is published on `127.0.0.1` only: the harness ships a fixed database password and auth
 secret, so it must not be reachable from another machine.
+Each host port can be moved with `HARNESS_POSTGRES_PORT`, `HARNESS_REDIS_PORT`, `HARNESS_AUTH_PORT`,
+`HARNESS_AUTH_REDIS_PORT`, `HARNESS_AUTH_STRICT_PORT` or `HARNESS_AUTH_THROTTLED_PORT`; the e2e
+fixtures read the same variables. The defaults sit below 32768, outside Linux's ephemeral range and
+Windows' Hyper-V-reserved dynamic range, where another process can already hold a port.
 
 Every auth container runs `auth migrate` against the same database on start, so the three optional
 ones wait for `auth` to be healthy rather than racing it.
