@@ -2,18 +2,32 @@
 
 `record` runs at the end of each matrix leg. It maps the conformance step's outcome to one of
 three verdicts - passed, conformance-failed (pytest ran and failed), could-not-run (something
-before pytest failed) - and writes it with the versions the leg ran to a small JSON file the leg
-uploads as an artifact. A cancelled step writes nothing: a cancelled leg files nothing.
+before pytest failed) - and writes it, with the versions the leg ran, its run attempt and when it
+was recorded (UTC), to a small JSON file the leg uploads as an artifact. A cancelled step writes
+nothing: a cancelled leg files nothing.
 
-`report` runs in the one job that may write issues. It reads every leg's file and the upstream
-watch's job result, lists the open `canary` issues, and then: a failure files an issue, or
-comments on the open issue with that title so a repeat failure is never silent; a pass closes
-every open issue its own leg filed. A lane whose job failed without recording any failure files
-an issue of its own, so a broken record step cannot read as green.
+`report` runs in the one job that may write issues, one canary run at a time. It reads every
+leg's file, the upstream watch's job result and the expected matrix, lists the open `canary`
+issues with their creation times, and then:
 
-The leg files were written by jobs that ran npm-installed upstream code and pytest, so every
-field is validated again here before it can reach an issue title, and `gh` is only ever called
-with an argument list. Standard library only: the report job never installs the project.
+- a failure files an issue, or comments on the open issue with that title, so a repeat failure
+  is never silent;
+- a pass closes the open issues its own leg filed before the pass was recorded - an issue filed
+  later stays open. The comment says the leg passed when it retested the combination the title
+  names, and says the issue is superseded, not retested, when the title names an older wheel or
+  an older resolution of `latest`;
+- a lane whose job failed names, in one issue, every expected leg with no usable result, however
+  many other legs recorded failures; a green lane closes that issue;
+- on a partial re-run, results from earlier attempts are weighed by attempt: an earlier pass
+  covers its leg and closes only when the lane is green, an earlier failure is stale.
+
+The leg files were written by jobs that ran npm-installed upstream code and pytest, so they are
+untrusted. Every field is validated before it can reach an issue title, a file counts only for
+the leg whose artifact directory holds it, and `gh` is only ever called with an argument list.
+The `recorded_at` time comes from the leg too, but because a result is bound to its own leg, a
+lying leg can only affect its own issues. A refused file is reported as an `::error::` and its
+leg treated as missing; it never blocks the valid legs or the upstream watch, and the job exits
+non-zero at the end. Standard library only: the report job never installs the project.
 """
 
 from __future__ import annotations
