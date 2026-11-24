@@ -23,7 +23,6 @@ treats them as untrusted: every field is validated before it can reach an issue 
 
 from __future__ import annotations
 
-import gc
 import json
 import pathlib
 import sys
@@ -561,20 +560,16 @@ def test_a_result_too_deep_to_decode_is_rejected_not_fatal(
     assert "canary-result-head-1.7.1" in capsys.readouterr().err
 
 
+@pytest.mark.reaches_recursion_limit
 def test_a_real_deeply_nested_result_is_rejected_on_every_interpreter(
     script: Report, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The real payload, undoctored. Garbage is collected first and the collector paused for the
-    parse, so no finalizer can run near the recursion limit and fail the test by timing."""
+    """The real payload, undoctored. The marker pauses the collector for the parse, so no
+    finalizer can run near the recursion limit and fail the test by timing."""
     deep = "[" * 2000 + "]" * 2000
-    gc.collect()
-    gc.disable()
-    try:
-        code, gh = plant_and_report(
-            script, tmp_path, lambda leg: (leg / "canary-result.json").write_text(deep, "utf-8")
-        )
-    finally:
-        gc.enable()
+    code, gh = plant_and_report(
+        script, tmp_path, lambda leg: (leg / "canary-result.json").write_text(deep, "utf-8")
+    )
 
     assert code == 1
     assert sorted(numbers(gh.of("close"))) == ["7", "96"]

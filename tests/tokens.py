@@ -34,6 +34,8 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from jwt.algorithms import ECAlgorithm, RSAAlgorithm
 
+from tests.recursion_limit import collector_paused
+
 VECTOR_PATH = pathlib.Path(__file__).parent / "vectors" / "jwt_v1.json"
 VECTOR: dict[str, Any] = json.loads(VECTOR_PATH.read_text(encoding="utf-8"))
 
@@ -254,11 +256,15 @@ def defeats_the_json_parser(document: bytes) -> bool:
     interpreters and parses cleanly on others, because the ceiling is `sys.getrecursionlimit()`
     up to 3.11, a compile-time constant on 3.12/3.13 and stack headroom on 3.14+. A test that
     asserts the overflow therefore has to know which one it is running on.
+
+    It runs while test modules are imported, outside any test, so it pauses the collector
+    itself rather than relying on the `reaches_recursion_limit` marker.
     """
-    try:
-        json.loads(document)
-    except RecursionError:
-        return True
+    with collector_paused():
+        try:
+            json.loads(document)
+        except RecursionError:
+            return True
     return False
 
 

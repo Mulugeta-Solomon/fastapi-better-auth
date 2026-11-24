@@ -277,6 +277,7 @@ def test_the_nesting_probe_is_the_deepest_the_cap_admits() -> None:
     assert len(nested_arrays(DEEP_DOCUMENT_DEPTH + 1)) > MAX_JWKS_BYTES
 
 
+@pytest.mark.reaches_recursion_limit
 @pytest.mark.skipif(not DOCUMENT_OVERFLOWS, reason=OUT_OF_REACH)
 def test_the_nesting_probe_really_defeats_this_interpreters_json_parser() -> None:
     """Platform evidence: here the cap admits a body this scanner cannot finish reading.
@@ -287,6 +288,7 @@ def test_the_nesting_probe_really_defeats_this_interpreters_json_parser() -> Non
 
 
 @pytest.mark.anyio
+@pytest.mark.reaches_recursion_limit
 async def test_a_key_set_nested_as_deep_as_the_cap_allows_is_unusable() -> None:
     """The deepest body the cap admits, end to end. Where the probe overflows this
     interpreter, this is the escape route walked for real; where it does not, the scanner
