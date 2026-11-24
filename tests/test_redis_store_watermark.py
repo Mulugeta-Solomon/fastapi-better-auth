@@ -24,6 +24,7 @@ from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 from fastapi_better_auth import RedisSessionStore
+from fastapi_better_auth._internal.reasons import REDACTED
 from tests.stores import NOW, TOKEN, USER_ID, DecodingRedis, RecordingRedis, stored, wire_session
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -238,6 +239,21 @@ class TestAWatermarkItCannotRead:
         assert written
         assert TOKEN not in written
         assert USER_ID not in written
+
+    @pytest.mark.anyio
+    async def test_the_warning_says_it_was_the_watermark(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The line an operator acts on. Its kind goes through `safe_label`, so a kind the label
+        pattern refuses would render as `<redacted>` and name nothing."""
+        store, _client = store_over(with_watermark("soon"))
+
+        with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER):
+            await store.fetch_session_by_token(TOKEN)
+
+        (line,) = [entry.getMessage() for entry in caplog.records]
+        assert line.startswith("stored watermark is unusable (")
+        assert REDACTED not in line
 
 
 class TestACreatedAtItCannotRead:
