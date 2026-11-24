@@ -44,8 +44,8 @@ One more line at `WARNING`, and the frequency of two lines named above:
 - **Mode C readiness probe answered a temporary status** (`408`, `425`, `429` or any `5xx`). Once
   per `RemoteVerifier`, naming the status and its class and never the body. Every request is
   refused as `AuthServiceUnavailable` until a probe passes.
-- **Mode B key that will not load.** One line per skipped key, naming its `kid`. The rest of the
-  key set is still used. See [Mode B](mode-b-jwt.md#when-the-key-set-cannot-be-fetched).
+- **Mode B key that will not load.** One line per skipped key each time the key set is fetched,
+  naming its `kid`. The rest of the key set is still used. See [Mode B](mode-b-jwt.md#when-the-key-set-cannot-be-fetched).
 - **Mode B key-set refresh failed** while the set on hand was still within `max_stale`: one line
   per failed refresh, which happens at most once per 10 seconds.
 

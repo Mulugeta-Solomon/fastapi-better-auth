@@ -38,8 +38,8 @@ a rung of the probe: a `set-cookie` is a `ConfigurationError` naming
 `FastAPI(lifespan=auth.lifespan)` never starts. It is remembered like every other contract failure —
 a deployment that skipped the lifespan and probes lazily refuses every request instead. Its own
 reachability failure is *not* a verdict, and neither is a `408`, `425`, `429` or `5xx` answer that
-sets no cookie: each stays the transient `AuthServiceUnavailable` the unreachable-at-boot path
-already handles, and is retried rather than remembered. A `set-cookie` is the verdict whatever
+sets no cookie: each is a temporary failure, the `AuthServiceUnavailable` the unreachable-at-boot
+path already handles, and is retried rather than remembered. A `set-cookie` is the verdict whatever
 status comes with it. The flag is
 opt-in because the posture is your server's to set, and off is the current behaviour exactly.
 

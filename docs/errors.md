@@ -26,8 +26,10 @@ Two more exceptions are not refusals of this kind:
   See [A refusal that explains](authorization.md#a-refusal-that-explains).
 - **`ConfigurationError`** (a `BetterAuthError`) is a configuration fault, not an answer to a
   client. It is raised while the application is built, so a deployment that cannot verify safely
-  does not start. Two cases reach a request: a bare factory planted in `app.dependency_overrides`,
-  and a Mode C readiness probe that found a contract failure while running lazily.
+  does not start. Some cases can only be found at request time, for example a bare factory planted
+  in `app.dependency_overrides`, a Mode C readiness probe that found a contract failure while
+  running lazily, or a SQL store that reads a broken schema on its first lookup because
+  `connect()` was not called.
 
 ## Why the 401s are identical
 

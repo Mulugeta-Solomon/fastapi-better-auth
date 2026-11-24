@@ -18,8 +18,9 @@ you change a dependency, run `uv lock` and commit `uv.lock` with the change.
 
 ## The checks
 
-Run all of these before you open a pull request. CI runs them on every pull request and every push
-to `main`.
+Run all of these before you open a pull request. CI runs the same lint, format, type, test and
+build checks on every pull request and every push to `main`; it installs with `uv sync`, without
+`--locked`.
 
 ```bash
 uv sync --locked
@@ -74,9 +75,6 @@ describes each server.
 - **Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):**
   `<type>: <description>`, where the type is one of `feat`, `fix`, `refactor`, `docs`, `test`,
   `chore`, `perf` or `ci`.
-- **Document what you change.** A change a user can see gets a line under "Unreleased" in
-  [CHANGELOG.md](CHANGELOG.md), with an upgrade note if users must change something, and an update
-  to the page in `docs/` that describes it.
 - **Security problems** are reported privately; see [SECURITY.md](SECURITY.md).
 
 ## How a release happens
@@ -84,9 +82,8 @@ describes each server.
 The maintainer releases. The steps:
 
 1. A release pull request sets the new version in both `pyproject.toml` (`version`) and
-   `src/fastapi_better_auth/__init__.py` (`__version__`), updates `uv.lock`, and moves the
-   "Unreleased" entries in `CHANGELOG.md` under the new version. A unit test fails if
-   `__version__` and the installed package version differ.
+   `src/fastapi_better_auth/__init__.py` (`__version__`), and updates the package's own entry in
+   `uv.lock`. A unit test fails if `__version__` and the installed package version differ.
 2. After it is merged, the maintainer publishes a GitHub release with the tag `vX.Y.Z` on the merge
    commit.
 3. Publishing the release runs `.github/workflows/release.yml`. It builds with

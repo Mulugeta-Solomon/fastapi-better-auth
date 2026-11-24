@@ -22,16 +22,15 @@ not verify is always refused, with one uniform answer, whatever the reason.
 | **Reads** | the session cookie | `Authorization: Bearer <JWT>` | the session cookie |
 | **Needs** | the Better Auth secret, and read access to its session store (SQL database or Redis) | the JWT plugin on the Better Auth server | network access to the Better Auth server |
 | **Trusts** | the cookie signature, then the stored session | the token signature, against the server's published keys | the server's `get-session` answer |
-| **Sign-out** | seen on the next request | not seen until the token expires | seen on the next request |
+| **Sign-out** | the very next request is `401` | invisible until the token expires | the very next request is `401` |
 | **Auth server down** | keeps working; it never calls the server | keeps working from cached keys, for at most one day by default | refuses every request |
 | **Cost per request** | one store read | none | one call to the auth server, unless refused locally first |
 | **CSRF policy** | required | not needed | required |
+| **Pick it when** | FastAPI can read the database or Redis that Better Auth writes sessions to | FastAPI must keep working while the auth server is down, and a sign-out may take up to the token lifetime to apply | FastAPI can only reach the Better Auth server over the network |
 
-**Which mode.** If FastAPI can read the database or Redis that Better Auth writes sessions to, use
-Mode A. If it can only reach the Better Auth server over the network, use Mode C. If it must keep
-working while the auth server is down, and a sign-out may take up to the token lifetime to apply,
-use Mode B. Mode B can be combined with Mode A or Mode C; each request is checked by the verifier
-whose credential it carries. The full comparison is in
+**Which mode.** Start from the last row. Mode B can be combined with Mode A or Mode C; each request
+is checked by the verifier whose credential it carries. Mode A and Mode C read the same cookie, so
+they cannot be combined. The full comparison is in
 [Choosing a mode](https://github.com/Mulugeta-Solomon/fastapi-better-auth/blob/main/docs/choosing-a-mode.md).
 
 ## Install
@@ -151,7 +150,7 @@ auth = BetterAuth(
 )
 CurrentSession = Annotated[Session[User], Depends(auth.current_session())]
 
-# In production, add lifespan=auth.lifespan so the startup probe runs before traffic.
+# In production, add lifespan=auth.lifespan so the readiness probe runs before traffic.
 app = FastAPI()
 
 
