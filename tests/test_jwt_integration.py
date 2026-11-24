@@ -175,6 +175,7 @@ def test_a_token_the_json_parser_gives_up_on_logs_no_traceback(
     assert transport.calls == 0
 
 
+@pytest.mark.reaches_recursion_limit
 def test_a_token_nested_as_deep_as_the_cap_allows_logs_no_traceback(
     client_backend: str, caplog: pytest.LogCaptureFixture
 ) -> None:

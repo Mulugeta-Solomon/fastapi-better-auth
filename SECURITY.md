@@ -71,8 +71,8 @@ a `crit` header at all, because Better Auth never emits one and no extension is 
 - **A planted same-name cookie can sign a signed-out victim in as the attacker, and CSRF does not
   stop it.** CSRF is required in cookie mode: `OriginCheck` and `SignedDoubleSubmit` check every
   unsafe method and WebSocket handshake on a request that reaches a cookie verifier — a route that
-  depends on a session dependency, carrying that verifier's cookie (README, *Where the CSRF check
-  runs*). A route that changes state on a `GET`, or one no verifier runs for, is outside that
+  depends on a session dependency, carrying that verifier's cookie
+  ([docs/csrf.md](docs/csrf.md#where-the-csrf-check-runs)). A route that changes state on a `GET`, or one no verifier runs for, is outside that
   check. And the check does not help against this attack. A sibling that plants the attacker's own
   signed session under the name this side reads makes a signed-out victim's browser present it, so
   the victim's writes through your real front end arrive from an allowed `Origin`, verify, and land
@@ -103,8 +103,8 @@ a `crit` header at all, because Better Auth never emits one and no extension is 
   identical construction from the Node side's own startup —
   `"tok_fp=" + createHash("sha256").update(secret, "utf8").digest("hex").slice(0, 8)`. Two different
   strings in two boot logs is the whole check, and the fingerprint — eight hex characters of a
-  SHA-256 — is the only form of the secret that may be written down anywhere. README.md carries the
-  two-sided recipe.
+  SHA-256 — is the only form of the secret that may be written down anywhere.
+  [docs/shared-secret.md](docs/shared-secret.md) carries the two-sided recipe.
 - **Bans are enforced locally and fail closed.** A stored `banned` value that is not `true`,
   `false` or absent is treated as banned; a store that hands the verifier a malformed record is a
   refusal, never an exception.
@@ -132,7 +132,15 @@ a `crit` header at all, because Better Auth never emits one and no extension is 
   plugin's hook overwrites the outgoing session cookie with whatever `Authorization` it sees, so a
   bridge that forwarded it would let a client turn any victim's cookie into a `200 null` (a targeted
   denial of service) or authenticate a raw token this side never extracted, never CSRF-checked and
-  never pre-filtered. An auth server that cannot be reached is a `401`, never a pass.
+  never pre-filtered. An auth server that cannot be reached is a `401`, never a pass. The cookie
+  value itself is forwarded only if every byte is an RFC 6265 cookie-octet, so a client cannot put
+  CR, LF, a comma or any other byte of its choosing into the outbound header; anything else is
+  refused like a malformed cookie, with no upstream call.
+- **Mode B stops trusting a key set it cannot refresh.** When refreshing the JWKS fails,
+  `JwtVerifier` keeps using the keys it has for at most `max_stale` seconds (one day by default)
+  after the last successful fetch, then refuses every token until a refresh succeeds. A key the
+  auth server withdrew therefore stops verifying here within that bound. There is no setting that
+  removes the bound.
 - **Traceback hygiene.** Every frame of this library that holds a raw credential drops it before a
   refusal propagates, so an error reporter that captures frame locals finds nothing. If you write
   your own `Verifier`, `SessionStore` or `CsrfPolicy`, the frames you own are yours to scrub the
@@ -173,8 +181,11 @@ carry into production without noticing.
   library that could raise it would be a library that could disable your rate limiting. The fix is
   upstream configuration — exempt or raise the rule for `/get-session` (exempting removes the limit
   for every caller of that route, browsers included, not only this bridge), or run Mode A or Mode B,
-  which make no upstream call per request. README.md carries the exact config and the source
-  citations. Note also that upstream answers a refusal with `X-Retry-After`, not `Retry-After`;
+  which make no upstream call per request. Configure `RemoteVerifier`'s `secret=` as well: without
+  it, every well-formed cookie is forwarded, and a client that sends a new forged value on each
+  request spends one call of that shared bucket per request; with it, only correctly signed
+  cookies are forwarded. [docs/mode-c-remote.md](docs/mode-c-remote.md#the-shared-rate-limit-bucket)
+  carries the exact config and the source citations. Note also that upstream answers a refusal with `X-Retry-After`, not `Retry-After`;
   a monitor watching for the standard header will not see these.
 
 ## Maintainer inactivity policy

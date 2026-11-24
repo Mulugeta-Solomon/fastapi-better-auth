@@ -7,9 +7,33 @@ of our supported surface untested.
 
 from __future__ import annotations
 
+from collections.abc import Generator
+
 import pytest
 
+from tests.recursion_limit import REACHES_RECURSION_LIMIT, collector_paused
+
 ANYIO_BACKENDS = ("asyncio", "trio")
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        f"{REACHES_RECURSION_LIMIT}: the test drives the interpreter to its recursion limit;"
+        " automatic garbage collection is paused for it (tests/recursion_limit.py)",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _collector_paused_at_the_recursion_limit(
+    request: pytest.FixtureRequest,
+) -> Generator[None, None, None]:
+    """Applies `collector_paused()` to every test marked `reaches_recursion_limit`."""
+    if request.node.get_closest_marker(REACHES_RECURSION_LIMIT) is None:
+        yield
+        return
+    with collector_paused():
+        yield
 
 
 @pytest.fixture(params=ANYIO_BACKENDS)

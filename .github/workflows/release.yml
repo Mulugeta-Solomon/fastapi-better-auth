@@ -3,19 +3,62 @@ name: release
 on:
   release:
     types: [published]
+  # A rehearsal: runs on-main, the full test workflow and build for the dispatched commit, and
+  # never publishes. PR CI never executes this file and v* tags are immutable, so this is how a
+  # workflow bug is found before it burns a tag and a version number. A dispatch from a branch
+  # other than main fails on-main, which rehearses that guard too.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  on-main:
+    # A release can be cut from any tag, including one on an unmerged branch. Only a commit
+    # that is already on main may reach PyPI. On a dispatch it checks the dispatched commit.
+    name: tagged commit is on main
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          # Full history of every branch, so origin/main is present locally: the checkout keeps
+          # no credentials, so nothing can be fetched after this step.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Guard — the tagged commit must be an ancestor of origin/main
+        run: |
+          git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null \
+            || { echo "::error::origin/main was not fetched; refusing to release"; exit 1; }
+          if git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "$GITHUB_SHA is on main"
+          else
+            echo "::error::$GITHUB_SHA ($GITHUB_REF_NAME) is not on main; refusing to release"
+            exit 1
+          fi
+
+  tests:
+    # The whole test workflow - every unit lane, pyright, the floors lane and the e2e
+    # conformance lane against the harness - for this exact commit, in this run.
+    name: full test workflow
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
+  build:
+    needs: [on-main, tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: pyproject.toml
       - name: Build distributions
         run: uv build --no-sources
       - name: Guard — git tag must equal the built wheel's version
+        # A dispatch has no tag to compare; every other guard runs on both events.
+        if: github.event_name != 'workflow_dispatch'
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           WHEEL=$(ls dist/*.whl)
@@ -25,21 +68,25 @@ jobs:
           esac
       - name: Guard — wheel must ship py.typed
         run: unzip -l dist/fastapi_better_auth_bridge-*.whl | grep -q "fastapi_better_auth/py.typed"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
           path: dist/
 
   publish:
-    needs: build
+    # Only a published release reaches PyPI; a dispatch stops after build. The needs are listed
+    # in full so the gate does not rest on build's own needs alone.
+    if: github.event_name == 'release'
+    needs: [on-main, tests, build]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      # Mandatory for PyPI Trusted Publishing (OIDC). No token is configured anywhere.
+      # Mandatory for PyPI Trusted Publishing (OIDC). No token is configured anywhere. This is
+      # the only job that can mint it, and it checks nothing out and runs no project code.
       id-token: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

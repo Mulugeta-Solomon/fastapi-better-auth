@@ -9,10 +9,31 @@ import urllib.parse
 import httpx
 import pytest
 
-HARNESS_URL = os.environ.get("HARNESS_URL", "http://localhost:3100")
-REDIS_HARNESS_URL = os.environ.get("REDIS_HARNESS_URL", "http://localhost:3101")
-STRICT_HARNESS_URL = os.environ.get("STRICT_HARNESS_URL", "http://localhost:3102")
-THROTTLED_HARNESS_URL = os.environ.get("THROTTLED_HARNESS_URL", "http://localhost:3103")
+
+def harness_port(variable: str, default: str) -> str:
+    """A host port from its HARNESS_*_PORT variable, unset or empty meaning the default.
+
+    This is what Compose's `${VAR:-default}` does in harness/docker-compose.yml, so the fixtures
+    and the published ports agree whether the variable is absent or set to nothing.
+    """
+    return os.environ.get(variable, "").strip() or default
+
+
+# Host ports follow harness/docker-compose.yml: one HARNESS_*_PORT variable moves both the
+# published port and these defaults; a full URL variable still overrides everything.
+AUTH_PORT = harness_port("HARNESS_AUTH_PORT", "3100")
+AUTH_REDIS_PORT = harness_port("HARNESS_AUTH_REDIS_PORT", "3101")
+AUTH_STRICT_PORT = harness_port("HARNESS_AUTH_STRICT_PORT", "3102")
+AUTH_THROTTLED_PORT = harness_port("HARNESS_AUTH_THROTTLED_PORT", "3103")
+POSTGRES_PORT = harness_port("HARNESS_POSTGRES_PORT", "15432")
+REDIS_PORT = harness_port("HARNESS_REDIS_PORT", "16379")
+
+HARNESS_URL = os.environ.get("HARNESS_URL", f"http://localhost:{AUTH_PORT}")
+REDIS_HARNESS_URL = os.environ.get("REDIS_HARNESS_URL", f"http://localhost:{AUTH_REDIS_PORT}")
+STRICT_HARNESS_URL = os.environ.get("STRICT_HARNESS_URL", f"http://localhost:{AUTH_STRICT_PORT}")
+THROTTLED_HARNESS_URL = os.environ.get(
+    "THROTTLED_HARNESS_URL", f"http://localhost:{AUTH_THROTTLED_PORT}"
+)
 HARNESS_SECRET = os.environ.get("HARNESS_SECRET", "harness-secret-do-not-use-in-production")
 SEED_EMAIL = os.environ.get("SEED_EMAIL", "seed@example.com")
 SEED_PASSWORD = os.environ.get("SEED_PASSWORD", "seed-password-123")
@@ -20,9 +41,10 @@ ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@example.com")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin-password-123")
 
 POSTGRES_URL = os.environ.get(
-    "HARNESS_POSTGRES_URL", "postgresql+asyncpg://harness:harness@localhost:55432/harness"
+    "HARNESS_POSTGRES_URL",
+    f"postgresql+asyncpg://harness:harness@localhost:{POSTGRES_PORT}/harness",
 )
-REDIS_URL = os.environ.get("HARNESS_REDIS_URL", "redis://localhost:56379/0")
+REDIS_URL = os.environ.get("HARNESS_REDIS_URL", f"redis://localhost:{REDIS_PORT}/0")
 
 SESSION_COOKIE = "better-auth.session_token"
 PASSWORD = "conformance-password-123"

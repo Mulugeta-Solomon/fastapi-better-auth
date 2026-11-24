@@ -119,6 +119,7 @@ def test_the_nesting_probes_are_the_deepest_the_cap_admits() -> None:
     assert len(DEEP_PAYLOAD_TOKEN(DEEP_PAYLOAD_DEPTH + 1)) > MAX_TOKEN_BYTES
 
 
+@pytest.mark.reaches_recursion_limit
 @pytest.mark.skipif(not HEADER_OVERFLOWS, reason=out_of_reach("header", DEEP_HEADER_DEPTH))
 def test_the_header_nesting_probe_really_defeats_this_interpreters_json_parser() -> None:
     """Platform evidence: here the cap admits a header this scanner cannot finish reading.
@@ -138,6 +139,7 @@ def test_the_header_nesting_probe_really_defeats_this_interpreters_json_parser()
     assert isinstance(refused_by_pyjwt.value.__cause__, RecursionError)
 
 
+@pytest.mark.reaches_recursion_limit
 @pytest.mark.skipif(not PAYLOAD_OVERFLOWS, reason=out_of_reach("payload", DEEP_PAYLOAD_DEPTH))
 def test_the_payload_nesting_probe_really_defeats_this_interpreters_json_parser() -> None:
     with pytest.raises(RecursionError):
@@ -145,6 +147,7 @@ def test_the_payload_nesting_probe_really_defeats_this_interpreters_json_parser(
 
 
 @pytest.mark.anyio
+@pytest.mark.reaches_recursion_limit
 async def test_a_header_nested_as_deep_as_the_cap_allows_is_refused_without_a_fetch() -> None:
     """The deepest header an unauthenticated client can send, end to end.
 
@@ -161,6 +164,7 @@ async def test_a_header_nested_as_deep_as_the_cap_allows_is_refused_without_a_fe
 
 
 @pytest.mark.anyio
+@pytest.mark.reaches_recursion_limit
 async def test_a_payload_nested_as_deep_as_the_cap_allows_is_refused() -> None:
     """The decode half. A payload is parsed only after the signature has verified, so this
     probe is signed by a key the key set really publishes: defence in depth rather than an

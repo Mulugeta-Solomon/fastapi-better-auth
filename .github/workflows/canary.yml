@@ -9,14 +9,26 @@ on:
     - cron: "37 18 * * *"
   workflow_dispatch:
 
+# One canary run at a time, so two reports never interleave: neither can file a title the
+# other is filing, nor close what the other just filed. A run in progress is never cancelled
+# (a cancelled run reports nothing). GitHub keeps one pending run per group, so a third run
+# queued behind a pending second replaces it; that is fine, since a cancelled run reports
+# nothing and the newer run sweeps the same matrix.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Read-only everywhere. The legs build images that `npm install` upstream Better Auth and run
+# pytest, so none of them holds a write token; only the `report` job at the end can write
+# issues, and it runs nothing but the reporter script.
 permissions:
   contents: read
-  issues: write
 
 jobs:
   upstream-check:
     # Only the daily watch narrows the sweep. The weekly cron and manual dispatch skip this
     # job, and a failure here widens the sweep rather than cancelling it - see the gates below.
+    # The report job files an issue when this job fails.
     name: upstream release watch
     if: github.event_name == 'schedule' && github.event.schedule == '37 18 * * *'
     runs-on: ubuntu-latest
@@ -25,22 +37,11 @@ jobs:
       latest: ${{ steps.watch.outputs.latest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Did better-auth publish a release in the last 26 hours?
         id: watch
         run: python3 .github/scripts/upstream_release_watch.py --window-hours 26
-      - name: Open issue on failure
-        if: failure()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          TITLE="canary: upstream release watch cannot read the npm registry"
-          BODY="The daily watch could not decide whether better-auth published a release. Today's sweep ran anyway - the gates fail open - so this is not a missed canary, but the watch is no longer narrowing anything and every daily tick will now run the full matrix until it is fixed. Run: ${RUN_URL}"
-          gh label create canary --color D93F0B --description "automated conformance canary" 2>/dev/null || true
-          EXISTING=$(gh issue list --state open --label canary --limit 100 --json title --jq ".[].title" | grep -Fx "$TITLE" || true)
-          if [ -z "$EXISTING" ]; then
-            gh issue create --title "$TITLE" --label canary --body "$BODY"
-          fi
 
   conformance:
     name: HEAD vs better-auth@${{ matrix.version }}
@@ -56,39 +57,56 @@ jobs:
         version: ["1.6.30", "1.7.1", "1.7.5", "1.7.6", "latest"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: pyproject.toml
       - name: Start harness (better-auth@${{ matrix.version }})
-        run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled up --build -d --wait
+        env:
+          BETTER_AUTH_VERSION: ${{ matrix.version }}
+        run: docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled up --build -d --wait
       - name: Echo the better-auth version the harness runs
         id: echo
         env:
           MATRIX_VERSION: ${{ matrix.version }}
         run: python3 .github/scripts/harness_better_auth_version.py --expected "$MATRIX_VERSION"
       - name: Sync (dev group)
-        run: uv sync
+        run: uv sync --locked
       - name: Conformance lane
+        id: conformance
         run: uv run pytest -m e2e -q
       - name: Harness logs
         if: failure()
         run: docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled logs
-      # Only main files issues: a branch dispatch's failures are its dispatcher's to read.
-      - name: Open issue on failure
-        if: (failure() || cancelled()) && github.ref == 'refs/heads/main'
+      # passed / conformance failed (pytest ran and failed) / could not run (an earlier step
+      # failed and pytest was skipped), with the run attempt and the UTC time it was recorded.
+      # A cancelled leg records nothing and so files nothing.
+      - name: Record this leg's verdict
+        if: ${{ !cancelled() }}
         env:
-          GH_TOKEN: ${{ github.token }}
           MATRIX_VERSION: ${{ matrix.version }}
           HARNESS_VERSION: ${{ steps.echo.outputs.version }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          TARGET="better-auth@${MATRIX_VERSION}"
-          if [ "$MATRIX_VERSION" = "latest" ]; then TARGET="${TARGET} (${HARNESS_VERSION:-unresolved})"; fi
-          TITLE="canary: conformance failure against ${TARGET}"
-          BODY="The HEAD conformance leg against ${TARGET} failed or was cancelled; its harness servers ran better-auth ${HARNESS_VERSION:-(unread - see the version echo step)}. Run: ${RUN_URL}"
-          gh label create canary --color D93F0B --description "automated conformance canary" 2>/dev/null || true
-          EXISTING=$(gh issue list --state open --label canary --limit 100 --json title --jq ".[].title" | grep -Fx "$TITLE" || true)
-          if [ -z "$EXISTING" ]; then
-            gh issue create --title "$TITLE" --label canary --body "$BODY"
-          fi
+          CONFORMANCE_OUTCOME: ${{ steps.conformance.outcome }}
+        run: >-
+          python3 .github/scripts/canary_report.py record --lane head
+          --matrix-version "$MATRIX_VERSION" --harness-version "$HARNESS_VERSION"
+          --conformance-outcome "$CONFORMANCE_OUTCOME" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          --out canary-result/canary-result.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: canary-result-head-${{ matrix.version }}
+          path: canary-result/canary-result.json
+          # Nothing to upload only when the conformance step itself was cancelled; a leg that
+          # failed without a result is still caught: the report job names every expected leg
+          # with no usable result when the lane's job failed.
+          if-no-files-found: ignore
+          retention-days: 7
+          # A re-run of this leg replaces its earlier verdict rather than failing on the name.
+          # A leg that passed is not re-run by "Re-run failed jobs" and keeps its earlier
+          # attempt's verdict; the result records its attempt so the reporter can tell.
+          overwrite: true
 
   published-wheel:
     # The wheel users actually install, from the index, against the same harness matrix.
@@ -109,9 +127,15 @@ jobs:
       WHEEL_VENV: .venv-published-wheel
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: pyproject.toml
       - name: Start harness (better-auth@${{ matrix.version }})
-        run: BETTER_AUTH_VERSION=${{ matrix.version }} docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled up --build -d --wait
+        env:
+          BETTER_AUTH_VERSION: ${{ matrix.version }}
+        run: docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled up --build -d --wait
       - name: Echo the better-auth version the harness runs
         id: echo
         env:
@@ -139,28 +163,69 @@ jobs:
       - name: Harness logs
         if: failure()
         run: docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled logs
-      - name: Open issue on failure
-        if: (failure() || cancelled()) && github.ref == 'refs/heads/main'
+      # Recorded with the runner's python3, never the wheel venv or `uv run`: the reporter is
+      # standard-library only, so recording installs nothing from the checkout.
+      - name: Record this leg's verdict
+        if: ${{ !cancelled() }}
         env:
-          GH_TOKEN: ${{ github.token }}
           MATRIX_VERSION: ${{ matrix.version }}
           HARNESS_VERSION: ${{ steps.echo.outputs.version }}
-          WHEEL_VERSION: ${{ steps.guard.outputs.version || 'unknown' }}
+          WHEEL_VERSION: ${{ steps.guard.outputs.version }}
           CONFORMANCE_OUTCOME: ${{ steps.conformance.outcome }}
+        run: >-
+          python3 .github/scripts/canary_report.py record --lane wheel
+          --matrix-version "$MATRIX_VERSION" --harness-version "$HARNESS_VERSION"
+          --wheel-version "$WHEEL_VERSION" --conformance-outcome "$CONFORMANCE_OUTCOME"
+          --run-attempt "$GITHUB_RUN_ATTEMPT" --out canary-result/canary-result.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: canary-result-wheel-${{ matrix.version }}
+          path: canary-result/canary-result.json
+          if-no-files-found: ignore
+          retention-days: 7
+          # A re-run of this leg replaces its earlier verdict rather than failing on the name.
+          # A leg that passed is not re-run by "Re-run failed jobs" and keeps its earlier
+          # attempt's verdict; the result records its attempt so the reporter can tell.
+          overwrite: true
+
+  report:
+    # The only job that can write issues. It reads the legs' verdicts and the upstream watch's
+    # result and files, comments on, or closes issues - nothing else. A pass closes only issues
+    # nothing has updated since it was recorded; a refused verdict, or a green lane missing an
+    # expected leg, is an ::error:: that fails this job without blocking the others. Only main
+    # files issues: a branch dispatch's failures are its dispatcher's to read. A cancelled run
+    # reports nothing. On a re-run, a failed lane warns (no issue) about legs covered only by
+    # an earlier attempt's pass.
+    name: file or close canary issues
+    needs: [upstream-check, conformance, published-wheel]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: canary-result-*
+          path: canary-results
+      - name: File, comment on, or close canary issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          TARGET="better-auth@${MATRIX_VERSION}"
-          if [ "$MATRIX_VERSION" = "latest" ]; then TARGET="${TARGET} (${HARNESS_VERSION:-unresolved})"; fi
-          RAN="its harness servers ran better-auth ${HARNESS_VERSION:-(unread - see the version echo step)}"
-          if [ "$CONFORMANCE_OUTCOME" = "failure" ]; then
-            TITLE="canary: published wheel ${WHEEL_VERSION} fails conformance against ${TARGET}"
-            BODY="fastapi-better-auth-bridge ${WHEEL_VERSION}, installed from PyPI, failed the e2e conformance lane against ${TARGET}; ${RAN}. This is the artifact users have, not HEAD. Run: ${RUN_URL}"
-          else
-            TITLE="canary: published-wheel lane cannot run against ${TARGET}"
-            BODY="The published-wheel lane failed before it tested anything - harness startup, the better-auth version echo, the PyPI install, or the instrument-liveness guard; ${RAN}. Until this is fixed the lane proves nothing about the shipped wheel. Run: ${RUN_URL}"
-          fi
-          gh label create canary --color D93F0B --description "automated conformance canary" 2>/dev/null || true
-          EXISTING=$(gh issue list --state open --label canary --limit 100 --json title --jq ".[].title" | grep -Fx "$TITLE" || true)
-          if [ -z "$EXISTING" ]; then
-            gh issue create --title "$TITLE" --label canary --body "$BODY"
-          fi
+          UPSTREAM_WATCH: ${{ needs.upstream-check.result }}
+          HEAD_JOB: ${{ needs.conformance.result }}
+          WHEEL_JOB: ${{ needs.published-wheel.result }}
+          # The same list as both matrices above (a guardrail test holds the three equal): a
+          # failed lane names every one of these that left no usable result.
+          EXPECTED_VERSIONS: '["1.6.30", "1.7.1", "1.7.5", "1.7.6", "latest"]'
+        run: >-
+          python3 .github/scripts/canary_report.py report --results-dir canary-results
+          --run-url "$RUN_URL" --upstream-watch "$UPSTREAM_WATCH"
+          --head-job "$HEAD_JOB" --wheel-job "$WHEEL_JOB"
+          --expected-versions "$EXPECTED_VERSIONS" --run-attempt "$GITHUB_RUN_ATTEMPT"
