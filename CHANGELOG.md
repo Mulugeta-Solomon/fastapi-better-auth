@@ -78,6 +78,13 @@ Merged on `main` since 0.6.0, not yet on PyPI.
 - Mode B: a key the auth server withdrew stops verifying within `max_stale`, even while the key set
   cannot be fetched. (PR #110)
 
+### Project
+
+- A release reaches PyPI only from a tag whose commit is on `main`, and only after the whole test
+  workflow, the live conformance lane included, has passed for that commit. (PR #108)
+- The conformance harness publishes its ports on `127.0.0.1` only, and each port can be moved with
+  a `HARNESS_*_PORT` variable. (PR #108)
+
 ### Documentation
 
 - The README is now a short front page. Everything else moved to `docs/`, one page per subject, and

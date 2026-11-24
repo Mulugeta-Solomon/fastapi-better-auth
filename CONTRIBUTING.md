@@ -19,8 +19,8 @@ you change a dependency, run `uv lock` and commit `uv.lock` with the change.
 ## The checks
 
 Run all of these before you open a pull request. CI runs the same lint, format, type, test and
-build checks on every pull request and every push to `main`; it installs with `uv sync`, without
-`--locked`.
+build checks on every pull request and every push to `main`, and it also installs with
+`uv sync --locked`.
 
 ```bash
 uv sync --locked
@@ -62,8 +62,11 @@ uv run pytest -m e2e -q
 docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled down -v
 ```
 
-The ports each service listens on are in `harness/docker-compose.yml`. The tests read the server
-URLs from `HARNESS_URL`, `REDIS_HARNESS_URL`, `STRICT_HARNESS_URL`, `THROTTLED_HARNESS_URL`,
+The host port of each service, and its default, is in `harness/docker-compose.yml`. Every port is
+published on `127.0.0.1` only. If a default port is taken on your machine, set the matching
+`HARNESS_*_PORT` variable (for example `HARNESS_POSTGRES_PORT`) before both commands: Compose and
+the tests read the same variables. The tests can also be pointed at other servers with
+`HARNESS_URL`, `REDIS_HARNESS_URL`, `STRICT_HARNESS_URL`, `THROTTLED_HARNESS_URL`,
 `HARNESS_POSTGRES_URL` and `HARNESS_REDIS_URL` (defaults in `tests/e2e/conftest.py`). Locally, a
 test whose profile is not running is skipped with a reason; in CI it fails. `harness/README.md`
 describes each server.
@@ -75,6 +78,16 @@ describes each server.
 - **Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):**
   `<type>: <description>`, where the type is one of `feat`, `fix`, `refactor`, `docs`, `test`,
   `chore`, `perf` or `ci`.
+- **A change a user can observe adds a line to [CHANGELOG.md](CHANGELOG.md)** under "Unreleased",
+  in the same pull request. If it changes what a user must do when upgrading, the line goes under
+  "Upgrade notes".
+- **A change in behaviour updates its `docs/` page in the same pull request.** The docs describe
+  the `main` branch.
+- **`main` is protected.** Every change arrives through a pull request, and nobody can push to
+  `main` directly. A pull request is merged with a merge commit (squash and rebase are switched
+  off), and only when the required checks pass: every unit lane on a released Python version,
+  `pyright`, the lowest-versions lane and the live conformance lane. If you rename or remove a CI
+  job, the list of required checks in the repository settings must change in the same sitting.
 - **Security problems** are reported privately; see [SECURITY.md](SECURITY.md).
 
 ## How a release happens
@@ -83,13 +96,19 @@ The maintainer releases. The steps:
 
 1. A release pull request sets the new version in both `pyproject.toml` (`version`) and
    `src/fastapi_better_auth/__init__.py` (`__version__`), and updates the package's own entry in
-   `uv.lock`. A unit test fails if `__version__` and the installed package version differ.
-2. After it is merged, the maintainer publishes a GitHub release with the tag `vX.Y.Z` on the merge
-   commit.
-3. Publishing the release runs `.github/workflows/release.yml`. It builds with
-   `uv build --no-sources`, refuses to continue if the tag does not equal the built wheel's version
-   or if the wheel does not ship `py.typed`, and uploads to PyPI with Trusted Publishing from the
-   `pypi` environment. No API token is stored anywhere.
-4. The weekly canary (`.github/workflows/canary.yml`) then also tests the wheel published on PyPI.
+   `uv.lock`. A unit test fails if `__version__` and the installed package version differ. The
+   same pull request renames the changelog's "Unreleased" section to the version and its date.
+2. After it is merged, the maintainer can rehearse the release: run the `release` workflow by hand
+   on `main` (Actions, "release", "Run workflow"). It does everything except publish. A tag and a
+   PyPI version can never be reused, so a workflow problem is better found here.
+3. The maintainer publishes a GitHub release with the tag `vX.Y.Z` on the merge commit. A `v*` tag
+   cannot be moved or deleted afterwards.
+4. Publishing the release runs `.github/workflows/release.yml`. It refuses a tag whose commit is
+   not on `main`, runs the whole test workflow for that commit (the live conformance lane
+   included), builds with `uv build --no-sources`, and refuses to continue if the tag does not
+   equal the built wheel's version or if the wheel does not ship `py.typed`. Only then does it
+   upload to PyPI, with Trusted Publishing from the `pypi` environment. No API token is stored
+   anywhere.
+5. The weekly canary (`.github/workflows/canary.yml`) then also tests the wheel published on PyPI.
    The "Last green on the published wheel" column of [COMPATIBILITY.md](COMPATIBILITY.md) is
    updated by hand from that run.

@@ -22,6 +22,8 @@ DOC_PAGES = tuple(sorted((ROOT / "docs").glob("*.md")))
 TOP_LEVEL = tuple(
     ROOT / name for name in ("CHANGELOG.md", "COMPATIBILITY.md", "CONTRIBUTING.md", "SECURITY.md")
 )
+ELSEWHERE = (ROOT / "harness" / "README.md",)
+"""Pages outside `docs/` that link into it, so a moved heading cannot leave them pointing nowhere."""
 
 REPOSITORY = "https://github.com/Mulugeta-Solomon/fastapi-better-auth/"
 IN_REPOSITORY = re.compile(re.escape(REPOSITORY) + r"(?:blob|tree)/main/([^#?]+)(?:#(.+))?")
@@ -116,7 +118,11 @@ def test_the_readme_links_into_this_repository_resolve() -> None:
     assert checked >= 10
 
 
-@pytest.mark.parametrize("page", DOC_PAGES + TOP_LEVEL, ids=lambda page: page.name)
+@pytest.mark.parametrize(
+    "page",
+    DOC_PAGES + TOP_LEVEL + ELSEWHERE,
+    ids=lambda page: page.relative_to(ROOT).as_posix(),
+)
 def test_relative_links_resolve(page: pathlib.Path) -> None:
     if not page.exists():
         pytest.fail(f"{page.name} is missing")
