@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import anyio
-from anyio.to_thread import run_sync
 
 from ..errors import ConfigurationError
 from .outage import OutageLatch, report_once
 from .records import StoredSession, StoredUser
+from .thread_handoff import run_in_worker
 
 if TYPE_CHECKING:
     from sqlalchemy import Connection, Engine, Select
@@ -306,9 +307,19 @@ class SyncStoreAdapter(_CoreStore):
     bound, a flood of concurrent (or cancelled) lookups would exhaust the connection pool and error
     a legitimate request with a checkout timeout. The adapter holds its own `anyio.CapacityLimiter`,
     sized to the engine's pool where it is introspectable (a `QueuePool`'s size plus overflow) so
-    the *limiter* is where excess lookups queue - cheap and cancellable - rather than the pool. A
-    cancelled lookup returns to the caller promptly, but the DBAPI call it started still runs to
-    completion on its worker thread and its connection returns to the pool only when it finishes.
+    the *limiter* is where excess lookups queue - cheap and cancellable - rather than the pool.
+
+    **The bound is on worker threads, for each thread's whole life**, on asyncio and trio alike.
+    A cancelled lookup (a client gone, `CookieVerifier`'s `lookup_timeout`) returns to its caller
+    at once, but a thread cannot be interrupted: the DBAPI call it started runs on, holding its
+    pooled connection, and the thread keeps its slot until that call ends. So while the database
+    is not answering, this adapter never holds more than `max_concurrency` threads and
+    connections; further lookups wait for a slot without starting a thread, and are refused at
+    their own deadline. Those slots come back only when the database answers or the driver gives
+    up, so give the database a reason to: a server-side statement timeout (Postgres
+    `statement_timeout`, MySQL `max_execution_time`) and a driver connect/read timeout end an
+    abandoned call, and an engine `pool_timeout` shorter than the request deadline turns a
+    checkout wait into an error rather than a hang.
 
     Args:
         engine: A synchronous `Engine`, injected. Its pool needs room for the worker threads
@@ -357,22 +368,17 @@ class SyncStoreAdapter(_CoreStore):
         self._limiter: anyio.CapacityLimiter | None = None
 
     async def _columns(self) -> Columns:
-        return await run_sync(self._inspected, abandon_on_cancel=True, limiter=self._get_limiter())
+        return await run_in_worker(self._get_limiter(), self._inspected)
 
     def _inspected(self) -> Columns:
         with self._engine.connect() as connection:
             return self._reflected(connection)
 
     async def _select(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
-        # abandon_on_cancel frees the async caller on cancellation; the DBAPI call keeps running on
-        # its worker thread and its connection returns to the pool only when it finishes. The
-        # limiter bounds concurrent threads (hence checked-out connections) to the adapter's own.
-        return await run_sync(
-            self._queried,
-            statement,
-            dict(params),
-            abandon_on_cancel=True,
-            limiter=self._get_limiter(),
+        # A cancellation frees the async caller at once; the DBAPI call keeps running on its worker
+        # thread, which keeps its limiter token (and so its connection) until it finishes.
+        return await run_in_worker(
+            self._get_limiter(), partial(self._queried, statement, dict(params))
         )
 
     def _get_limiter(self) -> anyio.CapacityLimiter:

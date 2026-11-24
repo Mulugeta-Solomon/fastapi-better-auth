@@ -11,6 +11,7 @@ import logging
 from typing import Any
 
 import anyio
+import pytest
 
 from fastapi_better_auth import (
     CookieVerifier,
@@ -18,6 +19,7 @@ from fastapi_better_auth import (
     SessionStore,
     StoredSession,
     StoredUser,
+    SyncStoreAdapter,
 )
 from tests.cookies import CAPTURED_TOKEN, COOKIE, SECRET, sign, stored_session, stored_user
 from tests.log_hygiene import LIBRARY_LOGGER
@@ -88,6 +90,32 @@ def verifier(store: SessionStore, **options: Any) -> CookieVerifier:
         secure_cookies=False,
         **options,
     )
+
+
+async def every_slot_returned(store: SyncStoreAdapter) -> None:
+    """Wait until every one of the adapter's slots is back, or fail the test saying so.
+
+    A slot is held for a worker thread's whole life, so all of them back means every thread has
+    ended: its DBAPI call returned, its rows were read and its connection went back to the pool.
+    Taking every slot is the proof, since a thread still running holds one and the acquire waits
+    for it. The probes are then released, so the adapter is left as found.
+    """
+    limiter = store._get_limiter()  # pyright: ignore[reportPrivateUsage]
+    probes = [object() for _ in range(int(limiter.total_tokens))]
+    try:
+        with anyio.fail_after(GUARD):
+            for probe in probes:
+                await limiter.acquire_on_behalf_of(probe)
+    except TimeoutError:
+        pytest.fail(
+            f"{limiter.borrowed_tokens} adapter slot(s) still held {GUARD}s after the database"
+            " was released: a worker thread did not end, or a slot leaked"
+        )
+    finally:
+        held = limiter.statistics().borrowers
+        for probe in probes:
+            if probe in held:
+                limiter.release_on_behalf_of(probe)
 
 
 def outage_lines(records: list[logging.LogRecord]) -> list[logging.LogRecord]:

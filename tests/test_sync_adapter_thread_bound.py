@@ -25,10 +25,12 @@ import pytest
 from sqlalchemy import Engine, QueuePool
 
 from fastapi_better_auth import AuthServiceUnavailable, SyncStoreAdapter
+from fastapi_better_auth._internal.stores import thread_handoff
+from fastapi_better_auth._internal.stores.thread_handoff import run_in_worker
 from tests.cookies import COOKIE, http, run, sign
-from tests.deadlines import DEADLINE, GUARD, OVERRUN_KIND, kinds, verifier
+from tests.deadlines import DEADLINE, GUARD, OVERRUN_KIND, every_slot_returned, kinds, verifier
 from tests.log_hygiene import capturing
-from tests.stores import TOKEN, StoreFixture
+from tests.stores import SESSION_ID, TOKEN, StoreFixture
 
 LIMIT = 2
 HUNG = LIMIT + 1
@@ -62,27 +64,6 @@ class ThreadGate:
                     self.inside -= 1
 
         monkeypatch.setattr(engine.dialect, "do_execute", do_execute)
-
-
-async def every_slot_returned(store: SyncStoreAdapter) -> None:
-    """Wait until every slot is back - which, with slots held for a thread's whole life, is every
-    worker thread having ended - or fail saying so. Taking all the slots is the proof: a thread
-    still running would hold one, and the acquire would wait for it."""
-    limiter = store._get_limiter()  # pyright: ignore[reportPrivateUsage]
-    probes = [object() for _ in range(int(limiter.total_tokens))]
-    try:
-        with anyio.fail_after(GUARD):
-            for probe in probes:
-                await limiter.acquire_on_behalf_of(probe)
-    except TimeoutError:
-        pytest.fail(
-            f"{limiter.borrowed_tokens} adapter slot(s) still held {GUARD}s after the database"
-            " answered: a worker thread did not end, or a slot leaked"
-        )
-    finally:
-        for probe in probes:
-            if probe in limiter.statistics().borrowers:
-                limiter.release_on_behalf_of(probe)
 
 
 @pytest.fixture
@@ -132,3 +113,113 @@ async def test_abandoned_lookups_never_run_more_threads_than_the_limit(
     assert isinstance(engine.pool, QueuePool)
     assert engine.pool.checkedout() <= LIMIT
     assert kinds(records) == [OVERRUN_KIND]
+
+
+@pytest.mark.anyio
+async def test_slots_come_back_when_the_database_answers_and_it_serves_again(
+    bounded: tuple[SyncStoreAdapter, ThreadGate, Engine],
+) -> None:
+    store, gate, engine = bounded
+    await abandoned(store, HUNG)
+
+    gate.release.set()
+    await every_slot_returned(store)
+
+    assert gate.inside == 0
+    assert isinstance(engine.pool, QueuePool)
+    assert engine.pool.checkedout() == 0
+    session = await run(verifier(store, lookup_timeout=GUARD), http(cookie=COOKIE_PAIR))
+    assert session is not None
+    assert session.id == SESSION_ID
+
+
+@pytest.mark.anyio
+async def test_a_lookup_cancelled_while_waiting_for_a_slot_starts_no_thread_and_leaks_none(
+    bounded: tuple[SyncStoreAdapter, ThreadGate, Engine],
+) -> None:
+    """With every slot held by a hung thread, a further lookup waits on the limiter itself, so a
+    cancellation there must leave no slot behind and no thread started."""
+    store, gate, _ = bounded
+    await abandoned(store, LIMIT)
+    limiter = store._get_limiter()  # pyright: ignore[reportPrivateUsage]
+    assert limiter.borrowed_tokens == LIMIT
+
+    with anyio.move_on_after(DEADLINE) as waiting:
+        await store.fetch_session_by_token(TOKEN)
+
+    assert waiting.cancelled_caught
+    assert limiter.borrowed_tokens == LIMIT
+    assert gate.peak == LIMIT
+    gate.release.set()
+    await every_slot_returned(store)
+
+
+@pytest.mark.anyio
+async def test_no_slot_leaks_across_many_hang_and_recover_cycles(
+    bounded: tuple[SyncStoreAdapter, ThreadGate, Engine],
+) -> None:
+    store, gate, engine = bounded
+
+    for _ in range(CYCLES):
+        gate.release.clear()
+        await abandoned(store, HUNG)
+        gate.release.set()
+        await every_slot_returned(store)
+
+    assert gate.peak == LIMIT
+    assert isinstance(engine.pool, QueuePool)
+    assert engine.pool.checkedout() == 0
+    session = await run(verifier(store, lookup_timeout=GUARD), http(cookie=COOKIE_PAIR))
+    assert session is not None
+
+
+# ---------------------------------------------------------------- the hand-off on its own
+
+
+@pytest.mark.anyio
+async def test_a_call_that_raises_gives_its_slot_back() -> None:
+    limiter = anyio.CapacityLimiter(1)
+
+    def broken() -> None:
+        raise LookupError("the driver raised")
+
+    with pytest.raises(LookupError):
+        await run_in_worker(limiter, broken)
+
+    assert limiter.borrowed_tokens == 0
+
+
+@pytest.mark.anyio
+async def test_a_thread_that_fails_to_start_gives_its_slot_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limiter = anyio.CapacityLimiter(1)
+
+    async def no_thread(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(thread_handoff, "run_sync", no_thread)
+
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        await run_in_worker(limiter, lambda: None)
+
+    assert limiter.borrowed_tokens == 0
+
+
+@pytest.mark.anyio
+async def test_a_call_withdrawn_before_its_thread_starts_never_runs() -> None:
+    """The caller left before the worker began: the slot is given back at once, exactly once, and
+    the worker refuses to start a call nobody is waiting for."""
+    limiter = anyio.CapacityLimiter(1)
+    post = thread_handoff._post_to_this_loop()  # pyright: ignore[reportPrivateUsage]
+    slot = thread_handoff._Slot(limiter, post)  # pyright: ignore[reportPrivateUsage]
+    await limiter.acquire_on_behalf_of(slot)
+    ran: list[bool] = []
+
+    slot.settle()
+
+    assert limiter.borrowed_tokens == 0
+    with pytest.raises(thread_handoff.AbandonedBeforeStartError):
+        slot.run(lambda: ran.append(True))
+    assert ran == []
+    assert limiter.borrowed_tokens == 0
