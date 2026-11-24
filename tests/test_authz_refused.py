@@ -61,7 +61,7 @@ JURISDICTION_BODY = {"code": "outside_jurisdiction", "covers": ["Ada East Distri
 ACCIDENT = "a helper's own words that must never reach the wire"
 CLIENT_LOGGERS = frozenset({"httpx2", "asyncio"})
 
-README = ROOT / "README.md"
+RECIPE_PAGE = ROOT / "README.md"
 RECIPE_HEADING = "#### A refusal that explains"
 RECIPE_MARKER = "class PermissionDenied(AuthorizationRefused):"
 JSON_FENCE = "```json\n"
@@ -739,8 +739,8 @@ def the_recipe() -> Snippet:
 
 
 def documented_body() -> Any:
-    """The `json` block the README shows under the recipe, parsed — so the page cannot drift."""
-    text = README.read_text(encoding="utf-8")
+    """The `json` block the page shows under the recipe, parsed — so the page cannot drift."""
+    text = RECIPE_PAGE.read_text(encoding="utf-8")
     section = text[text.index(RECIPE_HEADING) :]
     opened = section.index(JSON_FENCE) + len(JSON_FENCE)
     return json.loads(section[opened : section.index("```", opened)])

@@ -3,7 +3,8 @@
 Documentation drifts silently: a factory grows a keyword, a name moves, a route stops being
 refused — and the snippet that taught every reader how to use the library keeps rendering
 perfectly on PyPI while describing an API that no longer exists. This file removes the silence.
-Every python fence in the shipped documents is extracted, executed in a fresh namespace, and the
+Every python fence in the shipped documents - the README, COMPATIBILITY.md and every page under
+`docs/` - is extracted, executed as a module of its own, and the
 applications those snippets build are driven over the wire: the protected route has to answer 401
 to a forged credential, and the document has to publish the bearer scheme `/docs` needs before it
 can show an Authorize button. Executing a snippet proves it parses; asking it for a refusal proves
@@ -60,9 +61,20 @@ from tests.cookies import http as cookie_request
 from tests.cookies import run as run_cookie_mode
 from tests.fakes import TestClient
 
+
+class Heading(NamedTuple):
+    """A heading line on one page. Headings repeat across pages, so the page is part of the key."""
+
+    document: pathlib.Path
+    text: str
+
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
-DOCUMENTS = (README, ROOT / "COMPATIBILITY.md")
+DOCS = ROOT / "docs"
+DOC_PAGES = tuple(sorted(DOCS.glob("*.md")))
+"""Every page under `docs/`, found by glob, so a page added later is executed the day it lands."""
+DOCUMENTS = (README, ROOT / "COMPATIBILITY.md", *DOC_PAGES)
 
 FENCE = "```"
 PYTHON_FENCE = "```python"
@@ -101,8 +113,8 @@ signature of the wrong length, and a well-formed envelope whose HMAC does not ve
 BASE_URL = "https://auth.example.com"
 BROKEN_SNIPPET = "```python\nfrom fastapi_better_auth import BetterAuht\n```\n"
 
-TESTING_HEADING = "## Testing"
-CLOCK_HEADING = "### Moving the verifier's clock"
+TESTING_HEADING = Heading(README, "## Testing")
+CLOCK_HEADING = Heading(README, "### Moving the verifier's clock")
 HTTP_CLIENTS = ("httpx", "httpx2")
 """The two libraries a bare `fastapi-better-auth-bridge` install has neither of (#65)."""
 
@@ -116,7 +128,7 @@ cookies are refused at the signature, so the store behind it is never asked anyt
 """
 LANE_SECRET = "readme-lane-secret-that-signs-nothing-it-is-shown"
 FACTORY_FAKE_ID = "u-factory-fake"
-QUICKSTART_A = "## Quickstart (Mode A — session cookie)"
+QUICKSTART_A = Heading(README, "## Quickstart (Mode A — session cookie)")
 
 UNOPENED_SPELLINGS = ("```py", "~~~python", "```python3", "   ```python")
 """Fence openers a reader calls python and `snippets` does not open. None may be silent."""
@@ -159,12 +171,26 @@ class Snippet(NamedTuple):
     def id(self) -> str:
         return f"{self.document}:L{self.line}"
 
+    @property
+    def module_name(self) -> str:
+        """The name the snippet runs under: unique per document and line, a valid identifier."""
+        return "doc_snippet_" + re.sub(r"[^0-9A-Za-z]", "_", self.document) + f"_{self.line}"
+
+
+def document_name(path: pathlib.Path) -> str:
+    """The path a reader would open: relative to the repository, or the bare name outside it."""
+    try:
+        return path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return path.name
+
 
 def snippets(path: pathlib.Path) -> tuple[Snippet, ...]:
     """Every ```python fence in one document, in the order it is read on the page."""
     found: list[Snippet] = []
     opened: int | None = None
     body: list[str] = []
+    name = document_name(path)
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         stripped = line.rstrip()
         if opened is None:
@@ -172,11 +198,11 @@ def snippets(path: pathlib.Path) -> tuple[Snippet, ...]:
                 opened, body = number, []
             continue
         if stripped == FENCE:
-            found.append(Snippet(document=path.name, line=opened, code="\n".join(body) + "\n"))
+            found.append(Snippet(document=name, line=opened, code="\n".join(body) + "\n"))
             opened = None
             continue
         body.append(line)
-    assert opened is None, f"{path.name}: a python fence opened at line {opened} is never closed"
+    assert opened is None, f"{name}: a python fence opened at line {opened} is never closed"
     return tuple(found)
 
 
@@ -185,27 +211,35 @@ ALL_SNIPPETS = tuple(snippet for path in DOCUMENTS for snippet in snippets(path)
 
 def closes(line: str, heading: str) -> bool:
     """Whether `line` is a heading at `heading`'s level or above: a `##` section ends at the next
-    `##`, a `###` subsection at the next `###` or `##`. The page has no other levels."""
+    `##`, a `###` subsection at the next `###` or `##`. A page's one `#` is its title, above every
+    section, so it never closes one - and a `# comment` inside a fence must not either."""
     level = len(heading) - len(heading.lstrip("#"))
     return any(line.startswith("#" * depth + " ") for depth in range(2, level + 1))
 
 
-def fences_under(heading: str) -> tuple[Snippet, ...]:
-    """The README's python fences between `heading` and the next heading closing it, in page order."""
-    lines = README.read_text(encoding="utf-8").splitlines()
-    index = lines.index(heading)
+def fences_under(heading: Heading) -> tuple[Snippet, ...]:
+    """One page's python fences between `heading` and the next heading closing it, in page order.
+
+    The heading must appear on its page exactly once: a guard that matched the first of two
+    would quietly read the wrong section the day a page grew a second heading with that text.
+    """
+    lines = heading.document.read_text(encoding="utf-8").splitlines()
+    where = document_name(heading.document)
+    count = lines.count(heading.text)
+    assert count == 1, f"{where}: {heading.text!r} appears {count} times, not once"
+    index = lines.index(heading.text)
     end = next(
         (
             number
             for number, line in enumerate(lines[index + 1 :], index + 2)
-            if closes(line, heading)
+            if closes(line, heading.text)
         ),
         len(lines) + 1,
     )
     return tuple(
         snippet
         for snippet in ALL_SNIPPETS
-        if snippet.document == README.name and index + 1 < snippet.line < end
+        if snippet.document == where and index + 1 < snippet.line < end
     )
 
 
@@ -218,9 +252,10 @@ def run(snippet: Snippet) -> dict[str, Any]:
     Run as a real module, registered in `sys.modules` while its top level executes, because a
     reader's file is one: pydantic 2.14 looks the module up by `__name__` when a generic model
     is parametrized at module level. Unregistered afterwards, success or failure, so no
-    snippet outlives its run or is found by the next one.
+    snippet outlives its run or is found by the next one. The name carries the document as well
+    as the line, so two pages with a fence on the same line never share one.
     """
-    name = f"readme_snippet_{snippet.line}"
+    name = snippet.module_name
     assert name not in sys.modules, f"{name} is already a module; snippets must not nest"
     module = types.ModuleType(name)
     code = compile(snippet.code, f"<{snippet.id}>", "exec", dont_inherit=True)
@@ -712,7 +747,7 @@ def test_the_factory_app_is_overridden_through_the_instance_it_built(
     assert refuse_database == []
 
 
-SESSION_FACTS = "## What a verified session carries"
+SESSION_FACTS = Heading(README, "## What a verified session carries")
 FORWARD = "revoke_upstream"
 FORWARDED_NAME = "__Secure-better-auth.session_token"
 FORWARDED_VALUE = "forwarded-session-token.c2lnbmF0dXJl%2Bc2lnbmF0dXJl%3D"
