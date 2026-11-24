@@ -31,7 +31,6 @@ CANARY = ROOT / ".github" / "workflows" / "canary.yml"
 SERVICE_LINE = re.compile(r"^  ([a-z][a-z0-9-]*):\s*$")
 MATRIX_JOBS = 2
 ECHO_CALL = 'harness_better_auth_version.py --expected "$MATRIX_VERSION"'
-MAIN_ONLY = "github.ref == 'refs/heads/main'"
 
 
 class EchoScript(Protocol):
@@ -242,13 +241,15 @@ def test_both_matrix_jobs_echo_after_the_harness_starts_and_before_any_test() ->
         assert started < echoed < job.index("pytest")
 
 
-def test_no_matrix_job_files_an_issue_from_a_branch() -> None:
-    """A dispatch on a branch is its dispatcher's to read; an issue it filed would be public."""
+def test_no_matrix_job_can_file_an_issue() -> None:
+    """The legs run npm-installed upstream code and pytest, so they hold no write permission.
+
+    Only the reporting job files issues, and only on main - a dispatch on a branch is its
+    dispatcher's to read (`test_ci_guardrails.py` pins that job's condition).
+    """
     jobs = matrix_jobs()
 
     assert len(jobs) == MATRIX_JOBS
     for job in jobs:
-        step = job.split("- name: Open issue on failure\n", 1)[1]
-        condition = step.splitlines()[0].strip()
-        assert condition.startswith("if: "), condition
-        assert condition.endswith(f"&& {MAIN_ONLY}"), condition
+        assert "issues: write" not in job
+        assert "GH_TOKEN" not in job
