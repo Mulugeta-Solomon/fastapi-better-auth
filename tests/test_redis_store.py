@@ -560,7 +560,7 @@ class TestConstruction:
 
         class FakeRedis:
             @staticmethod
-            def from_url(url: str) -> RecordingRedis:
+            def from_url(url: str, **kwargs: Any) -> RecordingRedis:
                 return built
 
         monkeypatch.setattr(redis_store_module, "_import_redis", lambda: FakeRedis)

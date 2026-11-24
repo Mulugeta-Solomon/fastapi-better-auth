@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 from collections.abc import Mapping
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
@@ -20,6 +21,27 @@ if TYPE_CHECKING:
     import redis.asyncio
 
 MAX_VALUE_BYTES = 64 * 1024
+
+CONNECT_TIMEOUT_SECONDS = 3.0
+"""How long a client built from `url=` waits to connect.
+
+A Redis on the same network connects in well under a millisecond, so this only ever decides how
+long a request waits on a cache that is down. Three seconds rather than less because a refused
+loopback connect takes about two seconds on Windows, and a shorter deadline would report a port
+nobody listens on as a timeout instead of the refusal it is."""
+
+READ_TIMEOUT_SECONDS = 2.0
+"""How long a client built from `url=` waits for one reply - one `GET` of a value capped at
+`MAX_VALUE_BYTES`, which a healthy Redis answers in well under a millisecond. A lookup issues two,
+so a Redis that accepts connections and then stops answering costs a request at most
+`CONNECT_TIMEOUT_SECONDS + 2 * READ_TIMEOUT_SECONDS` before the verifier refuses it."""
+
+SOCKET_TIMEOUT = "socket_timeout"
+SOCKET_CONNECT_TIMEOUT = "socket_connect_timeout"
+LENT_DEADLINE = (
+    "{name} was given with client=. A lent client is never modified, so the deadline would be"
+    " silently ignored; set it on the client you built, or pass url= to have this store build one."
+)
 
 MISSING = (
     "RedisSessionStore needs the redis package, which is not installed. Install it with:"
@@ -75,7 +97,43 @@ def _import_redis() -> Any:
     return Redis
 
 
-def _built_client(url: object) -> Any:
+def _validated_deadline(name: str, seconds: object) -> float:
+    """A positive, finite number of seconds. `None` is redis-py's "wait forever" - refused."""
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, (int, float))
+        or not math.isfinite(seconds)
+        or seconds <= 0
+    ):
+        raise ConfigurationError(
+            f"{name} must be a positive, finite number of seconds; got {safe_label(repr(seconds))}."
+            " It bounds how long one Redis socket operation may hold the request that needed it."
+        )
+    return seconds
+
+
+def _deadlines(read: object, connect: object, *, lent: bool) -> dict[str, float]:
+    """Both socket deadlines, validated - and refused beside a lent client unless left alone.
+
+    A lent client is never modified, so a deadline given with one would do nothing; the store
+    cannot tell a default passed explicitly from one left out, and neither is a change, so only a
+    value other than the default is refused.
+    """
+    deadlines = {
+        SOCKET_TIMEOUT: _validated_deadline(SOCKET_TIMEOUT, read),
+        SOCKET_CONNECT_TIMEOUT: _validated_deadline(SOCKET_CONNECT_TIMEOUT, connect),
+    }
+    defaults = {
+        SOCKET_TIMEOUT: READ_TIMEOUT_SECONDS,
+        SOCKET_CONNECT_TIMEOUT: CONNECT_TIMEOUT_SECONDS,
+    }
+    changed = [name for name, seconds in deadlines.items() if seconds != defaults[name]]
+    if lent and changed:
+        raise ConfigurationError(LENT_DEADLINE.format(name=changed[0]))
+    return deadlines
+
+
+def _built_client(url: object, deadlines: Mapping[str, float]) -> Any:
     """Build a client from `url`, refusing a bad one at construction rather than at first fetch.
 
     The `Raises:` contract promises a `ConfigurationError` for every construction failure, and a
@@ -83,13 +141,17 @@ def _built_client(url: object) -> Any:
     redis-py's own error is echoed: a redis URL can carry a password (`redis://user:pass@host`),
     so the refusal names what to check and is raised outside the handler with `from None`, so the
     credential can ride out on neither `__cause__` nor `__context__`.
+
+    `deadlines` go in as keyword arguments, which redis-py's `from_url` overrides with any option
+    of the same name in the URL's query string - so `?socket_timeout=10` wins, by redis-py's own
+    precedence rather than by a merge this library would have to keep in step with it.
     """
     if not isinstance(url, str) or not url.strip():
         raise ConfigurationError(
             "url must be a non-empty redis URL string, like 'redis://host:6379/0'."
         )
     try:
-        return _import_redis().from_url(url)
+        return _import_redis().from_url(url, **deadlines)
     except (ValueError, TypeError):
         failure = ConfigurationError(
             "the url= given was rejected by redis-py; check its scheme, host and port"
@@ -170,12 +232,20 @@ class RedisSessionStore:
         max_bytes: The largest stored value this store will parse. It bounds the parse and the
             record, not the read - the client has already received the value by the time it gets
             here - so read it as a refusal to believe something absurd, not as a DoS control.
+        socket_timeout: Seconds a client built from `url` waits for one reply; 2 by default. A
+            lookup issues two `GET`s, so a Redis that stops answering costs a request at most
+            the connect deadline plus twice this. An option of the same name in the URL's query
+            string (`?socket_timeout=5`) wins, which is redis-py's own precedence.
+        socket_connect_timeout: Seconds a client built from `url` waits to connect; 3 by
+            default, and overridden by the URL's query string the same way. Neither deadline may
+            be changed alongside `client`: a lent client is never modified.
 
     Raises:
         ConfigurationError: If neither `url` nor `client` is given, if both are, if `key_prefix`
-            is not a string, if `max_bytes` is not a positive integer, or if `url` was given and
-            the `redis` package is not installed. Every one of these is checked before a client
-            is built, so a refused construction leaves no pool behind.
+            is not a string, if `max_bytes` is not a positive integer, if either deadline is not
+            a positive finite number of seconds or is changed alongside `client`, or if `url` was
+            given and the `redis` package is not installed. Every one of these is checked before
+            a client is built, so a refused construction leaves no pool behind.
     """
 
     def __init__(
@@ -185,6 +255,8 @@ class RedisSessionStore:
         client: redis.asyncio.Redis | _Client | None = None,
         key_prefix: str = "",
         max_bytes: int = MAX_VALUE_BYTES,
+        socket_timeout: float = READ_TIMEOUT_SECONDS,
+        socket_connect_timeout: float = CONNECT_TIMEOUT_SECONDS,
     ) -> None:
         if url is None and client is None:
             raise ConfigurationError(NEITHER)
@@ -194,7 +266,8 @@ class RedisSessionStore:
         # leave a connection pool nobody holds a reference to and nobody closes.
         self._prefix = _validated_prefix(key_prefix)
         self._max_bytes = _validated_cap(max_bytes)
-        built = None if client is not None else _built_client(url)
+        deadlines = _deadlines(socket_timeout, socket_connect_timeout, lent=client is not None)
+        built = None if client is not None else _built_client(url, deadlines)
         # Only a client this store BUILT is ever closed; a borrowed pool is not ours to shut.
         self._built: Any | None = built
         self._client: _Client = cast("_Client", client if client is not None else built)

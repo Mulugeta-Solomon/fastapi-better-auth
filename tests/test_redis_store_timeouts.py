@@ -118,8 +118,9 @@ class TestRefusals:
     def test_a_deadline_beside_a_lent_client_is_refused(self, name: str) -> None:
         """A lent client is never modified, so a deadline given with one would be silently
         ignored - and a deadline somebody believes is set is worse than none."""
+        changed: dict[str, Any] = {name: 1.0}
         with pytest.raises(ConfigurationError, match=name):
-            RedisSessionStore(client=RecordingRedis(), **{name: 1.0})
+            RedisSessionStore(client=RecordingRedis(), **changed)
 
     def test_a_lent_client_is_left_exactly_as_it_was(self) -> None:
         client = RecordingRedis()
