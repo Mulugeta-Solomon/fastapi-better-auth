@@ -34,6 +34,9 @@ schema](../README.md#who-owns-the-database-schema) for the rule and the reason.
 | `postgres` | 55432 | Exposed for vector capture and session manipulation in tests |
 | `redis` | 56379 | Used only by the `redis` profile |
 
+Every port is published on `127.0.0.1` only: the harness ships a fixed database password and auth
+secret, so it must not be reachable from another machine.
+
 Every auth container runs `auth migrate` against the same database on start, so the three optional
 ones wait for `auth` to be healthy rather than racing it.
 

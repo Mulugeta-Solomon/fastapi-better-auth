@@ -1,14 +1,19 @@
 # Conformance harness: a real, version-pinned Better Auth server for e2e tests
 # and golden-vector capture. See harness/README.md.
+#
+# Every published port binds 127.0.0.1 only: the harness ships a fixed database password and
+# auth secret, so nothing on it should be reachable from another machine. Images are pinned
+# as `tag@sha256:digest` - the digest is what Docker pulls, the tag is what a reader and
+# Dependabot (docker-compose ecosystem) read.
 services:
   postgres:
-    image: postgres:17.5-alpine
+    image: postgres:17.5-alpine@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
     environment:
       POSTGRES_USER: harness
       POSTGRES_PASSWORD: harness
       POSTGRES_DB: harness
     ports:
-      - "55432:5432"
+      - "127.0.0.1:55432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U harness"]
       interval: 2s
@@ -16,9 +21,9 @@ services:
       retries: 15
 
   redis:
-    image: redis:7.4-alpine
+    image: redis:7.4-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     ports:
-      - "56379:6379"
+      - "127.0.0.1:56379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -37,7 +42,7 @@ services:
       BETTER_AUTH_URL: http://localhost:3100
       PORT: "3100"
     ports:
-      - "3100:3100"
+      - "127.0.0.1:3100:3100"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3100/healthz"]
       interval: 2s
@@ -62,7 +67,7 @@ services:
       PORT: "3101"
       REDIS_URL: redis://redis:6379
     ports:
-      - "3101:3101"
+      - "127.0.0.1:3101:3101"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3101/healthz"]
       interval: 2s
@@ -93,7 +98,7 @@ services:
       PORT: "3102"
       BEARER_REQUIRE_SIGNATURE: "1"
     ports:
-      - "3102:3102"
+      - "127.0.0.1:3102:3102"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3102/healthz"]
       interval: 2s
@@ -122,7 +127,7 @@ services:
       PORT: "3103"
       RATE_LIMIT_GET_SESSION_MAX: "3"
     ports:
-      - "3103:3103"
+      - "127.0.0.1:3103:3103"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3103/healthz"]
       interval: 2s
