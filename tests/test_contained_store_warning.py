@@ -23,7 +23,6 @@ from typing import Any, cast
 
 import pytest
 from anyio.from_thread import BlockingPortal
-from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -51,7 +50,7 @@ from tests.cookies import (
     stored_session,
     verifier,
 )
-from tests.fakes import client, session_app
+from tests.fakes import TestClient, client, session_app
 from tests.log_hygiene import LIBRARY_LOGGER, broken_log_filter, capturing
 from tests.stores import (
     AiosqliteStops,
@@ -112,7 +111,7 @@ def aiosqlite_stops(monkeypatch: pytest.MonkeyPatch) -> AiosqliteStops:
 
 def apps_loop(http: TestClient) -> BlockingPortal:
     """The portal onto the loop a `TestClient` runs the app on - open until its `with` exits."""
-    return cast("BlockingPortal", http.portal)  # pyright: ignore[reportUnknownMemberType]
+    return cast("BlockingPortal", http.portal)
 
 
 def statuses(

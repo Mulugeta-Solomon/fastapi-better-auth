@@ -31,6 +31,7 @@ from tests.fakes import (
     client,
     resolver_of,
     session_app,
+    websocket,
 )
 
 HEADER = "x-cred-a"
@@ -299,7 +300,7 @@ def test_the_dependency_resolves_on_a_websocket(client_backend: str) -> None:
     app.add_api_websocket_route("/ws", socket)
     with (
         client(app, client_backend) as http,
-        http.websocket_connect("/ws", headers={HEADER: GOOD_CREDENTIAL}) as ws,
+        websocket(http, "/ws", headers={HEADER: GOOD_CREDENTIAL}) as ws,
     ):
         received = ws.receive_text()
 

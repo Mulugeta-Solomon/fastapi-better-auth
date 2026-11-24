@@ -16,7 +16,6 @@ from typing import Any
 import pytest
 from fastapi import Request, Response
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.testclient import TestClient
 
 from fastapi_better_auth import (
     AmbiguousCredentials,
@@ -50,6 +49,7 @@ from tests.fakes import (
     SyncPrologueVerifier,
     SyncVerifyVerifier,
     TaskGroupVerifier,
+    TestClient,
     TracedVerifier,
     WrappedAsyncExtractVerifier,
     WrongModelVerifier,

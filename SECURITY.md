@@ -16,18 +16,23 @@ Pre-1.0: only the **latest released version** receives fixes.
 ## Better Auth compatibility floor
 
 This library bridges to a Better Auth (TypeScript) server you operate. Run **Better Auth 1.4.9 or
-newer**: earlier versions are affected by CVE-2026-67337, a critical 2FA bypass via the
-`session_data` cookie cache. This library never reads that cookie and warns once if it sees one,
-but it cannot patch the server side — keeping your Better Auth server current is part of your
-deployment's security posture. The versions each release is verified against are listed in
+newer**: earlier versions are affected by CVE-2026-67337 (the Better Auth maintainers' advisory is
+GHSA-xg6x-h9c9-2m83), a 2FA bypass via the `session_data` cookie cache. The sources disagree
+on the fixed version: the CVE record says versions before 1.4.9 are affected, and the
+maintainers' advisory names 1.4.6 as the first fixed version. 1.4.9 is fixed by both accounts.
+This library never reads that cookie and warns once if it sees one, but it cannot patch the
+server side — keeping your Better Auth server current is part of your deployment's security
+posture. The versions each release is verified against are listed in
 [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Dependency floors
 
 The declared lower bounds are security floors, not merely API floors. In particular `PyJWT` is
-required at **2.12.0 or newer** (CVE-2026-32597: unknown `crit` header extensions were accepted),
-and independently of the installed version this library refuses any token that declares a `crit`
-header at all, because Better Auth never emits one and no extension is supported here.
+required at **2.15.0 or newer**: 2.15.0 reports a token nested too deeply to parse as a
+`DecodeError` rather than a raw `RecursionError`, and it includes the 2.14.0 security fixes to
+`jwt.decode` and the CVE-2026-32597 fix from 2.12.0 (unknown `crit` header extensions were
+accepted). Independently of the installed version, this library refuses any token that declares
+a `crit` header at all, because Better Auth never emits one and no extension is supported here.
 
 ## What this library trusts, and what it does not
 

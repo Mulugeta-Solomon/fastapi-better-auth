@@ -34,7 +34,7 @@ from fastapi_better_auth import (
     User,
 )
 from tests.cookies import verifier as cookie_verifier
-from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, client, session_app
+from tests.fakes import GOOD_CREDENTIAL, FakeVerifier, client, session_app, websocket
 from tests.transports import ScriptedTransport
 
 BEARER_SOURCE = "header:authorization-bearer"
@@ -544,7 +544,7 @@ def test_a_documented_dependency_still_resolves_on_a_websocket(client_backend: s
     app.add_api_websocket_route("/ws", socket)
     with (
         client(app, client_backend) as http,
-        http.websocket_connect("/ws", headers={HEADER: GOOD_CREDENTIAL}) as ws,
+        websocket(http, "/ws", headers={HEADER: GOOD_CREDENTIAL}) as ws,
     ):
         received = ws.receive_text()
 
