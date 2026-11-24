@@ -10,7 +10,7 @@ workflow change, and each one guards a concrete failure:
 - uv is the version `pyproject.toml` asks for, and a stale lock fails instead of being
   silently re-resolved;
 - no `run:` step splices an expression into shell source;
-- the harness listens on loopback only, its images are pinned by digest, and Dependabot keeps
+- the harness listens on loopback only, on overridable ports below the ephemeral range, its images are pinned by digest, and Dependabot keeps
   them current without touching the deliberate better-auth conformance pin.
 
 There is no YAML parser in the locked dependencies, so these read the files as text, the way
@@ -34,6 +34,7 @@ CANARY = WORKFLOWS / "canary.yml"
 DEPENDABOT = ROOT / ".github" / "dependabot.yml"
 COMPOSE = ROOT / "harness" / "docker-compose.yml"
 DOCKERFILE = ROOT / "harness" / "auth-server" / "Dockerfile"
+E2E_CONFTEST = ROOT / "tests" / "e2e" / "conftest.py"
 
 JOB = re.compile(r"^  ([a-z][a-z0-9-]*):\s*$", re.MULTILINE)
 STEP = re.compile(r"^      - ", re.MULTILINE)
@@ -42,6 +43,18 @@ PINNED = re.compile(r"(?P<action>[\w.-]+/[\w./-]+)@(?P<sha>[0-9a-f]{40})")
 TAG_COMMENT = re.compile(r"^\s+# v\d+\.\d+\.\d+$")
 RUN_KEY = re.compile(r"^(?P<indent>\s*)(?:- )?run:\s?(?P<value>.*)$")
 DIGEST = re.compile(r"@sha256:[0-9a-f]{64}\b")
+PORT_MAPPING = re.compile(
+    r"127\.0\.0\.1:\$\{(?P<variable>HARNESS_[A-Z_]+_PORT):-(?P<default>\d+)\}:(?P<container>\d+)"
+)
+EPHEMERAL_FLOOR = 32768
+HOST_PORT_VARIABLES = {
+    "postgres": "HARNESS_POSTGRES_PORT",
+    "redis": "HARNESS_REDIS_PORT",
+    "auth": "HARNESS_AUTH_PORT",
+    "auth-redis": "HARNESS_AUTH_REDIS_PORT",
+    "auth-strict": "HARNESS_AUTH_STRICT_PORT",
+    "auth-throttled": "HARNESS_AUTH_THROTTLED_PORT",
+}
 UNLOCKED_SYNC_JOBS = {"floors"}
 """`floors` re-locks with `--resolution lowest-direct` on purpose and then syncs `--frozen`."""
 
@@ -241,13 +254,62 @@ def test_every_matrix_leg_records_and_uploads_its_verdict() -> None:
 # --- harness and Dependabot -------------------------------------------------------------------
 
 
-def test_every_published_harness_port_is_bound_to_loopback() -> None:
-    text = COMPOSE.read_text(encoding="utf-8")
-    ports = re.findall(r'^\s+- "([^"]+)"$', text, re.MULTILINE)
+def compose_services() -> dict[str, str]:
+    """Each compose service's text, keyed by its name."""
+    body = COMPOSE.read_text(encoding="utf-8").split("\nservices:\n", 1)[1]
+    names = JOB.findall(body)
+    assert names, "no services found in the compose file"
+    return dict(zip(names, JOB.split(body)[2::2], strict=True))
 
-    assert len(ports) == 6
-    for mapping in ports:
-        assert mapping.startswith("127.0.0.1:"), mapping
+
+def published_ports() -> dict[str, tuple[str, int, int]]:
+    """service -> (host-port variable, its default, container port), from each port mapping."""
+    found: dict[str, tuple[str, int, int]] = {}
+    for service, text in compose_services().items():
+        for mapping in re.findall(r'^\s+- "([^"]+)"$', text, re.MULTILINE):
+            match = PORT_MAPPING.fullmatch(mapping)
+            assert match, f"{service}: {mapping} is not 127.0.0.1:${{HARNESS_*_PORT:-n}}:n"
+            found[service] = (match["variable"], int(match["default"]), int(match["container"]))
+    return found
+
+
+def test_every_published_harness_port_is_loopback_overridable_and_below_ephemeral() -> None:
+    """Linux hands out 32768-60999 to outgoing connections and Windows reserves blocks of its
+    49152+ range for Hyper-V per boot, so a default up there collides at random (Nov 9 run)."""
+    ports = published_ports()
+
+    assert {service: variable for service, (variable, _, _) in ports.items()} == HOST_PORT_VARIABLES
+    for service, (_, default, _) in ports.items():
+        assert 1024 < default < EPHEMERAL_FLOOR, f"{service} defaults to {default}"
+    assert ports["postgres"][1:] == (15432, 5432)
+    assert ports["redis"][1:] == (16379, 6379)
+
+
+def test_an_auth_servers_origin_follows_its_host_port() -> None:
+    """Better Auth trusts its own baseURL origin, and the e2e lane sends that host-side origin,
+    so a moved host port must move BETTER_AUTH_URL with it or every signed POST is refused."""
+    services = compose_services()
+    auth = {name: port for name, port in published_ports().items() if name.startswith("auth")}
+
+    assert len(auth) == 4
+    for service, (variable, default, container) in auth.items():
+        url = f"BETTER_AUTH_URL: http://localhost:${{{variable}:-{default}}}"
+        assert url in services[service], service
+        assert f'PORT: "{container}"' in services[service], service
+
+
+def test_the_e2e_defaults_follow_the_compose_defaults() -> None:
+    conftest = E2E_CONFTEST.read_text(encoding="utf-8")
+
+    for variable, default, _ in published_ports().values():
+        assert f'"{variable}", "{default}"' in conftest, variable
+
+
+def test_each_leg_uploads_under_the_name_the_reporter_binds_it_to() -> None:
+    text = CANARY.read_text(encoding="utf-8")
+
+    for lane in ("head", "wheel"):
+        assert f"name: canary-result-{lane}-${{{{ matrix.version }}}}\n" in text, lane
 
 
 def test_every_harness_image_is_pinned_by_digest_and_keeps_its_tag() -> None:
