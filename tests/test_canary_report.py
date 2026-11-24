@@ -43,6 +43,7 @@ STALE_OCTOBER = {
     98: "canary: published-wheel lane cannot run against better-auth@1.7.1",
 }
 ALL_GREEN = {"head": "success", "wheel": "success"}
+LANE_NAMES = {"head": "HEAD conformance", "wheel": "published-wheel"}
 
 
 class Report(Protocol):
@@ -130,7 +131,9 @@ def report(
     *,
     watch: str = "skipped",
     jobs: Mapping[str, str] = ALL_GREEN,
+    versions: Sequence[str] | None = None,
 ) -> int:
+    expected = recorded_versions(results) if versions is None else list(versions)
     argv = [
         "report",
         "--results-dir",
@@ -143,8 +146,22 @@ def report(
         jobs["head"],
         "--wheel-job",
         jobs["wheel"],
+        "--expected-versions",
+        json.dumps(expected),
     ]
     return script.main(argv, gh=gh)
+
+
+def recorded_versions(results: pathlib.Path) -> list[str]:
+    """By default a test expects exactly the legs it recorded, so only coverage tests see gaps."""
+    if not results.is_dir():
+        return ["1.7.1"]
+    found = {
+        path.name.split("-", 3)[3]
+        for path in results.glob("canary-result-*-*")
+        if path.is_dir() and path.name.count("-") >= 3
+    }
+    return sorted(found) or ["1.7.1"]
 
 
 def created_titles(gh: Gh) -> list[str]:
@@ -442,6 +459,111 @@ def test_an_unrecorded_failure_issue_closes_when_its_lane_is_green(
     assert numbers(second.of("close")) == ["30"]
 
 
+def unrecorded_body(gh: Gh, lane: str) -> str:
+    title = f"canary: a {LANE_NAMES[lane]} leg failed without recording its result"
+    (call,) = [c for c in gh.of("create") if c[c.index("--title") + 1] == title]
+    return call[call.index("--body") + 1]
+
+
+def test_every_missing_leg_is_named_even_when_another_leg_recorded_a_failure(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    record(script, tmp_path, lane="head", version="1.6.30", outcome="failure", harness="1.6.30")
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
+    gh = Gh({})
+
+    report(
+        script,
+        tmp_path,
+        gh,
+        jobs={"head": "failure", "wheel": "success"},
+        versions=["1.6.30", "1.7.1", "1.7.5", "latest"],
+    )
+
+    assert "canary: conformance failure against better-auth@1.6.30" in created_titles(gh)
+    body = unrecorded_body(gh, "head")
+    assert "better-auth@1.7.5" in body
+    assert "better-auth@latest" in body
+    assert "1.6.30" not in body
+    assert "better-auth@1.7.1" not in body
+    assert RUN_URL in body
+
+
+def test_a_missing_leg_comments_on_the_open_unrecorded_issue(
+    script: Report, tmp_path: pathlib.Path
+) -> None:
+    gh = Gh({40: "canary: a published-wheel leg failed without recording its result"})
+
+    report(
+        script,
+        tmp_path,
+        gh,
+        jobs={"head": "success", "wheel": "failure"},
+        versions=["1.7.5", "1.7.6"],
+    )
+
+    (comment,) = gh.of("comment")
+    assert comment[2] == "40"
+    assert "better-auth@1.7.5" in comment[comment.index("--body") + 1]
+    assert gh.of("create") == []
+
+
+@pytest.mark.parametrize("lane_result", ["cancelled", "skipped"])
+def test_a_cancelled_or_skipped_lane_with_missing_legs_stays_silent(
+    script: Report, tmp_path: pathlib.Path, lane_result: str
+) -> None:
+    gh = Gh({})
+
+    report(
+        script,
+        tmp_path,
+        gh,
+        jobs={"head": lane_result, "wheel": "success"},
+        versions=["1.7.1", "1.7.5"],
+    )
+
+    assert gh.calls == []
+
+
+def test_a_result_for_a_version_the_matrix_does_not_list_is_rejected(
+    script: Report, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record(script, tmp_path, lane="head", version="1.7.1", outcome="success", harness="1.7.1")
+    gh = Gh(STALE_OCTOBER)
+
+    assert report(script, tmp_path, gh, versions=["1.6.30"]) == 1
+
+    assert gh.of("close") == []
+    assert "::error::" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "versions",
+    ["not json", "[]", '["1.7.1", "next"]', '["1.7.1", "1.7.1"]', '{"a": 1}', '["1.7.1\\n"]'],
+    ids=["not-json", "empty", "unknown-tag", "duplicate", "object", "newline"],
+)
+def test_an_implausible_expected_matrix_is_refused_before_any_call(
+    script: Report, tmp_path: pathlib.Path, versions: str
+) -> None:
+    calls: list[list[str]] = []
+
+    def gh(argv: Sequence[str]) -> tuple[int, str]:
+        calls.append(list(argv))
+        return 0, "[]"
+
+    argv = [
+        "report", "--results-dir", str(tmp_path), "--run-url", RUN_URL,
+        "--upstream-watch", "failure", "--head-job", "success", "--wheel-job", "success",
+        "--expected-versions", versions,
+    ]  # fmt: skip
+
+    with pytest.raises(SystemExit) as exited:
+        script.main(argv, gh=gh)
+
+    assert exited.value.code == 1
+    assert calls == []
+
+
 def test_the_canary_label_is_ensured_before_an_issue_is_created(
     script: Report, tmp_path: pathlib.Path
 ) -> None:
@@ -605,6 +727,8 @@ def test_an_implausible_run_url_is_refused(
         "success",
         "--wheel-job",
         "success",
+        "--expected-versions",
+        '["1.7.1"]',
     ]
 
     with pytest.raises(SystemExit):
@@ -635,6 +759,8 @@ def test_an_unreadable_issue_list_acts_on_nothing(script: Report, tmp_path: path
                 "success",
                 "--wheel-job",
                 "success",
+                "--expected-versions",
+                '["1.7.1"]',
             ],
             gh=broken,
         )
