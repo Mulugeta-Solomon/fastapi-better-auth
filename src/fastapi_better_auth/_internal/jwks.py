@@ -42,6 +42,18 @@ LOADERS: Mapping[str, type[Algorithm]] = {
 SUPPORTED_ALGORITHMS: tuple[str, ...] = tuple(LOADERS)
 
 
+def monotonic_clock() -> float:
+    """The clock a `JwksClient` built without `clock=` reads: monotonic seconds.
+
+    Monotonic rather than the wall clock, because every rule it times is an age - the cache's
+    freshness, the refetch window, the negative cache - and an age read off the wall clock is
+    stretched or cut by whoever sets that clock. Looked up on every read rather than bound at
+    construction, so a test can wind it for a `JwtVerifier` it built through the public
+    constructor (`tests/jwks_fixtures.py`), and the event loop's own clock is never touched.
+    """
+    return time.monotonic()
+
+
 @dataclass(frozen=True)
 class Jwk:
     """One published key, already loaded into the object a signature check needs.
@@ -88,7 +100,7 @@ class JwksClient:
         max_bytes: The body cap handed to the transport.
         max_keys: The most keys a key set may carry.
         clock: A monotonic clock, replaceable so that cache policy can be tested without
-            waiting for it.
+            waiting for it. `None`, the default, reads `monotonic_clock`.
 
     Raises:
         ConfigurationError: If the transport is not one, or `cache_ttl` is below the floor.
@@ -105,7 +117,7 @@ class JwksClient:
         refetch_interval: float = REFETCH_INTERVAL,
         max_bytes: int = MAX_JWKS_BYTES,
         max_keys: int = MAX_KEYS,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._uri = f"{base_url}{JWKS_PATH}"
         self._transport = _validated_transport(transport)
@@ -161,6 +173,9 @@ class JwksClient:
                 return None
             return self._answer(kid)
 
+    def _now(self) -> float:
+        return monotonic_clock() if self._clock is None else self._clock()
+
     def _fresh_hit(self, kid: str) -> Jwk | None:
         keys = self._keys
         if keys is None or not self._is_fresh():
@@ -168,13 +183,13 @@ class JwksClient:
         return keys.get(kid)
 
     def _is_fresh(self) -> bool:
-        return self._fetched_at is not None and self._clock() - self._fetched_at < self._cache_ttl
+        return self._fetched_at is not None and self._now() - self._fetched_at < self._cache_ttl
 
     def _may_fetch(self) -> bool:
         """One fetch per window, whoever asks. A generated `kid` is not a fetch trigger."""
         if self._attempted_at is None:
             return True
-        return self._clock() - self._attempted_at >= self._refetch_interval
+        return self._now() - self._attempted_at >= self._refetch_interval
 
     async def _refresh(self) -> None:
         """Attempt a fetch. A failure with keys already on hand is survivable; the first is not."""
@@ -182,7 +197,7 @@ class JwksClient:
         # gated behind; a COMPLETED refusal keeps the stamp so a failing upstream stays rate-
         # limited (D-084/D-196). Only the cancellation exception rolls back - never a refusal.
         previous = self._attempted_at
-        self._attempted_at = self._clock()
+        self._attempted_at = self._now()
         cancelled = anyio.get_cancelled_exc_class()
         try:
             keys = await self._fetched()
@@ -195,7 +210,7 @@ class JwksClient:
             self._attempted_at = previous
             raise
         self._keys = keys
-        self._fetched_at = self._clock()
+        self._fetched_at = self._now()
         self._missing.clear()
 
     def _answer(self, kid: str) -> Jwk | None:
@@ -214,7 +229,7 @@ class JwksClient:
         at = self._missing.get(kid)
         if at is None:
             return False
-        if self._clock() - at >= self._negative_ttl:
+        if self._now() - at >= self._negative_ttl:
             del self._missing[kid]
             return False
         return True
@@ -227,7 +242,7 @@ class JwksClient:
         """
         while len(self._missing) >= MAX_REMEMBERED_MISSES:
             self._missing.pop(next(iter(self._missing)))
-        self._missing[kid] = self._clock()
+        self._missing[kid] = self._now()
 
     async def _fetched(self) -> Mapping[str, Jwk]:
         try:
