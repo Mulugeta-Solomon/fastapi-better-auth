@@ -43,8 +43,11 @@ answer *right now* - it is restarting, overloaded or rate-limiting - which prove
 contract either way. Remembering one as a contract verdict would turn a few seconds of upstream
 restart into an outage lasting until the process restarts, so each is a reachability failure like a
 timeout: `AuthServiceUnavailable`, retried on the caller's window, never remembered. The same holds
-for the bearer rung when it refuses, because there a transient status leaves the posture unproven.
-Every other status that is not `200` remains a contract failure. The transient line is logged at
+for the bearer rung when it refuses, because there a transient status leaves the posture unproven -
+but only for an answer with no `set-cookie`. A `set-cookie` on the manufactured-bearer request is
+the permissive posture's evidence whatever status sits beside it, so under `refuse_unsigned_bearer`
+it takes precedence: a `503` that sets a cookie is the remembered `ConfigurationError`, not an
+outage. Every other status that is not `200` remains a contract failure. The transient line is logged at
 most once per `outage` latch the caller passes, naming the status and its class and never the body.
 """
 
@@ -189,7 +192,8 @@ async def _advise(
     Advisory, it swallows every failure of its own and warns once per process. Refusing, it is a
     rung like the four before it: its own failures propagate (so a reachability failure or a
     transient status stays an `AuthServiceUnavailable` the caller can retry - an unproven posture
-    must not pass the probe) and a `set-cookie` is a `ConfigurationError`.
+    must not pass the probe) and a `set-cookie` is a `ConfigurationError`. The `set-cookie` is
+    judged first: with it, the status class is irrelevant and the answer is never retried away.
     """
     token = "".join(secrets.choice(TOKEN_ALPHABET) for _ in range(MANUFACTURED_TOKEN_LENGTH))
     headers = {"accept": ACCEPT_JSON, AUTHORIZATION: f"Bearer {token}"}
@@ -202,9 +206,11 @@ async def _advise(
     finally:
         headers.clear()
         token = ""
-    if refuse:
-        _refuse_transient(response.status_code, uri, outage)
     if SET_COOKIE not in response.headers:
+        # Only a cookie-free answer can be an outage: a `set-cookie` is the posture's evidence
+        # whatever status sits beside it, so it is judged below and never retried away.
+        if refuse:
+            _refuse_transient(response.status_code, uri, outage)
         return
     if refuse:
         raise ConfigurationError(_unsigned_bearer_message(uri))
