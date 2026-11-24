@@ -53,10 +53,10 @@ def test_the_pyjwt_floor_excludes_the_releases_with_known_holes() -> None:
 @pytest.mark.parametrize(
     ("line", "expected"),
     [
-        ('"pyjwt[crypto]>=2.12.0",', (2, 12, 0)),
+        ('"pyjwt[crypto]>=2.15.0",', (2, 15, 0)),
         ('"pyjwt[crypto]>=2.10",', (2, 10)),
         ('"pyjwt[crypto]>=3",', (3,)),
-        ('"pyjwt[crypto]>=2.12.0,<3",', (2, 12, 0)),
+        ('"pyjwt[crypto]>=2.15.0,<3",', (2, 15, 0)),
     ],
     ids=["patched", "vulnerable", "major-only", "with-a-ceiling"],
 )
