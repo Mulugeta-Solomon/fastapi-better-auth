@@ -166,6 +166,36 @@ async def test_an_unknown_kid_still_waits_for_the_refresh(monkeypatch: pytest.Mo
     assert transport.calls == 2
 
 
+@pytest.mark.anyio
+async def test_a_cancelled_stale_refresher_releases_the_lock_and_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lock is taken by hand on this path, so its release is this path's to prove: a
+    refresher cancelled mid-fetch must leave neither the lock held (every unknown kid would
+    then wait forever) nor the refetch window spent (D-196), so the next stale hit refreshes."""
+    clock = wind_jwks_clock(monkeypatch)
+    verifier, transport = build(json_reply(KEY_SET), json_reply(KEY_SET))
+    token = SIGNER.sign(claims())
+    await verifier.verify(token, User)
+    clock.advance(STALE)
+    gate = _hold_the_next_fetch(transport)
+
+    with anyio.CancelScope() as scope:
+        async with anyio.create_task_group() as group:
+            group.start_soon(verifier.verify, token, User)
+            await _settled()
+            assert transport.calls == 2, "the refresh never started; this probe proves nothing"
+            scope.cancel()
+
+    gate.set()
+    with anyio.fail_after(5), pytest.raises(InvalidCredential):
+        # An unknown kid takes the lock the blocking way: a leaked lock hangs here.
+        await verifier.verify(ROTATED.sign(claims()), User)
+    assert transport.calls == 3, "the cancelled attempt must not have spent the window"
+    assert isinstance(await verifier.verify(token, User), Session)
+    assert transport.calls == 3
+
+
 def test_the_single_refresher_holds_for_a_verifier_built_outside_the_loop(
     anyio_backend: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

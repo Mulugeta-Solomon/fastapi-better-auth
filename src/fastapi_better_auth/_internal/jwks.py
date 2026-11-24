@@ -162,13 +162,22 @@ class JwksClient:
     async def key_for(self, kid: str) -> Jwk | None:
         """The key published under `kid`, or `None` when a key set we trust does not carry it.
 
+        A `kid` the honoured-but-stale set carries never waits for the network: one such lookup
+        refreshes and the rest are answered from the set on hand (`_stale_hit`). Every other
+        miss queues behind the lock, where concurrent misses collapse into one fetch.
+
         Raises:
             AuthServiceUnavailable: When there is no key set to answer from - the first fetch
-                failed, or the one on hand is stale and does not carry this `kid`.
+                failed, the one on hand is past `max_stale`, or it is stale and does not carry
+                this `kid`.
         """
         hit = self._fresh_hit(kid)
         if hit is not None:
             return hit
+        held = self._honoured()
+        stale = None if held is None else held.get(kid)
+        if stale is not None:
+            return await self._stale_hit(kid, stale)
         async with self._lock:
             # Re-checked inside the lock: whoever held it may have fetched the answer already.
             hit = self._fresh_hit(kid)
@@ -182,6 +191,29 @@ class JwksClient:
             elif self._honoured() is not None and self._is_remembered(kid):
                 return None
             return self._answer(kid)
+
+    async def _stale_hit(self, kid: str, held: Jwk) -> Jwk | None:
+        """A `kid` the stale, still-honoured set carries: refresh it once, never queue for it.
+
+        The lock is taken without blocking. Whoever gets it refreshes - inside the refetch
+        window like any fetch - and is answered by the set as it stands afterwards, so a key
+        that refresh withdrew is refused. Whoever finds it held is answered from the set on
+        hand at once, rather than waiting on a fetch that may hang until the transport's
+        timeout. No task is spawned, so asyncio and trio behave the same.
+        """
+        if not self._may_fetch():
+            return held
+        try:
+            self._lock.acquire_nowait()
+        except anyio.WouldBlock:
+            return held
+        try:
+            # Re-checked under the lock: a fetch may have finished between the two reads.
+            if self._may_fetch() and not self._is_fresh():
+                await self._refresh()
+            return self._answer(kid)
+        finally:
+            self._lock.release()
 
     def _now(self) -> float:
         return monotonic_clock() if self._clock is None else self._clock()
