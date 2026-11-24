@@ -141,7 +141,44 @@ class TestReasonHygiene:
 class TestRefusalFramesNewGates:
     """Frame hygiene for the WP15 refusal paths: a cache-remembered null, a latched refusal, a
     saturated limiter, and a probe/ready failure must each leave no frame holding the credential.
+    The cookie-octet refusal and a transient probe status are two more of the same kind.
     """
+
+    @pytest.mark.anyio
+    async def test_a_cookie_octet_refusal_holds_no_credential(self) -> None:
+        token, _, signature = COOKIE_VALUE.rpartition(".")
+        value = f"{token[:8]}\r\n{token[8:]}.{signature}"
+        transport = RecordingTransport(Reply(b"null"))
+        built = verifier(transport)
+        connection = with_cookie(value)
+
+        error = await refused(built, connection)
+
+        assert isinstance(error, InvalidCredential)
+        assert "cookie-octet" in error.reason
+        assert transport.calls == 0
+        assert holding(error, value, ignore=[connection, transport]) == []
+        assert holding(error, signature, ignore=[connection, transport]) == []
+
+    @pytest.mark.anyio
+    async def test_a_transient_probe_refusal_holds_no_credential(self) -> None:
+        # A cold verifier whose bare probe answers 503 refuses on _ready as an outage, and the
+        # cookie that triggered it is never bound in a surviving frame.
+        transport = ScriptedTransport(Reply(b"", status=503))
+        built = RemoteVerifier(
+            base_url=ORIGIN,
+            csrf=CsrfDisabled(reason="frame test, no cross-site request"),
+            transport=transport,
+            secure_cookies=False,
+        )
+        connection = with_cookie()
+
+        error = await refused(built, connection)
+
+        assert isinstance(error, AuthServiceUnavailable)
+        assert "503" in error.reason
+        assert holding(error, TOKEN, ignore=[connection, transport]) == []
+        assert holding(error, COOKIE_VALUE, ignore=[connection, transport]) == []
 
     @pytest.mark.anyio
     async def test_a_cache_remembered_null_refusal_holds_no_credential(self) -> None:

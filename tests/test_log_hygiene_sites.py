@@ -1,8 +1,8 @@
 """Every log line this library emits, driven, and the record it produced read for a credential.
 
 One scenario per `COVERED_BY` entry: the contained-verifier traceback, the two JWKS warnings, the
-four store-side lines, the cookie verifier's session-data warning, the 429 latch and the advisory
-bearer probe. Each asserts that its own template fired - so the manifest is a record of what ran,
+four store-side lines, the cookie verifier's session-data warning, the 429 latch, the advisory
+bearer probe and the probe's transient-status line. Each asserts that its own template fired - so the manifest is a record of what ran,
 not a declaration - and then that nothing a client chose, and no credential, reached the line.
 `test_the_manifest_names_tests_that_exist` pins that every name in the manifest resolves to a
 test in this file, which is where a new site's scenario must be written.
@@ -474,6 +474,43 @@ def test_the_advisory_require_signature_warning_carries_no_credential(
 
     anyio.run(drive)
 
-    site = next(s for s in COVERED_BY if s.module == "remote_probe")
-    assert_template_fired(records, site)
+    # Selected by template: `remote_probe` emits two lines now (see `manifest_site`).
+    assert_template_fired(records, manifest_site("get-session accepted a manufactured bearer"))
     assert "CLEARED-SENTINEL" not in rendered(records), "the set-cookie value reached the line"
+
+
+def test_a_transient_probe_status_warning_carries_no_body_or_credential(
+    records: list[logging.LogRecord],
+) -> None:
+    """The transient-status line names the status and the class this library wrote for it. The
+    body a crashing upstream or an overloaded proxy sent - which could echo a header, a cookie or
+    anything else - is never read into it."""
+
+    async def drive() -> None:
+        with pytest.raises(AuthServiceUnavailable):
+            await remote_probe.run_probe(
+                _OverloadedTransport(),
+                uri=f"{ORIGIN}/api/auth/get-session",
+                max_bytes=65536,
+                outage=Once(),
+            )
+
+    anyio.run(drive)
+
+    assert_template_fired(records, manifest_site("get-session readiness probe answered"))
+    assert "503" in rendered(records)
+    assert_no_leak(records, STORE_TOKEN)
+
+
+class _OverloadedTransport:
+    """Answers 503 with a body that echoes a credential, as a misbehaving proxy might."""
+
+    async def get(self, url: str, *, headers: Any = None, max_bytes: int) -> TransportResponse:
+        return TransportResponse(
+            status_code=503,
+            headers={"content-type": "text/plain"},
+            content=f"upstream down; your cookie was {STORE_TOKEN}".encode(),
+        )
+
+    async def post(self, *args: Any, **kwargs: Any) -> TransportResponse:
+        raise AssertionError("get-session is a GET; a POST here is a bug")  # pragma: no cover

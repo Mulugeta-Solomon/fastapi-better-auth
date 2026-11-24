@@ -144,10 +144,19 @@ def _relaxed(
     )
 
 
+def _retyped(
+    columns: Sequence[tuple[str, str]], types: Mapping[str, str]
+) -> tuple[tuple[str, str], ...]:
+    """Replace the declared type of the named columns, keeping every other column as it was."""
+    return tuple((name, types.get(name, kind)) for name, kind in columns)
+
+
 def build_schema(
     path: pathlib.Path,
     *,
     admin: bool = True,
+    session_types: Mapping[str, str] | None = None,
+    user_types: Mapping[str, str] | None = None,
     sessions: Sequence[Mapping[str, Any]] = (SESSION_ROW,),
     users: Sequence[Mapping[str, Any]] = (USER_ROW,),
     drop_session_columns: Sequence[str] = (),
@@ -160,9 +169,18 @@ def build_schema(
     session_table: str = "session",
     user_table: str = "user",
 ) -> None:
-    """Create and seed a SQLite database that mirrors better-auth's migrated schema."""
-    session_columns = BASE_SESSION_COLUMNS + (ADMIN_SESSION_COLUMNS if admin else ())
-    user_columns = BASE_USER_COLUMNS + (ADMIN_USER_COLUMNS if admin else ())
+    """Create and seed a SQLite database that mirrors better-auth's migrated schema.
+
+    `session_types` / `user_types` replace a column's whole declaration (type and constraints),
+    which is how a deployment's id mode is modelled: `generateId: "serial"` migrates every id
+    column to an integer, `"uuid"` to the database's uuid type where it has one.
+    """
+    session_columns = _retyped(
+        BASE_SESSION_COLUMNS + (ADMIN_SESSION_COLUMNS if admin else ()), session_types or {}
+    )
+    user_columns = _retyped(
+        BASE_USER_COLUMNS + (ADMIN_USER_COLUMNS if admin else ()), user_types or {}
+    )
     session_columns = _relaxed(
         tuple(c for c in session_columns if c[0] not in drop_session_columns),
         relax_session_columns,

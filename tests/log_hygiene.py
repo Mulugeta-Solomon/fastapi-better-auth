@@ -267,6 +267,15 @@ COVERED_BY: Mapping[LogSite, str] = {
             " forwards a cookie, never a bearer."
         ),
     ): "test_the_advisory_require_signature_warning_carries_no_credential",
+    LogSite(
+        module="remote_probe",
+        level="warning",
+        template=(
+            "get-session readiness probe answered %d (%s), so the upstream could not answer now;"
+            " every request is refused as AuthServiceUnavailable until a probe passes, and the"
+            " probe is retried on its own window. Not repeated for this verifier."
+        ),
+    ): "test_a_transient_probe_status_warning_carries_no_body_or_credential",
 }
 
 
