@@ -356,6 +356,38 @@ class TestZeroOutbound:
         assert same_site.status_code == 200, same_site.text
         sign_out(harness, cookie)
 
+    @pytest.mark.anyio
+    async def test_a_non_octet_cookie_is_401_before_any_upstream_call(self, harness: str) -> None:
+        """A real cookie with a space and a comma spliced into it is refused before the fetch:
+        those bytes are outside RFC 6265's cookie-octets, so nothing goes upstream. The unspliced
+        cookie is the anti-vacuum control - a 200 that costs exactly one call, so the zero is the
+        octet rung refusing and not a verifier that never fetches."""
+        # Guarded here, not in the module guard: the published-wheel canary runs this module
+        # against the last release, which may predate the rung, and must skip only this leg.
+        from fastapi_better_auth._internal import remote_verifier
+
+        if not hasattr(remote_verifier, "COOKIE_OCTETS"):
+            pytest.skip("this build of fastapi-better-auth-bridge has no cookie-octet rung")
+        cookie = sign_in(harness, SEED_EMAIL, SEED_PASSWORD)
+        spliced = f"{cookie[:6]} ,{cookie[6:]}"
+
+        async with HttpxTransport() as inner:
+            counting = CountingTransport(inner)
+            verifier = build(harness, counting)
+            await verifier.prepare()
+            probed = counting.calls
+            app = session_app(BetterAuth(verifiers=[verifier]))
+
+            refused = await drive(app, headers=cookie_header(spliced))
+            after_refusal = counting.calls
+            accepted = await drive(app, headers=cookie_header(cookie))
+
+        assert refused.status_code == 401
+        assert after_refusal == probed, "a non-octet cookie must never reach get-session"
+        assert accepted.status_code == 200, accepted.text
+        assert counting.calls == probed + 1
+        sign_out(harness, cookie)
+
 
 class TestUpstreamState:
     """Legs 5, 6a and 6b: the three ways a session that still parses is no longer a session."""

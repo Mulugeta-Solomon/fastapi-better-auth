@@ -12,7 +12,7 @@ from starlette.requests import HTTPConnection
 
 from .errors import ConfigurationError, InvalidCredential, SessionExpired
 from .httpx_transports import default_transport, usable_default
-from .jwks import CACHE_TTL, SUPPORTED_ALGORITHMS, Jwk, JwksClient
+from .jwks import CACHE_TTL, MAX_STALE, SUPPORTED_ALGORITHMS, Jwk, JwksClient
 from .models import Session, User
 from .parsing import parse_user
 from .reasons import fingerprint, safe_label
@@ -123,11 +123,19 @@ class JwtVerifier:
         max_token_lifetime: The largest `exp - iat` a token may declare, in seconds.
             Defaults to 900 plus `leeway`, which is upstream's own token lifetime.
         cache_ttl: How long a fetched key set stays fresh, in seconds; at least 60.
+        max_stale: How long past its last successful fetch a key set is still honoured while
+            refetching it fails, in seconds; 86400 (a day) by default, and never below
+            `cache_ttl`. Past it the key set is not honoured - a key upstream withdrew during
+            the outage would otherwise keep verifying - and every token is answered
+            `AuthServiceUnavailable` until a refetch succeeds. There is no way to switch the
+            bound off; pass a longer explicit duration if a day does not cover your outages.
 
     Raises:
         ConfigurationError: For any unusable configuration, at construction: a `base_url`
             that is not an origin, an algorithm this library will not verify, a leeway or
-            lifetime outside its bounds, a transport that is not one, or a missing `httpx`.
+            lifetime outside its bounds, a `cache_ttl` below its floor, a `max_stale` that is
+            not a finite number of seconds at least `cache_ttl`, a transport that is not one,
+            or a missing `httpx`.
     """
 
     def __init__(
@@ -139,6 +147,7 @@ class JwtVerifier:
         leeway: float = 0.0,
         max_token_lifetime: float | None = None,
         cache_ttl: float = CACHE_TTL,
+        max_stale: float = MAX_STALE,
     ) -> None:
         self.credential_source = CREDENTIAL_SOURCE
         self._origin = normalize_base_url(base_url)
@@ -155,6 +164,7 @@ class JwtVerifier:
             transport=self._transport,
             algorithms=self._algorithms,
             cache_ttl=cache_ttl,
+            max_stale=max_stale,
         )
 
     @property
@@ -252,6 +262,7 @@ class JwtVerifier:
             key = await self._key_for(kid, algorithm, marker)
             claims = _decoded(token, key, self, marker)
             _check_subject(claims, marker)
+            _check_not_before(claims, marker)
             _check_lifetime(claims, self._max_token_lifetime, marker)
             return _session(claims, user_model)
         finally:
@@ -355,7 +366,9 @@ def _decoded(token: str, key: Jwk, verifier: JwtVerifier, marker: str) -> Mappin
         )
     except jwt.ExpiredSignatureError:
         expired, failure = True, "ExpiredSignatureError"
-    except (jwt.PyJWTError, ValueError, TypeError, RecursionError) as exc:
+    except (jwt.PyJWTError, ValueError, TypeError, OverflowError, RecursionError) as exc:
+        # OverflowError: a date claim's int() conversion inside PyJWT, should a version not
+        # catch it itself - the claim is the token's, so it is the token that is refused.
         expired, failure = False, type(exc).__name__
     token = ""
     if expired:
@@ -370,10 +383,20 @@ def _check_subject(claims: Mapping[str, Any], marker: str) -> None:
         raise InvalidCredential(reason=f"sub identifies nobody {marker}")
 
 
+def _check_not_before(claims: Mapping[str, Any], marker: str) -> None:
+    """An `nbf` that is present must be a NumericDate, as `iat` and `exp` must.
+
+    PyJWT checks `nbf` against the clock through `int()`, which accepts `true`, `"1"` and an
+    integer far past any representable time, so its check passing says nothing about the shape.
+    """
+    if "nbf" in claims and _numeric_date(claims["nbf"]) is None:
+        raise InvalidCredential(reason=f"nbf is not a usable number {marker}")
+
+
 def _check_lifetime(claims: Mapping[str, Any], ceiling: float, marker: str) -> None:
     """A token upstream would never have minted, however well it is signed."""
-    issued = _as_number(claims.get("iat"))
-    expires = _as_number(claims.get("exp"))
+    issued = _numeric_date(claims.get("iat"))
+    expires = _numeric_date(claims.get("exp"))
     if issued is None or expires is None:
         raise InvalidCredential(reason=f"iat or exp is not a number {marker}")
     lifetime = expires - issued
@@ -396,7 +419,7 @@ def _session(claims: Mapping[str, Any], user_model: type[UserModelT]) -> Session
 
 def _expiry(claims: Mapping[str, Any]) -> datetime:
     """`exp` is already proven a number, and bounded by the lifetime ceiling above."""
-    expires = _as_number(claims.get("exp"))
+    expires = _numeric_date(claims.get("exp"))
     assert expires is not None, "the lifetime check runs first"
     return datetime.fromtimestamp(expires, tz=timezone.utc)
 
@@ -414,11 +437,21 @@ def _identified(claims: Mapping[str, Any]) -> Mapping[str, Any]:
     return {**claims, "id": claims.get("sub")}
 
 
-def _as_number(value: object) -> float | None:
-    """`bool` is an `int`, and a claim of `true` is not a time."""
+def _numeric_date(value: object) -> float | None:
+    """A claim as an RFC 7519 NumericDate in seconds, or `None` when it is not a usable one.
+
+    `bool` is an `int`, and a claim of `true` is not a time. A JSON integer has no size limit,
+    so one past the float range is refused here rather than allowed to raise `OverflowError`
+    out of the verifier, and a non-finite float (JSON `Infinity`/`NaN`, which Python's parser
+    accepts) is no time either.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _validated_algorithms(algorithms: object) -> tuple[str, ...]:

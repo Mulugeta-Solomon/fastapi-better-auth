@@ -309,9 +309,10 @@ async def test_an_empty_key_set_is_not_malformed_it_simply_knows_no_kid() -> Non
 
 @pytest.mark.anyio
 async def test_a_key_whose_material_is_broken_is_unavailable() -> None:
-    """An allowed algorithm whose key will not load is a corrupt key set, not an unknown
-    kid: reporting it as unknown would send the operator hunting for a rotation that
-    already happened."""
+    """A key set whose only key will not load is a corrupt key set, not an empty one:
+    reporting its kid as unknown would send the operator hunting for a rotation that
+    already happened. Beside a key that does load, the same entry is skipped instead - see
+    `test_jwks_unloadable_keys.py` - so this holds because *no* key in the set loads."""
     broken = dict(SIGNER.jwk)
     broken["x"] = "not-base64url-material"
     keys, _transport = client(json_reply({"keys": [broken]}))

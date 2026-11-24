@@ -38,6 +38,7 @@ Internal module, public class: `RemoteVerifier` is exported from the package roo
 from __future__ import annotations
 
 import hmac
+import re
 import time
 from collections.abc import Callable, Sequence
 from datetime import datetime
@@ -70,6 +71,7 @@ from .errors import (
 from .labels import cookie_source
 from .models import Session, User
 from .negative_cache import MAX_REMEMBERED_MISSES, NEGATIVE_TTL, NegativeCache
+from .once import Once
 from .parsing import parse_user
 from .reasons import fingerprint
 from .refusal_clock import RefusalClock, check_ban, check_expiry
@@ -112,6 +114,10 @@ MAX_SESSION_BYTES = 65536
 MAX_TOKEN_BYTES = 4096
 
 PROBE_RETRY_INTERVAL = 10.0
+
+COOKIE_OCTETS = re.compile(r"[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]+")
+"""RFC 6265 §4.1.1 `cookie-octet`, one or more: printable US-ASCII minus DQUOTE, `,`, `;` and `\\`.
+No CTL, no whitespace, nothing above 0x7E - so nothing that could split or extend a header."""
 
 
 class RemoteCredential:
@@ -159,7 +165,11 @@ class RemoteVerifier:
     **The outbound request is pinned at construction (D-010).** The URI is
     `{base_url}{base_path}/get-session?disableCookieCache=true&disableRefresh=true`, and the headers
     are exactly `cookie` (the one the browser sent, under its own name, value verbatim) and `accept:
-    application/json`. Nothing is ever taken from the incoming request - not the `Authorization`
+    application/json`. A value is forwarded only once it is all RFC 6265 cookie-octets, so no CR,
+    LF, comma, whitespace or non-ASCII byte a client chose can reach the outbound header; anything
+    else is refused like a malformed cookie with no upstream call. That is structure, not
+    authenticity: without a secret, a well-formed forged cookie is still forwarded.
+    Nothing is ever taken from the incoming request - not the `Authorization`
     header (forwarding it would let a client authenticate a bearer token this verifier never
     extracted), not `Origin`, `Host`, or any `X-Forwarded-*`.
 
@@ -284,6 +294,9 @@ class RemoteVerifier:
         self._probed_ok = False
         self._contract_failure: str | None = None
         self._probe_attempted_at: float | None = None
+        # Per instance, so two verifiers each report their own upstream; never re-armed, because a
+        # probe that passes is terminal and nothing after it reads this.
+        self._probe_outage = Once()
 
     @property
     def origin(self) -> str:
@@ -344,27 +357,30 @@ class RemoteVerifier:
         200-null contract, or cannot be reached at boot, stops the application from starting
         instead of refusing its first authenticated request. Idempotent.
 
-        Two failure classes are handled differently. A **contract** failure - a non-200, a
-        non-JSON or non-null body, a session document from a bare request, and under
-        `refuse_unsigned_bearer=True` an upstream that accepts an unsigned bearer token - is a
-        permanent fact about the deployment: it is remembered, and every later `prepare()` and
-        `verify()` re-raises it. A **reachability** failure at startup - a timeout, a refused
-        connection - is raised as a `ConfigurationError` too, because an auth service you cannot
-        reach at boot is a deployment that should not take traffic; but it is *not* remembered, so
-        wiring the probe lazily (never calling `prepare()`) instead lets the first request retry it.
+        Two failure classes are handled differently. A **contract** failure - a redirect, a `4xx`
+        other than `408`/`425`/`429`, a non-JSON or non-null body, a session document from a bare
+        request, and under `refuse_unsigned_bearer=True` an upstream that accepts an unsigned
+        bearer token - is a permanent fact about the deployment: it is remembered, and every later
+        `prepare()` and `verify()` re-raises it. A **reachability** failure at startup - a
+        timeout, a refused connection, or a transient status (`408`, `425`, `429`, any `5xx`) - is
+        raised as a `ConfigurationError` too, because an auth service that cannot answer at boot is
+        a deployment that should not take traffic; but it is *not* remembered, so a later
+        `prepare()` once the retry window has passed probes again, and wiring the probe lazily
+        (never calling `prepare()`) instead lets a later request retry it.
 
         Raises:
-            ConfigurationError: A contract failure (remembered), or an unreachable server at boot.
+            ConfigurationError: A contract failure (remembered), or a server that could not answer
+                at boot (not remembered).
         """
         try:
             await self._ready()
             return
         except AuthServiceUnavailable as unreachable:
             failure = ConfigurationError(
-                f"RemoteVerifier could not reach get-session at {self._uri} during startup:"
-                f" {unreachable.reason}. An auth service unreachable at boot is a deployment that"
-                " should not take traffic. Fix reachability, or omit startup()/lifespan to let the"
-                " probe run lazily on the first request instead."
+                f"RemoteVerifier could not get an answer from get-session at {self._uri} during"
+                f" startup: {unreachable.reason}. An auth service that cannot answer at boot is a"
+                " deployment that should not take traffic. Fix reachability, or omit"
+                " startup()/lifespan to let the probe run lazily on the first request instead."
             )
         raise failure from None  # outside the handler, as in `_acquire`
 
@@ -382,10 +398,12 @@ class RemoteVerifier:
         operator wires into startup.
 
         Raises:
-            ConfigurationError: A contract failure - a non-200, a non-JSON or non-null body, a
-                session document from a bare request, or (under `refuse_unsigned_bearer`) an
-                upstream that accepts an unsigned bearer token. The reason names the URI.
-            AuthServiceUnavailable: A reachability failure - the server could not be reached.
+            ConfigurationError: A contract failure - a redirect, a `4xx` other than
+                `408`/`425`/`429`, a non-JSON or non-null body, a session document from a bare
+                request, or (under `refuse_unsigned_bearer`) an upstream that accepts an unsigned
+                bearer token. The reason names the URI.
+            AuthServiceUnavailable: A reachability failure - the server could not be reached, or
+                answered a transient status (`408`, `425`, `429`, any `5xx`).
         """
         await run_probe(
             self._transport,
@@ -499,7 +517,9 @@ class RemoteVerifier:
         A confirmed probe returns at once. A remembered contract failure re-raises permanently. An
         unconfirmed verifier probes under the lock, throttled to one attempt per
         `PROBE_RETRY_INTERVAL`; between attempts every request is `AuthServiceUnavailable` - never
-        fail-open. The lock collapses a first-request burst into one probe.
+        fail-open. The lock collapses a first-request burst into one probe. A transient status
+        (`408`, `425`, `429`, any `5xx`) takes the same window as a timeout: the probe raises it
+        as `AuthServiceUnavailable`, so it is never remembered and the stamp spaces the retry.
         """
         if self._probed_ok:
             return
@@ -524,7 +544,9 @@ class RemoteVerifier:
 
     async def _attempt_probe(self) -> None:
         """One probe attempt under the lock. Contract failures are remembered permanently; a
-        cancelled attempt rolls back its stamp so it does not spend the retry window (D-196)."""
+        reachability failure (a transient status included) keeps its stamp, which is what spaces
+        the next attempt; a cancelled attempt rolls back its stamp so it does not spend the retry
+        window (D-196)."""
         previous = self._probe_attempted_at
         self._probe_attempted_at = self._clock()
         cancelled = anyio.get_cancelled_exc_class()
@@ -534,6 +556,7 @@ class RemoteVerifier:
                 uri=self._uri,
                 max_bytes=self._max_bytes,
                 refuse_unsigned_bearer=self._refuse_unsigned_bearer,
+                outage=self._probe_outage,
             )
         except ConfigurationError as contract:
             self._contract_failure = str(contract)
@@ -656,10 +679,17 @@ class RemoteVerifier:
 def _rung_one(material: str) -> str:
     """The always-on structural rung: the loosest rule that still filters garbage, zero outbound.
 
-    Byte cap, strict `unquote`, a last-dot split into a non-empty token and a non-empty signature,
-    and a token byte cap. The 32-alnum token rule is deliberately dropped: `advanced.database`
-    makes token shape operator-defined. One frame holds every credential local, scrubbed in
-    `finally`; the returned token is the caller's to scrub.
+    Byte cap (cookie mode's `MAX_COOKIE_BYTES`), RFC 6265 cookie-octets, strict `unquote`, a
+    last-dot split into a non-empty token and a non-empty signature, and a token byte cap. The
+    32-alnum token rule is deliberately dropped: `advanced.database` makes token shape
+    operator-defined. One frame holds every credential local, scrubbed in `finally`; the returned
+    token is the caller's to scrub.
+
+    The octet rule reads `material` as it arrived - still percent-encoded, which is exactly the
+    form forwarded upstream - so it is a rule about what may enter the outbound `cookie:` header,
+    not a token shape: `%0D%0A` is six octets and travels inert, while a raw CR, LF, space, comma,
+    DQUOTE, backslash, control byte or non-ASCII character is refused before anything is sent.
+    Better Auth's own value is `encodeURIComponent` output, which is always octets.
     """
     marker = fingerprint(material)
     decoded = token = signature = ""
@@ -668,6 +698,10 @@ def _rung_one(material: str) -> str:
         if length > MAX_COOKIE_BYTES:
             raise InvalidCredential(
                 reason=f"cookie value is {length} bytes, over the cap [{marker}]"
+            )
+        if not COOKIE_OCTETS.fullmatch(material):
+            raise InvalidCredential(
+                reason=f"cookie value carries a byte outside the RFC 6265 cookie-octet set [{marker}]"
             )
         decoded = unquoted_strictly(material)
         if decoded is None:
