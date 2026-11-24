@@ -35,6 +35,7 @@ LABEL = "canary"
 LABEL_COLOR = "D93F0B"
 LABEL_DESCRIPTION = "automated conformance canary"
 RESULT_FILE = "canary-result.json"
+ARTIFACT_PREFIX = "canary-result-"
 MAX_RESULT_BYTES = 4096
 GH_TIMEOUT_SECONDS = 120.0
 ISSUE_LIMIT = "500"
@@ -315,29 +316,48 @@ def execute(actions: Iterable[Action], gh: GhRunner) -> int:
     return failures
 
 
+def artifact_name(lane: str, matrix_version: str) -> str:
+    """The artifact name canary.yml gives a leg; the leg's own code cannot choose it."""
+    return f"{ARTIFACT_PREFIX}{lane}-{matrix_version}"
+
+
 def load_results(directory: Path) -> list[LegResult]:
-    """Every leg's file, wherever download-artifact put it (flat when only one matched)."""
+    """Every leg's file, each bound to the artifact directory the workflow named for its leg.
+
+    A file is accepted only at `<directory>/canary-result-<lane>-<version>/canary-result.json`
+    and only if it names that same lane and version: a leg that ran compromised upstream code
+    may speak for itself, never for another leg. download-artifact writes a lone pattern match
+    flat, with no artifact name to bind it to, so that layout is refused too; with ten legs that
+    each record unless cancelled, it means nine legs were cancelled, and a red job is right.
+    """
     if not directory.is_dir():
         return []
-    results: dict[tuple[str, str], LegResult] = {}
+    results: list[LegResult] = []
     for path in sorted(directory.rglob(RESULT_FILE)):
-        if path.stat().st_size > MAX_RESULT_BYTES:
-            fail(f"{path} is larger than {MAX_RESULT_BYTES} bytes")
-        try:
-            document: object = json.loads(path.read_text(encoding="utf-8"))
-        except ValueError:
-            fail(f"{path} is not JSON")
-        if not isinstance(document, dict):
-            fail(f"{path} is not a JSON object")
-        fields = {str(k): v for k, v in document.items()}  # pyright: ignore[reportUnknownVariableType]
-        expected = set(LegResult.__dataclass_fields__)
-        if set(fields) != expected or not all(isinstance(v, str) for v in fields.values()):
-            fail(f"{path} does not hold exactly the string fields {sorted(expected)}")
-        result = LegResult(**{key: str(value) for key, value in fields.items()})
-        if result.leg in results:
-            fail(f"two results for the {result.lane} leg against {result.matrix_version}")
-        results[result.leg] = result
-    return list(results.values())
+        result = read_result(path)
+        if path.parent.parent != directory or path.parent.name != artifact_name(*result.leg):
+            fail(
+                f"{path} names the {result.lane} leg against {result.matrix_version} but is "
+                f"not in that leg's artifact directory {artifact_name(*result.leg)!r}"
+            )
+        results.append(result)
+    return results
+
+
+def read_result(path: Path) -> LegResult:
+    if path.stat().st_size > MAX_RESULT_BYTES:
+        fail(f"{path} is larger than {MAX_RESULT_BYTES} bytes")
+    try:
+        document: object = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        fail(f"{path} is not JSON")
+    if not isinstance(document, dict):
+        fail(f"{path} is not a JSON object")
+    fields = {str(k): v for k, v in document.items()}  # pyright: ignore[reportUnknownVariableType]
+    expected = set(LegResult.__dataclass_fields__)
+    if set(fields) != expected or not all(isinstance(v, str) for v in fields.values()):
+        fail(f"{path} does not hold exactly the string fields {sorted(expected)}")
+    return LegResult(**{key: str(value) for key, value in fields.items()})
 
 
 def record(args: argparse.Namespace) -> int:

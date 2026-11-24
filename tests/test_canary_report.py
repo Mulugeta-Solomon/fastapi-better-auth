@@ -495,7 +495,8 @@ def test_a_tampered_result_file_is_refused_before_any_issue_call(
 
 def result_bytes(script: Report, staging: pathlib.Path, *, lane: str, version: str) -> bytes:
     """A genuine passing result for one leg, written by `record`, to plant somewhere else."""
-    record(script, staging, lane=lane, version=version, outcome="success", harness=version)
+    harness = "1.8.0" if version == "latest" else version
+    record(script, staging, lane=lane, version=version, outcome="success", harness=harness)
     return next(staging.rglob("canary-result.json")).read_bytes()
 
 
