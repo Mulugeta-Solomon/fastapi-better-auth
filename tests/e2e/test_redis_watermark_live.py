@@ -16,7 +16,9 @@ Asyncio only: redis-py drives the event loop directly.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
+from typing import NamedTuple
 
 import anyio
 import httpx
@@ -48,6 +50,7 @@ DELETE_DEADLINE_SECONDS = 5.0
 """How long upstream gets to delete the revoked key. It deletes in an after-transaction hook, so
 putting the document back before that delete lands would test nothing at all."""
 POLL_SECONDS = 0.05
+LIBRARY_LOGGER = "fastapi_better_auth"
 FRESH_READ = {"disableCookieCache": "true", "disableRefresh": "true"}
 """Upstream's own read, with neither its cookie cache nor a refresh write in the way."""
 
@@ -102,7 +105,17 @@ async def gone(raw: aioredis.Redis, key: str) -> None:
             await anyio.sleep(POLL_SECONDS)
 
 
-async def signed_in_session(base: str, raw: aioredis.Redis) -> tuple[str, str, bytes, int]:
+class Signed(NamedTuple):
+    """A fresh user's session, and what Redis held for it."""
+
+    email: str
+    cookie: str
+    token: str
+    document: bytes
+    lifetime: int
+
+
+async def signed_in_session(base: str, raw: aioredis.Redis) -> Signed:
     _user_id, email = sign_up(base, "watermark")
     cookie = sign_in(base, email, PASSWORD)
     token = raw_token(cookie)
@@ -110,15 +123,19 @@ async def signed_in_session(base: str, raw: aioredis.Redis) -> tuple[str, str, b
     lifetime = await raw.pttl(token)
     assert isinstance(document, bytes), "the session is not in secondary storage"
     assert lifetime > 0, "the session key carries no TTL"
-    return cookie, token, document, lifetime
+    return Signed(email, cookie, token, document, lifetime)
 
 
 class TestRevokeAllSessions:
     @pytest.mark.anyio
     async def test_a_key_that_outlived_the_revocation_gets_upstreams_answer(
-        self, redis_harness: str, redis_store: RedisSessionStore, raw: aioredis.Redis
+        self,
+        redis_harness: str,
+        redis_store: RedisSessionStore,
+        raw: aioredis.Redis,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        cookie, token, document, lifetime = await signed_in_session(redis_harness, raw)
+        _email, cookie, token, document, lifetime = await signed_in_session(redis_harness, raw)
         assert await redis_store.fetch_session_by_token(token) is not None
         assert upstream_accepts(redis_harness, cookie, token)
         try:
@@ -128,7 +145,8 @@ class TestRevokeAllSessions:
             assert await raw.get(token) == document, "the surviving key was not put back"
 
             # The bridge first: upstream's refusal path may clean up after itself.
-            bridge = await redis_store.fetch_session_by_token(token) is not None
+            with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER):
+                bridge = await redis_store.fetch_session_by_token(token) is not None
             upstream = upstream_accepts(redis_harness, cookie, token)
         finally:
             await raw.delete(token)
@@ -137,15 +155,40 @@ class TestRevokeAllSessions:
             f"upstream {'accepts' if upstream else 'refuses'} the surviving session and the"
             f" bridge {'accepts' if bridge else 'refuses'} it"
         )
+        # A refusal for the right reason: revoked, not a watermark or createdAt it could not read.
+        assert caplog.records == [], [entry.getMessage() for entry in caplog.records]
 
     @pytest.mark.anyio
     async def test_a_revocation_nothing_survived_is_refused_by_both(
         self, redis_harness: str, redis_store: RedisSessionStore, raw: aioredis.Redis
     ) -> None:
-        cookie, token, _document, _lifetime = await signed_in_session(redis_harness, raw)
+        _email, cookie, token, _document, _lifetime = await signed_in_session(redis_harness, raw)
 
         revoke_all(redis_harness, cookie)
         await gone(raw, token)
 
         assert await redis_store.fetch_session_by_token(token) is None
         assert not upstream_accepts(redis_harness, cookie, token)
+
+    @pytest.mark.anyio
+    async def test_a_sign_in_after_the_revocation_is_accepted_by_both(
+        self,
+        redis_harness: str,
+        redis_store: RedisSessionStore,
+        raw: aioredis.Redis,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The leg that proves the watermark is read rather than merely refused on: a reader that
+        could not parse what upstream really writes would refuse this session too - and every
+        session of this user, until the watermark's own TTL ran out."""
+        email, cookie, token, _document, _lifetime = await signed_in_session(redis_harness, raw)
+        revoke_all(redis_harness, cookie)
+        await gone(raw, token)
+
+        fresh = sign_in(redis_harness, email, PASSWORD)
+        with caplog.at_level(logging.WARNING, logger=LIBRARY_LOGGER):
+            bridge = await redis_store.fetch_session_by_token(raw_token(fresh))
+
+        assert bridge is not None
+        assert upstream_accepts(redis_harness, fresh, raw_token(fresh))
+        assert caplog.records == [], [entry.getMessage() for entry in caplog.records]
