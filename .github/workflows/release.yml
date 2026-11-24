@@ -3,6 +3,11 @@ name: release
 on:
   release:
     types: [published]
+  # A rehearsal: runs on-main, the full test workflow and build for the dispatched commit, and
+  # never publishes. PR CI never executes this file and v* tags are immutable, so this is how a
+  # workflow bug is found before it burns a tag and a version number. A dispatch from a branch
+  # other than main fails on-main, which rehearses that guard too.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -10,7 +15,7 @@ permissions:
 jobs:
   on-main:
     # A release can be cut from any tag, including one on an unmerged branch. Only a commit
-    # that is already on main may reach PyPI.
+    # that is already on main may reach PyPI. On a dispatch it checks the dispatched commit.
     name: tagged commit is on main
     runs-on: ubuntu-latest
     steps:
@@ -52,6 +57,8 @@ jobs:
       - name: Build distributions
         run: uv build --no-sources
       - name: Guard — git tag must equal the built wheel's version
+        # A dispatch has no tag to compare; every other guard runs on both events.
+        if: github.event_name != 'workflow_dispatch'
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           WHEEL=$(ls dist/*.whl)
@@ -67,7 +74,10 @@ jobs:
           path: dist/
 
   publish:
-    needs: build
+    # Only a published release reaches PyPI; a dispatch stops after build. The needs are listed
+    # in full so the gate does not rest on build's own needs alone.
+    if: github.event_name == 'release'
+    needs: [on-main, tests, build]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
