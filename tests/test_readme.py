@@ -30,6 +30,7 @@ import json
 import pathlib
 import re
 import sys
+import types
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
@@ -213,12 +214,23 @@ def run(snippet: Snippet) -> dict[str, Any]:
 
     Compiled with `dont_inherit=True`: a reader's module does not have this file's
     `from __future__ import annotations`, so the snippet must not run under it either.
+
+    Run as a real module, registered in `sys.modules` while its top level executes, because a
+    reader's file is one: pydantic 2.14 looks the module up by `__name__` when a generic model
+    is parametrized at module level. Unregistered afterwards, success or failure, so no
+    snippet outlives its run or is found by the next one.
     """
-    namespace: dict[str, Any] = {"__name__": f"readme_snippet_{snippet.line}"}
+    name = f"readme_snippet_{snippet.line}"
+    assert name not in sys.modules, f"{name} is already a module; snippets must not nest"
+    module = types.ModuleType(name)
     code = compile(snippet.code, f"<{snippet.id}>", "exec", dont_inherit=True)
-    # The source is this repository's own documentation, and running it IS the test.
-    exec(code, namespace)  # noqa: S102
-    return namespace
+    sys.modules[name] = module
+    try:
+        # The source is this repository's own documentation, and running it IS the test.
+        exec(code, module.__dict__)  # noqa: S102
+    finally:
+        del sys.modules[name]
+    return module.__dict__
 
 
 def factory_apps(namespace: Mapping[str, Any]) -> tuple[FastAPI, ...]:
