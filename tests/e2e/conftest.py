@@ -9,14 +9,24 @@ import urllib.parse
 import httpx
 import pytest
 
+
+def harness_port(variable: str, default: str) -> str:
+    """A host port from its HARNESS_*_PORT variable, unset or empty meaning the default.
+
+    This is what Compose's `${VAR:-default}` does in harness/docker-compose.yml, so the fixtures
+    and the published ports agree whether the variable is absent or set to nothing.
+    """
+    return os.environ.get(variable, "").strip() or default
+
+
 # Host ports follow harness/docker-compose.yml: one HARNESS_*_PORT variable moves both the
 # published port and these defaults; a full URL variable still overrides everything.
-AUTH_PORT = os.environ.get("HARNESS_AUTH_PORT", "3100")
-AUTH_REDIS_PORT = os.environ.get("HARNESS_AUTH_REDIS_PORT", "3101")
-AUTH_STRICT_PORT = os.environ.get("HARNESS_AUTH_STRICT_PORT", "3102")
-AUTH_THROTTLED_PORT = os.environ.get("HARNESS_AUTH_THROTTLED_PORT", "3103")
-POSTGRES_PORT = os.environ.get("HARNESS_POSTGRES_PORT", "15432")
-REDIS_PORT = os.environ.get("HARNESS_REDIS_PORT", "16379")
+AUTH_PORT = harness_port("HARNESS_AUTH_PORT", "3100")
+AUTH_REDIS_PORT = harness_port("HARNESS_AUTH_REDIS_PORT", "3101")
+AUTH_STRICT_PORT = harness_port("HARNESS_AUTH_STRICT_PORT", "3102")
+AUTH_THROTTLED_PORT = harness_port("HARNESS_AUTH_THROTTLED_PORT", "3103")
+POSTGRES_PORT = harness_port("HARNESS_POSTGRES_PORT", "15432")
+REDIS_PORT = harness_port("HARNESS_REDIS_PORT", "16379")
 
 HARNESS_URL = os.environ.get("HARNESS_URL", f"http://localhost:{AUTH_PORT}")
 REDIS_HARNESS_URL = os.environ.get("REDIS_HARNESS_URL", f"http://localhost:{AUTH_REDIS_PORT}")
