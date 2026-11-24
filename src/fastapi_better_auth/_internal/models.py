@@ -213,6 +213,25 @@ class Session(BaseModel, Generic[UserT]):
             distinguishing on this field - nobody is impersonating, the plugin is not mounted,
             and Mode B, where a JWT carries the user object alone and no session column can
             reach it. It stays readable on `raw` as `impersonatedBy` too.
+        id: The session's own id - Better Auth's `session.id`, the row key - which is not a
+            credential. Mode A reads it from the store: the SQL store requires it (a row without
+            one is refused), the Redis store takes it when the stored document carries one, and
+            a store of your own sets it on `StoredSession.id` or leaves it `None`. Mode C takes
+            it from the `get-session` body when that carries one. `None` in Mode B, always: the
+            JWT plugin's default payload is the user object, so its `id` claim is the *user's*
+            id, and it is never read as this one.
+        cookie: The session cookie the verifier accepted, as `(name, value)`: the name it read,
+            `__Secure-` or `__Host-` prefix included, and the value exactly as accepted - still
+            percent-encoded, and reassembled if it arrived in chunks. Sent on as
+            `Cookie: {name}={value}` it is what Better Auth's own routes read. Set in Modes A and
+            C once every check has passed; `None` in Mode B. The value is a live credential held
+            as a `SecretStr`: masked in reprs, JSON dumps and `jsonable_encoder`, and read with
+            `.get_secret_value()`.
+        origin: The `allowed_origins` entry the CSRF check matched - the configured string, never
+            the request's `Origin` header - on an unsafe method or a WebSocket handshake in Modes A
+            and C under `OriginCheck` or `SignedDoubleSubmit`. `None` everywhere else: a safe
+            method (no check runs), `CsrfDisabled`, a policy of your own (a subclass of a shipped
+            one included), and Mode B.
         raw: The upstream payload as it arrived - the decoded JWT claims, or the `session`
             half of the `get-session` body (never the `{session, user}` wrapper; the user is
             `Session.user`). Everything this model does not promote to a field
@@ -230,6 +249,9 @@ class Session(BaseModel, Generic[UserT]):
 
     Instances are immutable. `Session` is formally hashable, but `hash()` raises
     `TypeError` at call time because `raw` is a mapping - key on `session.user` instead.
+    Two sessions are equal when every field is, `token` and `cookie` compared by value.
+    Pickling one writes `token` and the `cookie` value into the stream in cleartext, as
+    pickling any `SecretStr` does, so never pickle a session into a cache, a queue or a log.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -238,4 +260,7 @@ class Session(BaseModel, Generic[UserT]):
     expires_at: AwareDatetime | None
     token: SecretStr | None = None
     impersonated_by: str | None = None
+    id: str | None = None
+    cookie: tuple[str, SecretStr] | None = None
+    origin: str | None = None
     raw: RawPayload = Field(repr=False, exclude=True)

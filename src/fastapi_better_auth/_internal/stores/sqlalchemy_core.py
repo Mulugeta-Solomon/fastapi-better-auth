@@ -337,11 +337,18 @@ def session_from(rows: Sequence[Mapping[str, Any]], plan: Plan, token: str) -> S
         return None
     payload = _payload(row, plan.session_columns, SESSION_PREFIX)
     user = user_from(rows, plan, token)
+    session_id = as_text(payload.get("id"))
     expires_at = as_moment(payload.get("expiresAt"))
     user_id = as_text(payload.get("userId"))
     stored_token = as_text(payload.get("token"))
-    if expires_at is None or user_id is None or stored_token is None or user is None:
-        unusable("session", _why(expires_at, user_id, stored_token, user), token)
+    if (
+        session_id is None
+        or expires_at is None
+        or user_id is None
+        or stored_token is None
+        or user is None
+    ):
+        unusable("session", _why(session_id, expires_at, user_id, stored_token, user), token)
         return None
     # Equality was delegated to `WHERE token = :token`, i.e. to the DB collation. A
     # case/accent/pad-insensitive collation (MySQL's `utf8mb4_0900_ai_ci` default) folds a
@@ -357,6 +364,7 @@ def session_from(rows: Sequence[Mapping[str, Any]], plan: Plan, token: str) -> S
         payload=payload,
         user=user,
         impersonated_by=as_text(payload.get("impersonatedBy")),
+        id=session_id,
     )
 
 
@@ -421,11 +429,16 @@ def _payload(row: Mapping[str, Any], columns: tuple[str, ...], prefix: str) -> d
 
 
 def _why(
-    expires_at: object, user_id: str | None, stored_token: str | None, user: StoredUser | None
+    session_id: str | None,
+    expires_at: object,
+    user_id: str | None,
+    stored_token: str | None,
+    user: StoredUser | None,
 ) -> str:
     absent = [
         name
         for name, value in (
+            ("id", session_id),
             ("expiresAt", expires_at),
             ("userId", user_id),
             ("token", stored_token),

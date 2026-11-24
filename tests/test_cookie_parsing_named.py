@@ -1,9 +1,8 @@
-"""`resolve_named_cookie` - the (name, value) form Mode C forwards, over the one configured base.
+"""`resolve_named_cookie` - the (name, value) both cookie modes resolve, over the one base.
 
-`resolve_cookie_value` is now its `.value` projection, so the existing byte-unchanged suite in
-`test_cookie_parsing.py` also pins the value half of this. These rows pin the name half and the
-one-base rule the audit's D-189 fix put in place: the resolved name is the configured base, never
-a second accept-both name.
+Mode C forwards the pair, and both modes hand it on as `Session.cookie`; the value half is pinned
+by `test_cookie_parsing.py`. These rows pin the name half and the one-base rule the audit's D-189
+fix put in place: the resolved name is the configured base, never a second accept-both name.
 """
 
 from __future__ import annotations
@@ -11,10 +10,7 @@ from __future__ import annotations
 import pytest
 
 from fastapi_better_auth import InvalidCredential
-from fastapi_better_auth._internal.cookie_parsing import (
-    resolve_cookie_value,
-    resolve_named_cookie,
-)
+from fastapi_better_auth._internal.cookie_parsing import resolve_named_cookie
 
 COOKIE = "better-auth.session_token"
 SECURE = "__Secure-better-auth.session_token"
@@ -40,12 +36,6 @@ def test_only_the_configured_base_is_resolved() -> None:
     name, value = resolve_named_cookie(pairs((COOKIE, "plain"), (SECURE, "secure")), COOKIE)
 
     assert (name, value) == (COOKIE, "plain")
-
-
-def test_resolve_cookie_value_is_the_value_projection() -> None:
-    both = pairs((COOKIE, "value"))
-
-    assert resolve_cookie_value(both, COOKIE) == resolve_named_cookie(both, COOKIE)[1]
 
 
 def test_a_duplicate_base_name_is_refused() -> None:

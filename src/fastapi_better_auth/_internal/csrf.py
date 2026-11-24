@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import re
 from collections.abc import Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Protocol, cast, runtime_checkable
 
@@ -49,6 +50,14 @@ BROWSER_HEADERS = frozenset(
 
 Each of these is either set by the browser itself or CORS-safelisted, so a cross-site form
 POST already carries it. Requiring one would look like a control and enforce nothing.
+"""
+
+_admitted: ContextVar[list[str] | None] = ContextVar("fastapi_better_auth_csrf", default=None)
+"""Where the shipped matcher records the entry it matched, open only inside `enforce_policy`.
+
+`check` has to keep returning `None`, so the configured entry leaves by this side door: the
+sanctioned call opens a fresh list, the matcher appends to it, and the call closes it again before
+returning - all synchronously, in one context, so no other request can read or write it.
 """
 
 
@@ -204,6 +213,10 @@ class CsrfPolicy(Protocol):
     handed. Be aware of what that check can see: `isinstance` against a runtime-checkable
     protocol proves the member *names* exist, and nothing about their signatures.
 
+    A policy of your own - a subclass of a shipped one included - leaves `Session.origin` at
+    `None`: only `OriginCheck` and `SignedDoubleSubmit` hand the verifier the configured
+    `allowed_origins` entry their comparison matched.
+
     Attributes:
         required_header: The one custom header this policy reads, lowercased, or `None` if it
             reads none. `CsrfFacts.from_connection` captures exactly this header, so a policy
@@ -257,7 +270,8 @@ class OriginCheck:
     origin. The `Origin` a request presents is **not** re-canonicalized: browsers serialize it
     canonically already, and running configuration validation over an attacker-supplied header
     would turn a hostile value into a `ConfigurationError`. It is compared verbatim, in
-    constant time, against every entry.
+    constant time, against every entry. The entry it matched - the configured string, not the
+    header - is what the verifier hands a route as `Session.origin`.
 
     Args:
         allowed_origins: Every origin a browser may legitimately present, as full origins -
@@ -300,7 +314,7 @@ class OriginCheck:
         try:
             if not facts.requires_check:
                 return
-            _reject_bad_origin(facts, self._encoded)
+            _reject_bad_origin(facts, self._allowed, self._encoded)
             if self._header is not None:
                 _presented_header(facts, self._header)
         finally:
@@ -405,7 +419,7 @@ class SignedDoubleSubmit:
         try:
             if not facts.requires_check:
                 return
-            _reject_bad_origin(facts, self._encoded)
+            _reject_bad_origin(facts, self._allowed, self._encoded)
             presented = _presented_header(facts, self._header)
             _reject_forged_token(self._secret, session_token, presented, self._header)
         finally:
@@ -464,7 +478,9 @@ class CsrfDisabled:
 # ---------------------------------------------------------------- the rungs
 
 
-def _reject_bad_origin(facts: CsrfFacts, allowed: tuple[bytes, ...]) -> None:
+def _reject_bad_origin(
+    facts: CsrfFacts, allowed: tuple[str, ...], encoded: tuple[bytes, ...]
+) -> None:
     site = facts.sec_fetch_site
     if isinstance(site, str) and site.strip().casefold() == CROSS_SITE:
         raise CsrfFailure(
@@ -485,11 +501,16 @@ def _reject_bad_origin(facts: CsrfFacts, allowed: tuple[bytes, ...]) -> None:
             reason="more than one Origin header on an unsafe request; a browser sends exactly one"
         )
     presented = origin.encode("utf-8", "replace")
-    matched = False
-    for candidate in allowed:
-        matched |= hmac.compare_digest(presented, candidate)
-    if not matched:
+    # Every entry is compared, and the match is summed rather than branched on. The allowlist is
+    # deduplicated at construction, so at most one entry can match and `position` names it.
+    position = 0
+    for index, candidate in enumerate(encoded, start=1):
+        position += index * hmac.compare_digest(presented, candidate)
+    if not position:
         raise CsrfFailure(reason=f"Origin {safe_origin(origin)} is not in allowed_origins")
+    recorder = _admitted.get()
+    if recorder is not None:
+        recorder.append(allowed[position - 1])
 
 
 def _presented_header(facts: CsrfFacts, name: str) -> str:
@@ -549,14 +570,21 @@ def _digest(secret: SharedSecret, session_token: object) -> str:
 # ---------------------------------------------------------------- eager configuration
 
 
-def enforce_policy(policy: CsrfPolicy, facts: CsrfFacts, session_token: str) -> None:
-    """Run `policy`, and refuse a policy that answered instead of raising.
+def enforce_policy(policy: CsrfPolicy, facts: CsrfFacts, session_token: str) -> str | None:
+    """Run `policy`, refuse a policy that answered instead of raising, and say what it matched.
 
     The one sanctioned way to consume a `CsrfPolicy`. `check` allows by returning `None`, so a
     policy written to return `False` for "deny" would be a silent fail-open at every call site
     that ignored the answer - the same hazard `core._checked` exists for, answered the same
     way: loudly, as a `ConfigurationError`, rather than by guessing what was meant.
+
+    Returns the `allowed_origins` entry an `OriginCheck` or `SignedDoubleSubmit` matched - the
+    configured string itself, never the request's header - which the verifier hands on as
+    `Session.origin`. `None` when no comparison admitted the request: a safe method, and every
+    other policy, a subclass of those two included (its `check` is its own to have changed).
     """
+    matched: list[str] = []
+    recording = _admitted.set(matched)
     try:
         answer = policy.check(facts, session_token)
         if answer is not None:
@@ -566,7 +594,13 @@ def enforce_policy(policy: CsrfPolicy, facts: CsrfFacts, session_token: str) -> 
                 " returned answer is ignored by every caller, so it would allow the request."
             )
     finally:
+        _admitted.reset(recording)
         session_token = ""
+    return matched[0] if type(policy) in _MATCHERS and len(matched) == 1 else None
+
+
+_MATCHERS: tuple[type[CsrfPolicy], ...] = (OriginCheck, SignedDoubleSubmit)
+"""The policies whose matched entry reaches `Session.origin` - exactly these, never a subclass."""
 
 
 def validated_policy(policy: object, *, where: str) -> CsrfPolicy:
