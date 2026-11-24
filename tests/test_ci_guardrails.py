@@ -21,6 +21,7 @@ every assertion below pass over an empty set.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 
@@ -298,6 +299,20 @@ def test_the_issue_writer_runs_only_on_main_and_never_for_a_cancelled_run() -> N
 def test_no_workflow_talks_to_issues_outside_the_reporter_script() -> None:
     for path in workflow_files():
         assert "gh issue" not in path.read_text(encoding="utf-8"), path.name
+
+
+def test_the_reporter_expects_exactly_the_matrix_both_lanes_sweep() -> None:
+    """Three copies of one list: the two matrices and the reporter's expected coverage. If the
+    reporter's copy drifted, a dropped leg would never be reported missing."""
+    text = CANARY.read_text(encoding="utf-8")
+    matrices = re.findall(r"^\s+version: (\[[^]]*\])$", text, re.MULTILINE)
+    expected = re.findall(r"^\s+EXPECTED_VERSIONS: '(\[[^]]*\])'$", text, re.MULTILINE)
+
+    assert len(matrices) == 2
+    assert len(expected) == 1
+    assert json.loads(matrices[0]) == json.loads(matrices[1]) == json.loads(expected[0])
+    (writer,) = [job for job in jobs(CANARY).values() if "issues: write" in job]
+    assert '--expected-versions "$EXPECTED_VERSIONS"' in writer
 
 
 def test_every_matrix_leg_records_and_uploads_its_verdict() -> None:
