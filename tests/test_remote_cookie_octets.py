@@ -225,6 +225,57 @@ async def test_the_outbound_name_is_the_configured_secure_name() -> None:
     ]
 
 
+@pytest.mark.anyio
+async def test_a_semicolon_ends_the_value_so_a_smuggled_pair_is_never_forwarded() -> None:
+    """`;` can never be inside a value: the header parser splits on it, so `tok.sig;evil=1` is two
+    pairs, and only the session cookie's own pair is forwarded - the other is not this verifier's
+    and goes nowhere."""
+    header = f"{COOKIE_NAME}={COOKIE_VALUE};evil=1".encode("latin-1")
+    scope = {"type": "http", "method": "GET", "path": "/x", "headers": [(b"cookie", header)]}
+    transport = RecordingTransport(json_reply(document()))
+
+    session = await run(verifier(transport), HTTPConnection(scope))
+
+    assert session.user.id == "u1"
+    assert transport.sent == [
+        {"cookie": f"{COOKIE_NAME}={COOKIE_VALUE}", "accept": "application/json"}
+    ]
+
+
+@pytest.mark.anyio
+async def test_a_semicolon_that_cuts_the_value_short_is_refused_without_a_call() -> None:
+    """Split at a `;`, the session pair keeps only what came before it; with no signature
+    separator left, the structural rung refuses it and nothing is forwarded."""
+    header = f"{COOKIE_NAME}={TOKEN[:8]};{TOKEN[8:]}.{SIGNATURE}".encode("latin-1")
+    scope = {"type": "http", "method": "GET", "path": "/x", "headers": [(b"cookie", header)]}
+    transport = RecordingTransport(Reply(b"null"))
+
+    with pytest.raises(InvalidCredential):
+        await run(cold(transport), HTTPConnection(scope))
+
+    assert transport.calls == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("edge", ["\r\n", "\n", "\r", " ", "\t", "\x85", "\xa0"], ids=repr)
+async def test_whitespace_at_the_edges_is_stripped_by_the_parser_and_never_forwarded(
+    edge: str,
+) -> None:
+    """Leading and trailing whitespace (including CR, LF, NEL and NBSP) is stripped when the
+    header is split into pairs, so it cannot reach the outbound header either: what is forwarded
+    is exactly the cookie, under the configured name."""
+    transport = RecordingTransport(json_reply(document()))
+
+    session = await run(
+        verifier(transport), raw_cookie_connection((COOKIE_NAME, f"{edge}{COOKIE_VALUE}{edge}"))
+    )
+
+    assert session.user.id == "u1"
+    assert transport.sent == [
+        {"cookie": f"{COOKIE_NAME}={COOKIE_VALUE}", "accept": "application/json"}
+    ]
+
+
 # ---------------------------------------------------------------- on the wire
 
 

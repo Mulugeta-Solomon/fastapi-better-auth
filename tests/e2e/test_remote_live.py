@@ -362,6 +362,12 @@ class TestZeroOutbound:
         those bytes are outside RFC 6265's cookie-octets, so nothing goes upstream. The unspliced
         cookie is the anti-vacuum control - a 200 that costs exactly one call, so the zero is the
         octet rung refusing and not a verifier that never fetches."""
+        # Guarded here, not in the module guard: the published-wheel canary runs this module
+        # against the last release, which may predate the rung, and must skip only this leg.
+        from fastapi_better_auth._internal import remote_verifier
+
+        if not hasattr(remote_verifier, "COOKIE_OCTETS"):
+            pytest.skip("this build of fastapi-better-auth-bridge has no cookie-octet rung")
         cookie = sign_in(harness, SEED_EMAIL, SEED_PASSWORD)
         spliced = f"{cookie[:6]} ,{cookie[6:]}"
 
