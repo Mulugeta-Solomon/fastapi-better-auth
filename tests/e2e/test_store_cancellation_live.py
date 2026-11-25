@@ -13,6 +13,14 @@ more lookups than the pool has connections; after each one, the store's backends
 lock must go back to none and the store's connections must stay within the pool. The waits poll
 for the condition with a generous backstop instead of sleeping for a guess.
 
+The second case is a server that stops answering altogether, which no cancel request reaches: a
+relay between the store and Postgres stops forwarding both ways (`relay.py`). There the driver
+may never finish its clean-up on its own, and the store's backstop has to end it - so every
+abandoned call must end within the store's wind-down bound, the pool must hold no more than its
+size, and the store must answer as soon as the relay forwards again. It runs twice: at the shipped
+bound, which asyncpg's own two-second close timeout beats, and at a bound short enough that the
+backstop ends the calls first.
+
 Asyncio only: `asyncpg` drives the event loop directly, as in every other store-backed lane.
 """
 
@@ -25,20 +33,24 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any, NamedTuple
 
+import anyio
 import pytest
-from sqlalchemy import text
+from sqlalchemy import QueuePool, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from fastapi_better_auth import AuthServiceUnavailable, SessionError
 
 from .conftest import POSTGRES_URL
+from .relay import StallingRelay
 
 try:
     # The test helpers import post-0.1.0 names too, so they belong under the guard as well: the
     # canary's published-wheel leg installs the last release, and must skip here, not raise.
     from fastapi_better_auth import CookieVerifier, SqlAlchemySessionStore
+    from fastapi_better_auth._internal.stores.task_handoff import WIND_DOWN_SECONDS, TaskHandoff
     from tests.cookies import COOKIE, http, run, sign
-    from tests.deadlines import every_call_ended, verifier
+    from tests.deadlines import GUARD, every_call_ended, verifier
 except ImportError:
     pytest.skip(
         "this build of fastapi-better-auth-bridge publishes no session stores",
@@ -209,4 +221,84 @@ async def test_lookups_abandoned_at_their_deadline_leave_no_backend_behind(
     assert answer == "SessionRevoked", "the store did not answer once the lock was released"
     assert recovered_in < LOOKUP_TIMEOUT
     await every_call_ended(store)
+    assert loop_reports == []
+
+
+# ---------------------------------------------------------------- a server that stopped answering
+
+STALL_LOOKUP_TIMEOUT = 0.5
+"""Long enough for a lookup through the forwarding relay; every stalled one runs into it."""
+STALL_WAVES = 3
+SHORT_WIND_DOWN = 0.5
+"""Shorter than asyncpg's own two-second close timeout, so the backstop is what ends the calls."""
+RECOVERY_LOOKUPS = 3
+
+
+@pytest.fixture
+async def relay(harness: str) -> AsyncIterator[StallingRelay]:
+    target = make_url(POSTGRES_URL)
+    built = StallingRelay(target.host or "127.0.0.1", target.port or 5432)
+    await built.start()
+    try:
+        yield built
+    finally:
+        built.resume()
+        await built.close()
+
+
+@pytest.fixture
+async def relayed_engine(relay: StallingRelay) -> AsyncIterator[AsyncEngine]:
+    built = create_async_engine(
+        make_url(POSTGRES_URL).set(host="127.0.0.1", port=relay.port),
+        pool_size=POOL_SIZE,
+        max_overflow=MAX_OVERFLOW,
+    )
+    yield built
+    await built.dispose()
+
+
+def checked_out(engine: AsyncEngine) -> int:
+    pool = engine.sync_engine.pool
+    assert isinstance(pool, QueuePool)
+    return pool.checkedout()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "wind_down", [WIND_DOWN_SECONDS, SHORT_WIND_DOWN], ids=["shipped-bound", "backstop-first"]
+)
+async def test_lookups_abandoned_against_a_stalled_server_end_within_the_bound(
+    relay: StallingRelay,
+    relayed_engine: AsyncEngine,
+    wind_down: float,
+    loop_reports: list[dict[str, Any]],
+) -> None:
+    store = SqlAlchemySessionStore(engine=relayed_engine)
+    store._handoff = TaskHandoff(wind_down=wind_down)  # pyright: ignore[reportPrivateUsage]
+    await store.connect()
+    built = verifier(store, lookup_timeout=STALL_LOOKUP_TIMEOUT)
+    assert await one_lookup(built) == "SessionRevoked"
+    held: list[int] = []
+
+    relay.stall()
+    try:
+        for _ in range(STALL_WAVES):
+            outcomes = await asyncio.gather(*(one_lookup(built) for _ in range(PER_WAVE)))
+            assert outcomes == ["deadline"] * PER_WAVE
+            held.append(checked_out(relayed_engine))
+        started = time.monotonic()
+        # The bound runs from each call's abandonment, and the last wave's calls were abandoned
+        # just now: every call must have ended within one bound, plus a guard for a busy runner.
+        with anyio.fail_after(wind_down + GUARD):
+            await store._handoff.settled()  # pyright: ignore[reportPrivateUsage]
+        wound_down_in = time.monotonic() - started
+    finally:
+        relay.resume()
+    answers = [await one_lookup(built) for _ in range(RECOVERY_LOOKUPS)]
+    await every_call_ended(store)
+
+    assert max(held) <= CEILING, f"connections checked out per wave: {held}"
+    assert wound_down_in <= wind_down + GUARD
+    assert checked_out(relayed_engine) == 0
+    assert answers == ["SessionRevoked"] * RECOVERY_LOOKUPS, answers
     assert loop_reports == []
