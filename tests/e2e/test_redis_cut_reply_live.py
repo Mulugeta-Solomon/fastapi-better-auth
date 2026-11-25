@@ -18,14 +18,16 @@ Each case stalls the relay just before one chosen `GET` - a session or a waterma
 user - is sent, with lookups for all three in flight. The deadline lands by order, not by a timer
 (`LeapingClock`): the lookups run under `LONG`, and the loop's clock is moved past it only once
 the relay holds the chosen `GET` and every lookup in flight has reached the store. The relay then
-forwards again and all three users are asked, concurrently and one by one: at once, before the
-replies to the cut commands can have come back, and again once the relay has passed on everything
-it held. Every answer must be exactly right, and no line may say a stored session or watermark is
-unusable - that line is what a swapped reply looks like.
+forwards again and all three users are asked, concurrently and one by one: at once - with no
+yield in between, so most likely before the replies to the cut commands have come back, which is
+when a pooled connection cannot yet see it has an unread reply - and then a second pass, once the
+relay is provably holding nothing. Every answer must be exactly right, and no line may say a
+stored session or watermark is unusable - that line is what a swapped reply looks like.
 
 The control repeats the scenario with redis-py stopped from dropping a cancelled command's
-connection, and must see at least one wrong answer or unusable line. It is what makes the main
-case's "nothing wrong" mean something: the same instrument, shown able to see a stale reply.
+connection, and must see at least one wrong answer or unusable line, at every cut point. It is
+what makes the main case's "nothing wrong" mean something - the timing of the rounds above is
+likely rather than guaranteed, and the control is the proof that it is sensitive enough.
 
 Asyncio only: redis-py drives the event loop directly.
 """
@@ -94,8 +96,10 @@ REDIS_DEADLINE = 3600.0
 """`socket_timeout` and `socket_connect_timeout` for the store under test. redis-py's own
 deadlines run on the loop's clock too, and the cut leaps that clock by `LONG`; at an hour they are
 nowhere near expiry when it does, so the verifier's deadline - not redis-py's read timeout - is
-what cuts a lookup. `DEADLINE`, the outcome the held lookup must have, is how that is checked:
-a redis-py timeout would surface as a store error, not as the verifier's overrun."""
+what cuts a lookup. This is by construction, not by assertion: the held lookup must answer
+`DEADLINE`, but with a read timeout under the leap it still does (measured: both are due in the
+same loop pass, and the verifier's cancellation is the one delivered), so that outcome cannot tell
+the two apart - the size of this constant is what does."""
 
 IN_FLIGHT_PER_USER = 2
 """Lookups of each user in flight beside the one whose `GET` is held."""
@@ -198,10 +202,13 @@ async def scenario() -> AsyncIterator[Scenario]:
     raw = aioredis.from_url(REDIS_URL)
     built = Scenario(f"cut-reply-{secrets.token_hex(6)}:", people())
     try:
-        try:
-            await raw.exists(built.prefix)
-        except (RedisError, OSError) as exc:
-            unreachable(f"harness redis not reachable at {REDIS_URL}: {type(exc).__name__}")
+        await raw.exists(built.prefix)
+    except (RedisError, OSError) as exc:
+        # Probed before anything is written, so there is nothing to remove from a Redis that
+        # is not there - a clean-up here would turn the skip into a second connection error.
+        await raw.aclose()
+        unreachable(f"harness redis not reachable at {REDIS_URL}: {type(exc).__name__}")
+    try:
         for who in built.users:
             await raw.set(built.key("session", who), document(who), ex=KEY_TTL_SECONDS)
             if who.watermark is not None:
