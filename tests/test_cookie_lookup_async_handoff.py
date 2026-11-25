@@ -32,6 +32,7 @@ from sqlalchemy import QueuePool
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from fastapi_better_auth import AuthServiceUnavailable, SqlAlchemySessionStore
+from fastapi_better_auth._internal.stores.task_handoff import TaskHandoff
 from tests.cookies import CAPTURED_TOKEN, COOKIE, http, run, sign
 from tests.deadlines import (
     GUARD,
@@ -334,5 +335,41 @@ async def test_a_call_abandoned_while_its_connection_is_returned_is_cancelled_on
     assert outcome(gate) == (1, 1, 0)
     assert checked_out(engine) == 0
     assert kinds(records) == []
+    await served(store)
+    assert checked_out(engine) == 0
+
+
+@pytest.mark.anyio
+async def test_a_backstop_cancellation_during_the_return_still_gives_the_connection_back(
+    fixture: StoreFixture, monkeypatch: pytest.MonkeyPatch, return_stage: str
+) -> None:
+    """The return's clean-up does not end - a driver that waits on a silent server - so the
+    backstop cancels the call a second time, cutting that clean-up short. However it ends, the
+    pool slot must come back: on SQLAlchemy 2.0.x a close cut short there leaves before the pool's
+    check-in, and one slot per such event would be lost for good. The bound is one nobody waits
+    out, and the clock is moved past it (`LeapingClock`) once the first cancellation is in."""
+    clock = LeapingClock(monkeypatch)
+    store, engine = await warmed(fixture)
+    store._handoff = TaskHandoff(wind_down=LONG)  # pyright: ignore[reportPrivateUsage]
+    if return_stage == "lookup":
+        await store.connect()
+        abandon: Any = lookup_through(store)
+    else:
+        abandon = store.connect
+    gate = AsyncDriverGate(engine, monkeypatch, method="do_rollback")
+    try:
+        await abandoned_once_inside(gate.arrived.wait, abandon)
+        await asyncio.sleep(0)
+        assert outcome(gate) == (1, 0, 0), "the cancellation did not reach the connection's return"
+        clock.leap(LONG)
+        with anyio.fail_after(GUARD):
+            await store._handoff.settled()  # pyright: ignore[reportPrivateUsage]
+        assert outcome(gate) == (1, 0, 1), "the backstop did not cut the held clean-up short"
+        held = checked_out(engine)
+    finally:
+        gate.open()
+
+    assert held == 0, "a return cut short by the backstop kept its pool slot"
+    await every_call_ended(store)
     await served(store)
     assert checked_out(engine) == 0
