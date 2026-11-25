@@ -7,13 +7,16 @@ collected mid-clean-up. The join returns only once every abandoned call has ende
 never reaches the loop's exception handler, not even when the loop shuts down mid-clean-up - the
 path `asyncio.run` takes, which reports a leftover task's exception text and all.
 
-The calls here are plain coroutines: no database, no driver, every wait an event.
+The calls here are plain coroutines: no database, no driver, every wait an event bounded by
+`GUARD`. The backstop runs on a bound no test waits out, and the loop's clock is moved past it one
+round at a time (`LeapingClock`), so its timer fires exactly when the test says and never on a
+slow machine's own schedule. A call that swallows cancellations is released in a `finally`, so a
+regression that stops cancelling it fails the test in seconds and leaves the loop able to close.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import gc
 import weakref
 from collections.abc import Callable, Coroutine
@@ -24,11 +27,8 @@ import pytest
 
 from fastapi_better_auth import SqlAlchemySessionStore
 from fastapi_better_auth._internal.stores.task_handoff import WIND_DOWN_SECONDS, TaskHandoff
-from tests.deadlines import GUARD, LONG
+from tests.deadlines import GUARD, LONG, LeapingClock
 from tests.stores import TOKEN
-
-TINY = 0.005
-"""A wind-down bound short enough that the backstop fires several times within one `GUARD`."""
 
 BACKSTOP_ROUNDS = 3
 """Cancellations a stubborn call takes before it ends: the caller's, then two of the backstop's."""
@@ -45,6 +45,12 @@ def anyio_backend() -> str:
 async def spin() -> None:
     for _ in range(SPINS):
         await asyncio.sleep(0)
+
+
+async def bounded(event: asyncio.Event) -> None:
+    """Wait for `event`, or fail the test within `GUARD`. Entered after any leap of the clock."""
+    with anyio.fail_after(GUARD):
+        await event.wait()
 
 
 async def abandoned(handoff: TaskHandoff, call: Callable[[], Coroutine[Any, Any, object]]) -> None:
@@ -64,23 +70,36 @@ async def abandoned(handoff: TaskHandoff, call: Callable[[], Coroutine[Any, Any,
 
 
 class Stubborn:
-    """A call whose clean-up does not end on a cancellation: it ends on the `needed`-th."""
+    """A call whose clean-up does not end on a cancellation: it ends on the `needed`-th.
+
+    `reached(n)` is set when the `n`-th cancellation arrives. `released` ends the call however
+    many have; every test sets it in a `finally`, because a call that swallows cancellations and
+    is never released is a task no loop teardown can end.
+    """
 
     def __init__(self, needed: int) -> None:
         self.needed = needed
         self.cancellations = 0
+        self.released = asyncio.Event()
         self.ended = asyncio.Event()
+        self._reached: dict[int, asyncio.Event] = {}
+
+    def reached(self, count: int) -> asyncio.Event:
+        return self._reached.setdefault(count, asyncio.Event())
 
     async def __call__(self) -> object:
-        forever = asyncio.Event()
-        while True:
-            try:
-                await forever.wait()
-            except asyncio.CancelledError:
-                self.cancellations += 1
-                if self.cancellations >= self.needed:
-                    self.ended.set()
-                    raise
+        try:
+            while not self.released.is_set():
+                try:
+                    await self.released.wait()
+                except asyncio.CancelledError:
+                    self.cancellations += 1
+                    self.reached(self.cancellations).set()
+                    if self.cancellations >= self.needed:
+                        raise
+            return None
+        finally:
+            self.ended.set()
 
 
 @pytest.mark.anyio
@@ -107,24 +126,41 @@ async def test_a_result_and_an_error_reach_the_waiting_caller_unchanged() -> Non
     async def fails() -> int:
         raise failure
 
-    assert await handoff.run(answers) == 7
-    with pytest.raises(LookupError) as caught:
-        await handoff.run(fails)
+    with anyio.fail_after(GUARD):
+        assert await handoff.run(answers) == 7
+        with pytest.raises(LookupError) as caught:
+            await handoff.run(fails)
     assert caught.value is failure
     assert caught.value.__context__ is None
     assert handoff.winding_down == 0
 
 
 @pytest.mark.anyio
-async def test_a_call_whose_clean_up_does_not_end_is_cancelled_again_until_it_does() -> None:
-    handoff = TaskHandoff(wind_down=TINY)
+async def test_a_call_whose_clean_up_does_not_end_is_cancelled_again_until_it_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One cancellation from the caller, then one from the backstop's own timer each time the
+    clock passes the bound, until the call ends - and none after it has."""
+    clock = LeapingClock(monkeypatch)
+    handoff = TaskHandoff(wind_down=LONG)
     call = Stubborn(needed=BACKSTOP_ROUNDS)
-
-    await abandoned(handoff, call)
-    assert call.cancellations == 1, "the caller did not cancel its call exactly once"
-    with anyio.fail_after(GUARD):
-        await call.ended.wait()
-        await handoff.settled()
+    try:
+        await abandoned(handoff, call)
+        await bounded(call.reached(1))
+        await spin()
+        assert call.cancellations == 1, "the caller did not cancel its call exactly once"
+        for count in range(2, BACKSTOP_ROUNDS + 1):
+            clock.leap(LONG)
+            await bounded(call.reached(count))
+            await spin()
+            assert call.cancellations == count, "one pass of the bound is one cancellation"
+        await bounded(call.ended)
+        with anyio.fail_after(GUARD):
+            await handoff.settled()
+        clock.leap(LONG)
+        await spin()
+    finally:
+        call.released.set()
 
     assert call.cancellations == BACKSTOP_ROUNDS
     assert handoff.winding_down == 0
@@ -134,10 +170,13 @@ async def test_a_call_whose_clean_up_does_not_end_is_cancelled_again_until_it_do
 async def test_a_call_that_ends_within_the_bound_is_cancelled_once() -> None:
     handoff = TaskHandoff(wind_down=LONG)
     call = Stubborn(needed=1)
-
-    await abandoned(handoff, call)
-    with anyio.fail_after(GUARD):
-        await handoff.settled()
+    try:
+        await abandoned(handoff, call)
+        with anyio.fail_after(GUARD):
+            await handoff.settled()
+        await spin()
+    finally:
+        call.released.set()
 
     assert call.cancellations == 1
 
@@ -159,23 +198,29 @@ async def test_the_handoff_owns_an_abandoned_call_until_it_ends() -> None:
         return None
 
     await abandoned(handoff, clean_up_only_this_call_can_reach)
-    (orphan,) = asyncio.all_tasks() - before
-    alive = weakref.ref(orphan)
-    del orphan, before
-    gc.collect()
+    left = asyncio.all_tasks() - before
+    try:
+        assert len(left) == 1, f"expected the one abandoned call to be winding down: {left}"
+        alive = weakref.ref(next(iter(left)))
+        left.clear()
+        del before
+        gc.collect()
 
-    task = alive()
-    assert task is not None, "the abandoned call was collected while it was still winding down"
-    assert handoff.winding_down == 1
-    join = asyncio.ensure_future(handoff.settled())
-    await spin()
-    assert not join.done(), "the join returned while a call was still winding down"
+        task = alive()
+        assert task is not None, "the abandoned call was collected while it was still winding down"
+        assert handoff.winding_down == 1
+        join = asyncio.ensure_future(handoff.settled())
+        await spin()
+        assert not join.done(), "the join returned while a call was still winding down"
 
-    task.cancel()
-    del task
-    with anyio.fail_after(GUARD):
-        await join
-    assert handoff.winding_down == 0
+        task.cancel()
+        del task
+        with anyio.fail_after(GUARD):
+            await join
+        assert handoff.winding_down == 0
+    finally:
+        for task in left:
+            task.cancel()
 
 
 def test_no_outcome_reaches_the_loop_even_when_it_shuts_down_mid_clean_up() -> None:
@@ -202,8 +247,10 @@ def test_no_outcome_reaches_the_loop_even_when_it_shuts_down_mid_clean_up() -> N
         caller = asyncio.ensure_future(handoff.run(call))
         await spin()
         caller.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await caller
+        # Bounded: a caller that waited for its call's clean-up would wait here for good.
+        done, _ = await asyncio.wait({caller}, timeout=GUARD)
+        assert caller in done, "the cancelled caller waited for its call's clean-up"
+        assert caller.cancelled()
         assert handoff.winding_down == 1
 
     asyncio.run(main())
