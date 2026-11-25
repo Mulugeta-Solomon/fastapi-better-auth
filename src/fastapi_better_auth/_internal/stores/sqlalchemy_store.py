@@ -340,15 +340,19 @@ async def _returned(connection: AsyncConnection) -> None:
     as the server stayed silent. Awaited here, the cancellation lands in the `ROLLBACK` and
     SQLAlchemy invalidates the connection.
 
-    A close that is itself cancelled is closed once more before the cancellation leaves. On
-    SQLAlchemy 2.0 a close whose terminate the backstop cut short leaves before the pool's
-    check-in, and the slot would be lost for good; by then the connection is already invalidated
-    and force-closed, so the second close only checks it in and touches no network. Its outcome is
-    dropped unread: the cancellation is what leaves, and nothing of a driver error goes anywhere.
+    A close that fails - cancelled, or raising - is closed once more before its exception leaves.
+    On SQLAlchemy 2.0 a close whose `ROLLBACK` raises, or whose terminate the backstop cut short,
+    leaves before the pool's check-in, and the slot would be lost for good (2.1 checks in from a
+    `finally`, and there the second close does nothing). After a cut-short terminate the
+    connection is already force-closed, so the second close only checks it in; after a raising
+    `ROLLBACK` it may try the server again, and the call's deadline and the backstop bound that as
+    they bound everything else here. Its outcome is dropped unread: the first exception is what
+    leaves, to `_select`'s translation or as the cancellation, and nothing of the second goes
+    anywhere.
     """
     try:
         await connection.close()
-    except asyncio.CancelledError:
+    except (Exception, asyncio.CancelledError):
         await _closed_again(connection)
         raise
 
