@@ -74,6 +74,11 @@ class TaskHandoff:
     Holds every abandoned call's task until it ends: asyncio keeps only weak references to its
     tasks, and a call whose clean-up waits on something only it can reach would otherwise be
     collected mid-clean-up, its connection with it.
+
+    Or until its loop is closed. Not every shutdown runs the done-callback first, and a task of a
+    closed loop never ends; kept, it would hold its frames and the bound token for the life of the
+    store, and a join on another loop would wait on it for good. So such entries are dropped,
+    their backstop timers with them, whenever the registry is read or added to.
     """
 
     __slots__ = ("_abandoned", "_wind_down")
@@ -84,7 +89,8 @@ class TaskHandoff:
 
     @property
     def winding_down(self) -> int:
-        """How many abandoned calls have not ended yet."""
+        """How many abandoned calls have not ended yet, on a loop that is still open."""
+        self._forget_closed_loops()
         return len(self._abandoned)
 
     async def run(self, call: Callable[[], Awaitable[T]]) -> T:
@@ -108,11 +114,16 @@ class TaskHandoff:
         For tests, which must not dispose an engine or close a loop under a call still winding
         down. A store has no close of its own to hang this on: its engine is the application's.
         """
-        while self._abandoned:
+        while self.winding_down:
             await asyncio.wait(tuple(self._abandoned))
+
+    def _forget_closed_loops(self) -> None:
+        for task in [task for task in self._abandoned if task.get_loop().is_closed()]:
+            self._abandoned.pop(task).cancel()
 
     def _abandon(self, task: asyncio.Task[_Outcome[T]]) -> None:
         """The caller left: cancel its call once, and own the task until it ends."""
+        self._forget_closed_loops()
         if task.done():
             # It finished before the caller could read it: no connection is held, and its outcome
             # is a value, so there is nothing to wind down and nothing to retrieve.
