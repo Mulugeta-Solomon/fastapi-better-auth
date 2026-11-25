@@ -256,3 +256,36 @@ def test_no_outcome_reaches_the_loop_even_when_it_shuts_down_mid_clean_up() -> N
     asyncio.run(main())
     gc.collect()
     assert reports == []
+
+
+def test_a_call_left_on_a_closed_loop_is_forgotten_and_never_waited_on() -> None:
+    """Not every shutdown runs the done-callback: a loop can be closed with a call still winding
+    down. That entry can never end, so keeping it would hold its task, its frames and the bound
+    token for the life of the store, and a later join on another loop would wait on it for good.
+    A store built once and used by one loop per test is exactly that shape."""
+    handoff = TaskHandoff(wind_down=LONG)
+    call = Stubborn(needed=BACKSTOP_ROUNDS)
+    loop = asyncio.new_event_loop()
+    # The abandoned task is destroyed pending once forgotten; that report is expected here.
+    loop.set_exception_handler(lambda _loop, _context: None)
+
+    async def leave_a_call_winding_down() -> None:
+        caller = asyncio.ensure_future(handoff.run(call))
+        await spin()
+        caller.cancel()
+        await asyncio.wait({caller}, timeout=GUARD)
+        await bounded(call.reached(1))
+
+    try:
+        loop.run_until_complete(leave_a_call_winding_down())
+        assert handoff.winding_down == 1
+    finally:
+        loop.close()
+
+    assert handoff.winding_down == 0, "an entry of a closed loop was kept"
+
+    async def join_elsewhere() -> None:
+        with anyio.fail_after(GUARD):
+            await handoff.settled()
+
+    anyio.run(join_elsewhere)
