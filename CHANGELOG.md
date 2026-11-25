@@ -78,8 +78,8 @@ Merged on `main` since 0.6.0, not yet on PyPI.
 - Mode C: a transient probe status is no longer remembered as a configuration failure; see Upgrade
   notes. (PR #109)
 - SQL stores: integer and uuid ids; see Upgrade notes. (PR #111)
-- `SqlAlchemySessionStore`: a lookup that was cancelled, by a client disconnect or by the new
-  limit, left its statement running on the server and cut its connection. While the database
+- `SqlAlchemySessionStore`: a lookup that was cancelled, with its request or by the new limit,
+  left its statement running on the server and cut its connection. While the database
   hung, each such lookup added one more connection on the server, past the pool's size. The
   statement is now cancelled on the server and the store stays within the engine's pool. (PR #112)
 - `SyncStoreAdapter`: a cancelled lookup no longer gives back its place in `max_concurrency` while

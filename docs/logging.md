@@ -50,7 +50,7 @@ One more line at `WARNING`, and the frequency of two lines named above:
   per failed refresh, which happens at most once per 10 seconds.
 - **Mode A store lookups that passed `lookup_timeout`.** The kind is `LookupDeadlineExceeded`, with
   no SQLSTATE. It follows the once-per-kind rule above: one line, then nothing until a lookup
-  completes. A lookup cancelled because its client disconnected logs nothing.
+  completes. A lookup cancelled with its request logs nothing.
 
 A `now=` clock that raises, or returns anything but an aware `datetime`, is an exception that
 escaped a verifier: the request is the uniform `401`, and the exception is logged at `ERROR` with
