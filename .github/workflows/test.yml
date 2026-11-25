@@ -16,6 +16,9 @@ jobs:
   unit:
     name: unit (py${{ matrix.python }})
     runs-on: ubuntu-latest
+    # Every job is bounded: a hung test would otherwise hold the runner for six hours and say
+    # nothing. Unit lanes take minutes; pytest's faulthandler_timeout dumps the stacks first.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -44,6 +47,7 @@ jobs:
   types:
     name: pyright strict (py3.13)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,6 +64,7 @@ jobs:
   os:
     name: unit (${{ matrix.os }}, py3.13)
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -82,6 +87,7 @@ jobs:
     # so the declared floors are never actually exercised. This lane installs them.
     name: unit (declared floors, py3.10)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -102,6 +108,7 @@ jobs:
     # 3.15 pre-release because no stable 3.15 exists yet.
     name: unit (py3.15 pre-release, advisory)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -119,6 +126,8 @@ jobs:
   e2e:
     name: e2e conformance + combined coverage
     runs-on: ubuntu-latest
+    # Longer: it builds and starts the harness, then runs the unit lane and the conformance lane.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
