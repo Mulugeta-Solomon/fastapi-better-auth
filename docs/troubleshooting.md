@@ -78,6 +78,22 @@ longer, pass a longer `max_stale`. See
 The `WARNING` names the driver error class and its SQLSTATE. `42501` means the database role lacks
 `SELECT` on `session` or `user`. See [Session stores](stores.md#the-shipped-stores).
 
+## Mode A: requests are `401` while the store is slow
+
+One `WARNING` says the session store lookup could not complete and names
+`LookupDeadlineExceeded`. A request's store lookups took longer than `lookup_timeout`, 5 seconds by
+default. Requests are answered again as soon as the store answers in time. If opening a new
+database connection alone takes longer than `lookup_timeout`, no lookup can complete: raise
+`lookup_timeout` or shorten the connection time. A SQL store that was not connected at startup
+also reads the schema inside a request, under the same limit: call `await store.connect()` in
+your lifespan. See [When the database does not answer](stores.md#when-the-database-does-not-answer).
+
+After a server has stopped answering altogether, the database driver may log a line of its own
+about the connection that was closed under it. With `asyncpg`, the `asyncio` logger may show
+`Future exception was never retrieved` with `ConnectionError('unexpected connection_lost() call')`.
+With `psycopg`, its own logger shows one `WARNING`, "query cancellation interrupted". Neither
+carries the token.
+
 ## SQL store: every request is `401`, and ids are integers or uuids
 
 Release 0.6.0 reads only text ids. With `advanced.database.generateId: "serial"` or `"uuid"`, every

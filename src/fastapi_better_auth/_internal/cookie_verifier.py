@@ -16,10 +16,12 @@ the store is reached on a CSRF failure. These are named invariants, spy-tested, 
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any, TypeVar, cast
 
+import anyio
 from pydantic import SecretStr
 from starlette.requests import HTTPConnection
 
@@ -44,6 +46,12 @@ from .errors import (
     SessionRevoked,
 )
 from .labels import cookie_source
+from .lookup_deadline import (
+    DEFAULT_LOOKUP_TIMEOUT,
+    LookupDeadlineExceeded,
+    lookup_deadline,
+    validated_lookup_timeout,
+)
 from .models import Session, User
 from .once import Once
 from .parsing import parse_user
@@ -120,7 +128,9 @@ class CookieVerifier:
     3. **Signature**, one `compare_digest` per keyring entry with no early return, accepted iff any
        matched. A bad signature is `InvalidCredential` and the store is never reached.
     4. **Store lookup** of the raw token. A miss after a valid signature is `SessionRevoked` - the
-       session was signed out or never existed - never a fall-through to anything else.
+       session was signed out or never existed - never a fall-through to anything else. The
+       lookup is bounded by `lookup_timeout`; a store that does not answer in time is
+       `AuthServiceUnavailable`, never a miss.
     5. **Expiry and bans**, which the store does not enforce and this verifier must.
     6. **parse_user** into the requested model, and the `Session` it proves, carrying the raw token.
 
@@ -161,14 +171,30 @@ class CookieVerifier:
             reason it cannot show a ban lapsing: store a past `ban_expires` for that. A `now()`
             that raises, or returns anything but an aware `datetime`, refuses the request (the
             uniform 401, with the exception logged at ERROR).
+        lookup_timeout: Seconds one request's store lookups may take, together, before the
+            request is refused - 5.0 by default. It is one budget per request, not per call: the
+            session lookup and, for a store that does not embed the user, the user lookup share
+            it, and so does a store's own first-use work inside them (the SQL stores' schema
+            discovery). A lookup that overruns is cancelled and answered exactly as a store that
+            raised is: `AuthServiceUnavailable`, the uniform refusal, never a session and never a
+            verdict on the credential, logged once as a WARNING of the kind
+            `LookupDeadlineExceeded` until a lookup completes again. A store that cannot be
+            interrupted and answers after the deadline anyway is refused the same way: a late
+            answer is never honoured, nor is a refusal the store raises late. A cancellation
+            from outside (a client gone, a server shutting down, a deadline of your own) stays a
+            cancellation. `None` disables it, for a caller that enforces its own deadline. A
+            store that blocks a worker thread (`SyncStoreAdapter`) is released from the request
+            at the deadline, but the thread cannot be interrupted: its call runs on, holding its
+            connection, until the database answers.
 
     Raises:
         ConfigurationError: For any unusable configuration, at construction: neither or both of
             `secret`/`secrets`, an empty keyring, a keyring entry or `secret` that is not a
             `SharedSecret`, a `store` that is not a `SessionStore`, a `csrf` that is `None` (which
             points at `CsrfDisabled`) or not a `CsrfPolicy`, a `cookie_name` that is blank or
-            carries a character illegal in a cookie name, or a `now` that is neither `None` nor
-            callable.
+            carries a character illegal in a cookie name, a `now` that is neither `None` nor
+            callable, or a `lookup_timeout` that is neither `None` nor a positive, finite number
+            of seconds.
     """
 
     def __init__(
@@ -182,6 +208,7 @@ class CookieVerifier:
         secure_prefix: str = DEFAULT_SECURE_PREFIX,
         secure_cookies: bool = True,
         now: Callable[[], datetime] | None = None,
+        lookup_timeout: float | None = DEFAULT_LOOKUP_TIMEOUT,
     ) -> None:
         self._secrets = _validated_keyring(secret, secrets)
         self._store = _validated_store(store)
@@ -190,6 +217,7 @@ class CookieVerifier:
         self._secure_prefix = _validated_prefix(secure_prefix)
         self._secure_cookies = _validated_secure_cookies(secure_cookies)
         self._refusal_clock = RefusalClock(now, owner="CookieVerifier")
+        self._lookup_timeout = validated_lookup_timeout(lookup_timeout)
         # Exactly one accepted base, never both: the `__Secure-`-prefixed name when the server
         # sets secure cookies (better-auth's production default), or the plain name when it does
         # not. Accepting both is the cross-name fixation D-189 closes.
@@ -237,6 +265,11 @@ class CookieVerifier:
     def store(self) -> SessionStore:
         """The authoritative session store this verifier looks a token up in."""
         return self._store
+
+    @property
+    def lookup_timeout(self) -> float | None:
+        """Seconds one request's store lookups may take together, or `None` for no deadline."""
+        return self._lookup_timeout
 
     def extract(self, connection: HTTPConnection) -> CookieCredential | None:
         """Return this verifier's cookie material and CSRF snapshot, or `None` if it is absent.
@@ -291,9 +324,10 @@ class CookieVerifier:
             CsrfFailure: For a cross-site unsafe request, decided before the signature.
             SessionRevoked: For a valid signature whose session or user is not in the store.
             SessionExpired: For a session past its expiry.
-            AuthServiceUnavailable: When the store could not be reached. A failure the store
-                did not translate itself is logged once, as a WARNING naming its class and
-                SQLSTATE, per kind of failure until a call of that lookup returns again.
+            AuthServiceUnavailable: When the store could not be reached, or did not answer
+                within `lookup_timeout`. A failure the store did not translate itself is logged
+                once, as a WARNING naming its class and SQLSTATE, per kind of failure until a call
+                of that lookup returns again; an overrun is the kind `LookupDeadlineExceeded`.
         """
         if not isinstance(credential, CookieCredential):
             raise InvalidCredential(reason="cookie credential snapshot is not this verifier's")
@@ -327,14 +361,18 @@ class CookieVerifier:
         # refusals, and `record` holds the token too (D-181). Scrub all of them (D-094).
         record: StoredSession | None = None
         stored: StoredUser | None = None
+        # One budget for the whole lookup phase, read once: every store call below runs against
+        # this same absolute deadline, so a slow session lookup leaves the user lookup only what
+        # is left of it rather than a fresh allowance.
+        deadline = lookup_deadline(self._lookup_timeout)
         try:
-            record = await self._looked_up(token, marker)
+            record = await self._looked_up(token, marker, deadline)
             if record is None:
                 raise SessionRevoked(reason=f"no stored session for this token [{marker}]")
             check_expiry(record, marker, self._refusal_clock, subject=STORED_SESSION)
             stored = record.user
             if stored is None:
-                stored = await self._looked_up_user(record.user_id, marker)
+                stored = await self._looked_up_user(record.user_id, marker, deadline)
                 if stored is None:
                     raise SessionRevoked(reason=f"the session's user is absent [{marker}]")
             check_ban(stored, marker, self._refusal_clock)
@@ -344,36 +382,82 @@ class CookieVerifier:
             cookie = ("", "")
             record = stored = None
 
-    async def _looked_up(self, token: str, marker: str) -> StoredSession | None:
+    async def _looked_up(self, token: str, marker: str, deadline: float) -> StoredSession | None:
+        found: StoredSession | None = None
+        late = False
         try:
-            try:
-                found = await self._store.fetch_session_by_token(token)
-            except (BetterAuthError, SessionError):
-                raise
-            except Exception as exc:  # noqa: BLE001 - a raw store failure becomes the uniform refusal
-                report_once(self._session_outage, exc, marker)
-            else:
-                self._session_outage.rearm()
-                return found
+            # A scope of our own rather than `fail_after`: only *its* deadline is caught, so a
+            # store's own `TimeoutError` stays a store error, and a cancellation from outside
+            # passes through it untouched.
+            with anyio.CancelScope(deadline=deadline) as scope:
+                try:
+                    found = await self._store.fetch_session_by_token(token)
+                except SessionError:
+                    # A store's typed refusal is its verdict only if it came in time (`_past`).
+                    late = _past(deadline)
+                    if not late:
+                        raise
+                except BetterAuthError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - a raw store failure: the uniform refusal
+                    late = _past(deadline)
+                    if not late:
+                        report_once(self._session_outage, exc, marker)
+                else:
+                    late = _past(deadline)
+                    if not late:
+                        self._session_outage.rearm()
+                        return found
+            if late or scope.cancelled_caught:
+                raise self._overrun(self._session_outage, marker, marker) from None
             # Raised outside the handler, so no __context__ links to the store's exception (it can
             # embed the token), and `from None` clears __cause__ (WP10 A1).
             raise _store_unavailable(marker) from None
         finally:
             token = ""
+            found = None
 
-    async def _looked_up_user(self, user_id: str, marker: str) -> StoredUser | None:
+    async def _looked_up_user(
+        self, user_id: str, marker: str, deadline: float
+    ) -> StoredUser | None:
         # No token here, and `user_id` is not a credential (it is in StoredSession's own repr), so
         # this frame needs no scrub; the contained failure is handled exactly as in `_looked_up`.
-        try:
-            found = await self._store.fetch_user_by_id(user_id)
-        except (BetterAuthError, SessionError):
-            raise
-        except Exception as exc:  # noqa: BLE001 - as _looked_up
-            report_once(self._user_outage, exc, fingerprint(user_id))
-        else:
-            self._user_outage.rearm()
-            return found
+        subject = fingerprint(user_id)
+        late = False
+        with anyio.CancelScope(deadline=deadline) as scope:
+            try:
+                found = await self._store.fetch_user_by_id(user_id)
+            except SessionError:
+                late = _past(deadline)
+                if not late:
+                    raise
+            except BetterAuthError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - as _looked_up
+                late = _past(deadline)
+                if not late:
+                    report_once(self._user_outage, exc, subject)
+            else:
+                late = _past(deadline)
+                if not late:
+                    self._user_outage.rearm()
+                    return found
+        if late or scope.cancelled_caught:
+            raise self._overrun(self._user_outage, subject, marker) from None
         raise _store_unavailable(marker) from None
+
+    def _overrun(self, latch: OutageLatch, subject: str, marker: str) -> AuthServiceUnavailable:
+        """The refusal for a lookup that ran past this request's deadline, reported once.
+
+        Only reached when the scope caught its *own* deadline, or the store ended after it. A
+        cancellation from outside never gets here: anyio's scope does not absorb a cancellation
+        while an enclosing one is pending, even when both fall due at the same checkpoint
+        (`test_an_outer_cancel_landing_with_the_deadline_is_still_a_cancellation`).
+        """
+        # Not raised, and not inside a handler: it only names the kind on the shared latch, so
+        # a hung store is one line per outage, like any other failure, until a lookup completes.
+        report_once(latch, LookupDeadlineExceeded(), subject)
+        return _store_timed_out(marker, self._lookup_timeout)
 
     def _observe_session_data(self, pairs: tuple[tuple[str, str], ...]) -> None:
         observed = next((name for name, _ in pairs if name in self._data_names), None)
@@ -392,6 +476,27 @@ def _joined_cookie_header(connection: HTTPConnection) -> str:
 
 def _store_unavailable(marker: str) -> AuthServiceUnavailable:
     return AuthServiceUnavailable(reason=f"session store lookup could not complete [{marker}]")
+
+
+def _past(deadline: float) -> bool:
+    """Whether a store call that has just ended did so after this request's deadline.
+
+    The cancel scope alone cannot say: a store that cannot be interrupted - a worker thread with
+    no `abandon_on_cancel`, a coroutine that swallows the cancellation - ends after the deadline
+    with an answer or an error of its own rather than the cancellation. Whatever it ended with,
+    it overran, and an overrun is never honoured: not as a session, not as a `SessionError` the
+    store raised itself (a late `SessionRevoked` would be a verdict on a credential that may be
+    valid), and not as a store error of some other kind. A deployment fault (`BetterAuthError`)
+    is not an answer and propagates whenever it arrives. With no deadline it never reads the
+    clock.
+    """
+    return deadline != math.inf and anyio.current_time() >= deadline
+
+
+def _store_timed_out(marker: str, lookup_timeout: float | None) -> AuthServiceUnavailable:
+    return AuthServiceUnavailable(
+        reason=f"session store lookup did not answer within {lookup_timeout}s [{marker}]"
+    )
 
 
 def _session(

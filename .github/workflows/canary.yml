@@ -32,6 +32,7 @@ jobs:
     name: upstream release watch
     if: github.event_name == 'schedule' && github.event.schedule == '37 18 * * *'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       should-run: ${{ steps.watch.outputs.should-run }}
       latest: ${{ steps.watch.outputs.latest }}
@@ -51,6 +52,7 @@ jobs:
       && (needs.upstream-check.result != 'success'
       || needs.upstream-check.outputs.should-run == 'true') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -118,6 +120,7 @@ jobs:
       && (needs.upstream-check.result != 'success'
       || needs.upstream-check.outputs.should-run == 'true') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -201,6 +204,7 @@ jobs:
     needs: [upstream-check, conformance, published-wheel]
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       issues: write

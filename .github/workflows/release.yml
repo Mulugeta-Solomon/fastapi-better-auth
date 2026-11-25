@@ -18,6 +18,7 @@ jobs:
     # that is already on main may reach PyPI. On a dispatch it checks the dispatched commit.
     name: tagged commit is on main
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,6 +48,7 @@ jobs:
   build:
     needs: [on-main, tests]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,6 +81,7 @@ jobs:
     if: github.event_name == 'release'
     needs: [on-main, tests, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: pypi
     permissions:
       # Mandatory for PyPI Trusted Publishing (OIDC). No token is configured anywhere. This is
