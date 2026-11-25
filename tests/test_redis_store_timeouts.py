@@ -4,14 +4,18 @@ redis-py's floor here is 5.0.1, whose connections default to no socket timeout a
 that accepts the connection and then stops answering holds the request - and the worker serving
 it - forever. So the store sets both deadlines itself, the caller may override them, and an
 option written into the URL's query string wins over both, which is redis-py's own precedence in
-`from_url` (`kwargs.update(parse_url(url))`). A client the caller lends is never touched.
+`from_url` (`kwargs.update(parse_url(url))`). What wins is held to the same rule as the arguments:
+`?socket_timeout=inf` would otherwise build exactly the unbounded wait the deadlines exist to rule
+out. A client the caller lends is never touched.
 """
 
 from __future__ import annotations
 
 import asyncio
+import gc
 import math
 import time
+import weakref
 from collections.abc import Iterator
 from typing import Any
 
@@ -20,7 +24,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from fastapi_better_auth import ConfigurationError, RedisSessionStore
 from fastapi_better_auth._internal.stores import redis_store as redis_store_module
-from tests.stores import RecordingRedis
+from tests.stores import BuiltRedis, RecordingRedis
 
 URL = "redis://localhost:6379/0"
 DEFAULT_CONNECT_SECONDS = 3.0
@@ -35,9 +39,9 @@ class Capturing:
     def __init__(self) -> None:
         self.calls = []
 
-    def from_url(self, url: str, **kwargs: Any) -> RecordingRedis:
+    def from_url(self, url: str, **kwargs: Any) -> BuiltRedis:
         self.calls.append((url, kwargs))
-        return RecordingRedis()
+        return BuiltRedis(kwargs)
 
 
 @pytest.fixture
@@ -98,6 +102,69 @@ class TestTheUrlWins:
 
         assert options["socket_timeout"] == 7
         assert options["socket_connect_timeout"] == DEFAULT_CONNECT_SECONDS
+
+
+PASSWORD = "pw-Hunter2-sekrit"
+USERNAME = "bridge-user"
+HOST = "cache-host.invalid"
+SECRET_URL = f"redis://{USERNAME}:{PASSWORD}@{HOST}:6379/0"
+"""Nothing connects: every case here is refused, or closed, before a first command."""
+
+DEADLINE_OPTIONS = ("socket_timeout", "socket_connect_timeout")
+
+
+class TestTheUrlIsHeldToTheSameRule:
+    """What the URL's query string sets is what the pool uses, so it passes the arguments' rule.
+
+    redis-py parses each of these into a float without complaint: `inf` and `1e999` are a read
+    that never times out, `nan` one no comparison can end, `-1` a deadline in the past and `0` a
+    read that times out at once - every request refused. Refused at construction instead, naming
+    the option and the URL as its source, and echoing neither the URL nor redis-py's own text: a
+    Redis URL can carry a password.
+    """
+
+    @pytest.mark.parametrize("value", ["inf", "1e999", "nan", "0", "-1"])
+    @pytest.mark.parametrize("name", DEADLINE_OPTIONS)
+    def test_a_query_deadline_that_is_not_a_positive_number_of_seconds_is_refused(
+        self, name: str, value: str
+    ) -> None:
+        (other,) = [option for option in DEADLINE_OPTIONS if option != name]
+
+        with pytest.raises(ConfigurationError) as caught:
+            RedisSessionStore(url=f"{SECRET_URL}?{name}={value}")
+
+        message = str(caught.value)
+        assert name in message
+        assert other not in message
+        assert "query string" in message
+        for leaked in (PASSWORD, USERNAME, HOST):
+            assert leaked not in message
+            assert leaked not in repr(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+
+    def test_a_refused_url_leaves_no_client_behind(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The pool is lazy, so the refused client holds no socket; and nothing of this library
+        keeps it either - a client still referenced from the traceback would keep the parsed
+        password alive in its pool's `connection_kwargs` for as long as the error is."""
+        real: Any = redis_store_module._import_redis()  # pyright: ignore[reportPrivateUsage]
+        built: list[weakref.ref[Any]] = []
+
+        class Watching:
+            @staticmethod
+            def from_url(url: str, **kwargs: Any) -> Any:
+                client = real.from_url(url, **kwargs)
+                built.append(weakref.ref(client))
+                return client
+
+        monkeypatch.setattr(redis_store_module, "_import_redis", lambda: Watching)
+
+        with pytest.raises(ConfigurationError):
+            RedisSessionStore(url=f"{SECRET_URL}?socket_timeout=inf")
+        gc.collect()
+
+        assert len(built) == 1
+        assert built[0]() is None, "the refused client is still referenced"
 
 
 class TestASilentRedis:

@@ -453,6 +453,25 @@ class RecordingRedis:
         return frozenset(name for name, _ in self.calls)
 
 
+class RecordingPool:
+    """The one attribute of redis-py's `ConnectionPool` a store reads: what it will connect with."""
+
+    def __init__(self, connection_kwargs: Mapping[str, Any]) -> None:
+        self.connection_kwargs: dict[str, Any] = dict(connection_kwargs)
+
+
+class BuiltRedis(RecordingRedis):
+    """A `RecordingRedis` as `from_url` would build it: with the pool it was configured for.
+
+    redis-py's `from_url` hands its keyword arguments, overridden by the URL's query string, to
+    the pool; a fake standing in for it keeps them on `connection_pool.connection_kwargs` too.
+    """
+
+    def __init__(self, connection_kwargs: Mapping[str, Any]) -> None:
+        super().__init__()
+        self.connection_pool = RecordingPool(connection_kwargs)
+
+
 class DecodingRedis(RecordingRedis):
     """A client built with `decode_responses=True`, which answers `str` rather than `bytes`."""
 

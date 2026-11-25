@@ -38,6 +38,7 @@ from tests.stores import (
     SESSION_ID,
     TOKEN,
     USER_ID,
+    BuiltRedis,
     DecodingRedis,
     RecordingRedis,
     stored,
@@ -556,19 +557,21 @@ class TestConstruction:
         """C3, the other branch: the `url=` path owns the client it built, so it must close it -
         a no-op close is a pool leak on every `url=` store. The only existing close assertion
         covers the *borrowed* branch, so this one is outcome-unpinned without it."""
-        built = RecordingRedis()
+        built: list[BuiltRedis] = []
 
         class FakeRedis:
             @staticmethod
-            def from_url(url: str, **kwargs: Any) -> RecordingRedis:
-                return built
+            def from_url(url: str, **kwargs: Any) -> BuiltRedis:
+                built.append(BuiltRedis(kwargs))
+                return built[-1]
 
         monkeypatch.setattr(redis_store_module, "_import_redis", lambda: FakeRedis)
 
         async with RedisSessionStore(url="redis://localhost:6379/0") as store:
             assert isinstance(store, SessionStore)
 
-        assert built.closed
+        (client,) = built
+        assert client.closed
 
 
 class TestFailures:
