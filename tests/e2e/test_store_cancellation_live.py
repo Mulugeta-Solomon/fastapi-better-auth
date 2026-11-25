@@ -284,11 +284,12 @@ async def relay(harness: str) -> AsyncIterator[StallingRelay]:
 
 
 @pytest.fixture
-async def relayed_engine(relay: StallingRelay) -> AsyncIterator[AsyncEngine]:
+async def relayed_engine(relay: StallingRelay, application_name: str) -> AsyncIterator[AsyncEngine]:
     built = create_async_engine(
         make_url(POSTGRES_URL).set(host="127.0.0.1", port=relay.port),
         pool_size=POOL_SIZE,
         max_overflow=MAX_OVERFLOW,
+        connect_args={"server_settings": {"application_name": application_name}},
     )
     yield built
     await built.dispose()
@@ -298,6 +299,47 @@ def checked_out(engine: AsyncEngine) -> int:
     pool = engine.sync_engine.pool
     assert isinstance(pool, QueuePool)
     return pool.checkedout()
+
+
+def pooled(engine: AsyncEngine) -> int:
+    """Every connection the engine's pool holds: checked in and checked out."""
+    pool = engine.sync_engine.pool
+    assert isinstance(pool, QueuePool)
+    return pool.checkedin() + pool.checkedout()
+
+
+SERVER_BACKENDS = """
+select pid, state, coalesce(query, '') from pg_stat_activity where application_name = :name
+"""
+IDLE_IN_TRANSACTION = "idle in transaction"
+
+
+async def server_backends(observer: AsyncEngine, name: str) -> list[tuple[Any, ...]]:
+    """The store's backends as the server sees them, read straight from Postgres (not the relay)."""
+    async with observer.connect() as connection:
+        rows = (await connection.execute(text(SERVER_BACKENDS), {"name": name})).all()
+    return [tuple(row) for row in rows]
+
+
+async def left_on_the_server(observer: AsyncEngine, name: str, engine: AsyncEngine) -> str:
+    """Poll until the server holds exactly the backends the pool holds and none of them is idle in
+    a transaction, or the backstop runs out; on a timeout, what the server holds, else nothing.
+
+    `checked_out() == 0` cannot see a backend the client has let go of while the server kept it:
+    a connection SQLAlchemy dropped without the driver ever closing its socket stays on the server,
+    `idle in transaction`, until the process exits. Only the server can say so, and "no more than
+    the ceiling" would not: one pooled connection and one orphan are two, under a ceiling of three.
+    """
+    give_up = time.monotonic() + SETTLE_BACKSTOP
+    while True:
+        rows = await server_backends(observer, name)
+        holds = pooled(engine)
+        orphaned = [row for row in rows if row[1] == IDLE_IN_TRANSACTION]
+        if len(rows) == holds and not orphaned:
+            return ""
+        if time.monotonic() > give_up:
+            return f"the pool holds {holds}, the server holds {len(rows)}: {rows}"
+        await asyncio.sleep(POLL)
 
 
 def unbounded_close(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
@@ -338,8 +380,11 @@ force-closed, once, and that lookup is refused (fail-closed) before service resu
 the floor, 2.0.24 with asyncpg 0.30.0. 2.1's pool does not, and there none is allowed."""
 
 
-async def recovered(store: SqlAlchemySessionStore, engine: AsyncEngine) -> None:
-    """The store answers once the relay forwards again, and leaves nothing checked out."""
+async def recovered(
+    store: SqlAlchemySessionStore, engine: AsyncEngine, observer: AsyncEngine, name: str
+) -> None:
+    """The store answers once the relay forwards again, leaves nothing checked out, and leaves
+    nothing on the server beyond the connections its pool holds."""
     steady = verifier(store, lookup_timeout=LONG)
     answers = [await one_lookup(steady) for _ in range(RECOVERY_LOOKUPS)]
     await every_call_ended(store)
@@ -347,11 +392,17 @@ async def recovered(store: SqlAlchemySessionStore, engine: AsyncEngine) -> None:
     assert all(answer in ("store-error", "SessionRevoked") for answer in opening), answers
     assert rest == ["SessionRevoked"] * len(rest), answers
     assert checked_out(engine) == 0
+    leftover = await left_on_the_server(observer, name, engine)
+    assert not leftover, f"a backend of the store was left on the server: {leftover}"
 
 
 @pytest.mark.anyio
 async def test_at_the_shipped_bound_calls_abandoned_against_a_stalled_server_end_within_it(
-    relay: StallingRelay, relayed_engine: AsyncEngine, loop_reports: list[dict[str, Any]]
+    relay: StallingRelay,
+    relayed_engine: AsyncEngine,
+    observer: AsyncEngine,
+    application_name: str,
+    loop_reports: list[dict[str, Any]],
 ) -> None:
     """The store as shipped: every abandoned call has ended within one wind-down bound (plus a
     guard) of the last wave. On the lockfile's asyncpg the driver's own two-second close timeout
@@ -366,7 +417,7 @@ async def test_at_the_shipped_bound_calls_abandoned_against_a_stalled_server_end
     finally:
         relay.resume()
 
-    await recovered(store, relayed_engine)
+    await recovered(store, relayed_engine, observer, application_name)
     gc.collect()  # a driver future dropped unread is reported when it is collected
     assert loop_reports == []
 
@@ -375,6 +426,8 @@ async def test_at_the_shipped_bound_calls_abandoned_against_a_stalled_server_end
 async def test_the_backstop_ends_a_clean_up_the_driver_would_never_end(
     relay: StallingRelay,
     relayed_engine: AsyncEngine,
+    observer: AsyncEngine,
+    application_name: str,
     monkeypatch: pytest.MonkeyPatch,
     loop_reports: list[dict[str, Any]],
 ) -> None:
@@ -404,7 +457,7 @@ async def test_the_backstop_ends_a_clean_up_the_driver_would_never_end(
     finally:
         relay.resume()
 
-    await recovered(store, relayed_engine)
+    await recovered(store, relayed_engine, observer, application_name)
     gc.collect()  # a driver future dropped unread is reported when it is collected
     assert loop_reports == []
 
@@ -413,6 +466,8 @@ async def test_the_backstop_ends_a_clean_up_the_driver_would_never_end(
 async def test_a_call_abandoned_while_its_rollback_is_unanswered_ends_within_the_bound(
     relay: StallingRelay,
     relayed_engine: AsyncEngine,
+    observer: AsyncEngine,
+    application_name: str,
     monkeypatch: pytest.MonkeyPatch,
     loop_reports: list[dict[str, Any]],
 ) -> None:
@@ -452,7 +507,7 @@ async def test_a_call_abandoned_while_its_rollback_is_unanswered_ends_within_the
 
     assert refused == "deadline"
     assert held_while_stalled == 0, "the connection stayed checked out while the server was silent"
-    await recovered(store, relayed_engine)
+    await recovered(store, relayed_engine, observer, application_name)
     gc.collect()  # a driver future dropped unread is reported when it is collected
     assert loop_reports == []
 
@@ -461,6 +516,8 @@ async def test_a_call_abandoned_while_its_rollback_is_unanswered_ends_within_the
 async def test_a_return_cut_short_by_the_backstop_still_gives_the_connection_back(
     relay: StallingRelay,
     relayed_engine: AsyncEngine,
+    observer: AsyncEngine,
+    application_name: str,
     monkeypatch: pytest.MonkeyPatch,
     loop_reports: list[dict[str, Any]],
 ) -> None:
@@ -504,6 +561,6 @@ async def test_a_return_cut_short_by_the_backstop_still_gives_the_connection_bac
 
     assert refused == "deadline"
     assert held_while_stalled == 0, "a return cut short by the backstop kept its pool slot"
-    await recovered(store, relayed_engine)
+    await recovered(store, relayed_engine, observer, application_name)
     gc.collect()  # a driver future dropped unread is reported when it is collected
     assert loop_reports == []
