@@ -149,9 +149,8 @@ on `asyncpg`. With the `session` table locked, no statement of a refused lookup 
 server. Against a server that stops answering, during a statement or while a connection is being
 returned to the pool, the abandoned calls end and their places in the pool come back, by the
 store's own 5-second limit where the driver would wait for good. Once the server answers again,
-it is asked directly, and it holds only the pool's connections. The locked-table case was also
-measured by hand on `psycopg`. Other drivers are not measured; the statement timeout above covers
-them.
+it is asked directly, and it holds only the pool's connections. The same cases were also measured
+by hand on `psycopg`. Other drivers are not measured; the statement timeout above covers them.
 
 ## Integer and uuid ids
 

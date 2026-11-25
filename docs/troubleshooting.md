@@ -87,9 +87,11 @@ database connection alone takes longer than `lookup_timeout`, no lookup can comp
 `lookup_timeout` or shorten the connection time. See
 [When the database does not answer](stores.md#when-the-database-does-not-answer).
 
-After a server has stopped answering altogether, the `asyncio` logger may also show
+After a server has stopped answering altogether, the database driver may log a line of its own
+about the connection that was closed under it. With `asyncpg`, the `asyncio` logger may show
 `Future exception was never retrieved` with `ConnectionError('unexpected connection_lost() call')`.
-That is the database driver reporting a connection that was closed under it. It carries no token.
+With `psycopg`, its own logger shows one `WARNING`, "query cancellation interrupted". Neither
+carries the token.
 
 ## SQL store: every request is `401`, and ids are integers or uuids
 
