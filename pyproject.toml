@@ -78,6 +78,9 @@ Issues = "https://github.com/Mulugeta-Solomon/fastapi-better-auth/issues"
 
 [tool.pytest.ini_options]
 addopts = "-m 'not e2e'"
+# A test still running after this many seconds dumps every thread's stack and keeps going, so a
+# hang says where it is instead of sitting silent until CI's job timeout. Tests take seconds.
+faulthandler_timeout = 180
 filterwarnings = [
     "error",
     # starlette 1.6.0's testclient imports anyio.abc.BlockingPortal, deprecated in anyio 4.15;
