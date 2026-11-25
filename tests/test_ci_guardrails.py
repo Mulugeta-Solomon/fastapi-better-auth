@@ -56,6 +56,9 @@ HOST_PORT_VARIABLES = {
     "auth-strict": "HARNESS_AUTH_STRICT_PORT",
     "auth-throttled": "HARNESS_AUTH_THROTTLED_PORT",
 }
+JOB_TIMEOUT = re.compile(r"^    timeout-minutes: (?P<minutes>\d+)\s*$", re.MULTILINE)
+"""A job-level bound: four spaces deep, beside `runs-on:`, not a step's own six-space one."""
+MAX_JOB_MINUTES = 60
 UNLOCKED_SYNC_JOBS = {"floors"}
 """`floors` re-locks with `--resolution lowest-direct` on purpose and then syncs `--frozen`."""
 
@@ -211,6 +214,16 @@ def test_the_test_workflow_is_reusable_and_keeps_its_triggers() -> None:
 
     for trigger in ("push:", "pull_request:", "workflow_dispatch:", "workflow_call:"):
         assert f"\n  {trigger}" in head, trigger
+
+
+def test_every_test_job_is_bounded_in_time() -> None:
+    """A hung test holds a runner for GitHub's default six hours and reports nothing; a job
+    bound turns that into a failure within the hour. The bound is generous - the unit lanes take
+    minutes - so it only ever fires on a hang (pytest's `faulthandler_timeout` says where)."""
+    for name, job in jobs(TEST).items():
+        bound = JOB_TIMEOUT.search(job)
+        assert bound is not None, f"test.yml job {name!r} has no job-level timeout-minutes"
+        assert 0 < int(bound.group("minutes")) <= MAX_JOB_MINUTES, (name, bound.group(0))
 
 
 def test_publish_waits_for_main_ancestry_and_the_full_test_workflow() -> None:
