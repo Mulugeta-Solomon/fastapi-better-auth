@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from functools import partial
@@ -17,7 +18,7 @@ from .thread_handoff import run_in_worker
 
 if TYPE_CHECKING:
     from sqlalchemy import Connection, Engine, Select
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
     from ..errors import AuthServiceUnavailable
     from .sqlalchemy_core import Discovered, Plan
@@ -304,8 +305,11 @@ class SqlAlchemySessionStore(_CoreStore):
         return await self._handoff.run(self._inspected)
 
     async def _inspected(self) -> Discovered:
-        async with self._engine.connect() as connection:
+        connection = await self._engine.connect()
+        try:
             return await connection.run_sync(self._reflected)
+        finally:
+            await _returned(connection)
 
     async def _select(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
         # Only the database call is handed off. Its error is translated here, in the caller's
@@ -319,8 +323,41 @@ class SqlAlchemySessionStore(_CoreStore):
         raise failure from None
 
     async def _queried(self, statement: Select[Any], params: dict[str, Any]) -> Rows:
-        async with self._engine.connect() as connection:
+        connection = await self._engine.connect()
+        try:
             return self._sql.rows(await connection.execute(statement, params))
+        finally:
+            await _returned(connection)
+
+
+async def _returned(connection: AsyncConnection) -> None:
+    """Close `connection` here, on the handed-off task, so a cancellation of the call reaches it.
+
+    Closing sends a `ROLLBACK` on the way back to the pool, and a server can stop answering right
+    there. `async with engine.connect()` would run that close where no cancellation reaches it -
+    SQLAlchemy 2.1 swallows them until the close is done, 2.0 orphans it - so the call's one
+    cancellation and every backstop one would pass it by while it held its connection for as long
+    as the server stayed silent. Awaited here, the cancellation lands in the `ROLLBACK` and
+    SQLAlchemy invalidates the connection.
+
+    A close that is itself cancelled is closed once more before the cancellation leaves. On
+    SQLAlchemy 2.0 a close whose terminate the backstop cut short leaves before the pool's
+    check-in, and the slot would be lost for good; by then the connection is already invalidated
+    and force-closed, so the second close only checks it in and touches no network. Its outcome is
+    dropped unread: the cancellation is what leaves, and nothing of a driver error goes anywhere.
+    """
+    try:
+        await connection.close()
+    except asyncio.CancelledError:
+        await _closed_again(connection)
+        raise
+
+
+async def _closed_again(connection: AsyncConnection) -> None:
+    try:
+        await connection.close()
+    except (Exception, asyncio.CancelledError):  # noqa: BLE001 - dropped; see `_returned`
+        return
 
 
 class SyncStoreAdapter(_CoreStore):
