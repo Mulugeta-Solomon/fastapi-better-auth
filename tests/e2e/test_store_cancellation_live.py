@@ -36,7 +36,7 @@ from typing import Any, NamedTuple
 
 import anyio
 import pytest
-from sqlalchemy import QueuePool, text
+from sqlalchemy import QueuePool, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -69,14 +69,15 @@ pytestmark = pytest.mark.e2e
 POOL_SIZE = 2
 MAX_OVERFLOW = 1
 CEILING = POOL_SIZE + MAX_OVERFLOW
-LOOKUP_TIMEOUT = 1.0
-"""Long enough that a lookup reaches the database and queues on the lock well inside it."""
+POOL_TIMEOUT = 2 * LONG
+"""Above the clock's leap past the lookups' deadline: a lookup queued on the pool must be refused
+by that deadline, not by the pool's own checkout timeout (30 s by default) firing first."""
 WAVES = 5
 PER_WAVE = 2 * CEILING
 """More lookups than the pool has connections: the rest wait for one and are refused too."""
 SETTLE_BACKSTOP = 10.0
-"""How long a wave's backends may take to go away before the wave counts as leaked. Healthy
-clean-up takes tens of milliseconds; this only ever runs out on a leak."""
+"""How long a wave's backends may take to queue on the lock, or to go away again, before the wave
+counts as stuck or leaked. Healthy runs take tens of milliseconds; this only ever runs out red."""
 POLL = 0.05
 # Lookups outside the waves - before them, and to prove recovery - run under `LONG`. Every
 # connection a wave touched was closed, so recovery opens new ones inside the lookup's deadline,
@@ -140,6 +141,7 @@ async def engine(application_name: str) -> AsyncIterator[AsyncEngine]:
         POSTGRES_URL,
         pool_size=POOL_SIZE,
         max_overflow=MAX_OVERFLOW,
+        pool_timeout=POOL_TIMEOUT,
         connect_args={"server_settings": {"application_name": application_name}},
     )
     yield built
@@ -185,6 +187,17 @@ async def settled(observer: AsyncEngine, name: str) -> Backends:
         await asyncio.sleep(POLL)
 
 
+async def queued(observer: AsyncEngine, name: str, before: Backends) -> int:
+    """Poll until `CEILING` more of the store's backends wait on the lock than `before`, or the
+    backstop runs out; the count of new waiters either way."""
+    give_up = time.monotonic() + SETTLE_BACKSTOP
+    while True:
+        fresh = (await backends(observer, name)).waiting - before.waiting
+        if fresh >= CEILING or time.monotonic() > give_up:
+            return fresh
+        await asyncio.sleep(POLL)
+
+
 async def one_lookup(built: Any) -> str:
     try:
         await run(built, http(cookie=FORGED))
@@ -202,19 +215,34 @@ async def test_lookups_abandoned_at_their_deadline_leave_no_backend_behind(
     blocker: AsyncEngine,
     schema: str,
     application_name: str,
+    monkeypatch: pytest.MonkeyPatch,
     loop_reports: list[dict[str, Any]],
 ) -> None:
+    """Each wave's deadline lands by order, not by a short timer: the lookups run under `LONG`,
+    the test waits until every connection the pool has holds a statement queued on the lock, and
+    only then moves the loop's clock past the deadline. A wave whose lookups never reached the
+    lock - connection setup eating a short deadline on a slow runner - fails, not passes."""
+    clock = LeapingClock(monkeypatch)
     store = SqlAlchemySessionStore(engine=engine, schema=schema)
     await store.connect()
-    built = verifier(store, lookup_timeout=LOOKUP_TIMEOUT)
     steady = verifier(store, lookup_timeout=LONG)
     assert await one_lookup(steady) == "SessionRevoked"
     waves: list[Backends] = []
+    reached: list[int] = []
 
     async with blocker.connect() as lock:
         await lock.execute(text(f"LOCK TABLE {schema}.session IN ACCESS EXCLUSIVE MODE"))
         for _ in range(WAVES):
-            outcomes = await asyncio.gather(*(one_lookup(built) for _ in range(PER_WAVE)))
+            before = await backends(observer, application_name)
+            wave = [asyncio.ensure_future(one_lookup(steady)) for _ in range(PER_WAVE)]
+            try:
+                reached.append(await queued(observer, application_name, before))
+                clock.leap(LONG)
+                with anyio.fail_after(GUARD):
+                    outcomes = await asyncio.gather(*wave)
+            finally:
+                for lookup in wave:
+                    lookup.cancel()
             assert outcomes == ["deadline"] * PER_WAVE
             waves.append(await settled(observer, application_name))
         await lock.rollback()
@@ -222,6 +250,7 @@ async def test_lookups_abandoned_at_their_deadline_leave_no_backend_behind(
     answer = await one_lookup(steady)
     recovered_in = time.monotonic() - started
 
+    assert reached == [CEILING] * WAVES, f"statements queued on the lock per wave: {reached}"
     assert [wave.waiting for wave in waves] == [0] * WAVES, f"backends left behind: {waves}"
     assert max(wave.connected for wave in waves) <= CEILING, f"connections leaked: {waves}"
     assert answer == "SessionRevoked", "the store did not answer once the lock was released"
@@ -268,23 +297,28 @@ def checked_out(engine: AsyncEngine) -> int:
     return pool.checkedout()
 
 
-def unbounded_close(monkeypatch: pytest.MonkeyPatch) -> None:
+def unbounded_close(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
     """Make asyncpg's graceful close wait for as long as the server is silent.
 
     SQLAlchemy asks for `close(timeout=2)`, and asyncpg 0.32 honours it on a loop timer. asyncpg
     0.30.0 does not, against a stalled peer: measured on the harness, its close waited for exactly
     as long as the server was paused. This gives the lockfile's driver that behaviour through its
-    public API, so that nothing but the store's backstop can end the clean-up.
+    public API, so that nothing but the store's backstop can end the clean-up. The event it
+    returns is set when a close is entered, so a test knows the clean-up has begun.
     """
     import asyncpg  # pyright: ignore[reportMissingTypeStubs] - asyncpg ships no stubs
 
     # Read off the class's namespace: asyncpg ships no annotation for `timeout`.
     original: Callable[..., Awaitable[None]] = vars(asyncpg.Connection)["close"]
 
+    entered = asyncio.Event()
+
     async def close(self: Any, *, timeout: float | None = None) -> None:
+        entered.set()
         await original(self, timeout=None)
 
     monkeypatch.setattr(asyncpg.Connection, "close", close)
+    return entered
 
 
 async def stalled_waves(relay: StallingRelay, built: CookieVerifier) -> None:
@@ -337,9 +371,10 @@ async def test_the_backstop_ends_a_clean_up_the_driver_would_never_end(
     store's bound is one nobody waits out, so after the waves the abandoned calls are still
     winding down - cancelled once, waiting on a server that will not answer. Only when the loop's
     clock passes the bound (`LeapingClock`) does the backstop cancel them again, and then they end
-    within a guard; without the backstop they never would. The pool is clean and the store answers
+    within a guard; without the backstop they never would. The leap waits until a close has been
+    entered, so the driver's clean-up has begun before the backstop is given its turn. The pool is clean and the store answers
     once the relay forwards again."""
-    unbounded_close(monkeypatch)
+    closing = unbounded_close(monkeypatch)
     clock = LeapingClock(monkeypatch)
     store = SqlAlchemySessionStore(engine=relayed_engine)
     store._handoff = TaskHandoff(wind_down=LONG)  # pyright: ignore[reportPrivateUsage]
@@ -347,14 +382,65 @@ async def test_the_backstop_ends_a_clean_up_the_driver_would_never_end(
     assert await one_lookup(verifier(store, lookup_timeout=LONG)) == "SessionRevoked"
     try:
         await stalled_waves(relay, verifier(store, lookup_timeout=STALL_LOOKUP_TIMEOUT))
-        winding = store._handoff.winding_down  # pyright: ignore[reportPrivateUsage]
-        assert winding >= 1, "an abandoned call ended before the backstop: nothing was proven"
+        # The clean-up has begun - an abandoned call is inside the driver's unbounded close - and
+        # a run that never gets there fails here instead of proving nothing.
+        with anyio.fail_after(GUARD):
+            await closing.wait()
+        assert store._handoff.winding_down >= 1  # pyright: ignore[reportPrivateUsage]
         clock.leap(LONG)
         with anyio.fail_after(GUARD):
             await store._handoff.settled()  # pyright: ignore[reportPrivateUsage]
     finally:
         relay.resume()
 
+    await recovered(store, relayed_engine)
+    gc.collect()  # a driver future dropped unread is reported when it is collected
+    assert loop_reports == []
+
+
+@pytest.mark.anyio
+async def test_a_call_abandoned_while_its_rollback_is_unanswered_ends_within_the_bound(
+    relay: StallingRelay,
+    relayed_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    loop_reports: list[dict[str, Any]],
+) -> None:
+    """The statement has answered; the server stops answering at the ROLLBACK the connection
+    sends on its way back to the pool. The relay is stalled from SQLAlchemy's `rollback` event,
+    dispatched just before that ROLLBACK goes out, and the lookup's deadline is passed only then
+    (`LeapingClock`). With the relay still stalled, the abandoned call must end within the bound
+    and its connection must come back - the one cancellation, or the backstop, has to reach the
+    return - and the store must answer once the relay forwards again."""
+    clock = LeapingClock(monkeypatch)
+    store = SqlAlchemySessionStore(engine=relayed_engine)
+    await store.connect()
+    steady = verifier(store, lookup_timeout=LONG)
+    assert await one_lookup(steady) == "SessionRevoked"
+    rolling_back = asyncio.Event()
+
+    def stall_the_rollback(_connection: Any) -> None:
+        if not rolling_back.is_set():
+            relay.stall()
+            rolling_back.set()
+
+    event.listen(relayed_engine.sync_engine, "rollback", stall_the_rollback)
+    lookup = asyncio.ensure_future(one_lookup(steady))
+    try:
+        with anyio.fail_after(GUARD):
+            await rolling_back.wait()
+        clock.leap(LONG)
+        with anyio.fail_after(GUARD):
+            refused = await lookup
+        with anyio.fail_after(WIND_DOWN_SECONDS + GUARD):
+            await store._handoff.settled()  # pyright: ignore[reportPrivateUsage]
+        held_while_stalled = checked_out(relayed_engine)
+    finally:
+        event.remove(relayed_engine.sync_engine, "rollback", stall_the_rollback)
+        relay.resume()
+        lookup.cancel()
+
+    assert refused == "deadline"
+    assert held_while_stalled == 0, "the connection stayed checked out while the server was silent"
     await recovered(store, relayed_engine)
     gc.collect()  # a driver future dropped unread is reported when it is collected
     assert loop_reports == []
