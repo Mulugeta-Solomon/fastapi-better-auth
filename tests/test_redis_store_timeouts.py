@@ -159,10 +159,12 @@ class TestTheUrlIsHeldToTheSameRule:
 
         monkeypatch.setattr(redis_store_module, "_import_redis", lambda: Watching)
 
-        with pytest.raises(ConfigurationError):
+        with pytest.raises(ConfigurationError) as caught:
             RedisSessionStore(url=f"{SECRET_URL}?socket_timeout=inf")
         gc.collect()
 
+        # Asked while the refusal - and every frame on its traceback - is still alive.
+        assert caught.value.__traceback__ is not None
         assert len(built) == 1
         assert built[0]() is None, "the refused client is still referenced"
 
