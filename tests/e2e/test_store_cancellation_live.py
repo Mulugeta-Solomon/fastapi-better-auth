@@ -444,3 +444,55 @@ async def test_a_call_abandoned_while_its_rollback_is_unanswered_ends_within_the
     await recovered(store, relayed_engine)
     gc.collect()  # a driver future dropped unread is reported when it is collected
     assert loop_reports == []
+
+
+@pytest.mark.anyio
+async def test_a_return_cut_short_by_the_backstop_still_gives_the_connection_back(
+    relay: StallingRelay,
+    relayed_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    loop_reports: list[dict[str, Any]],
+) -> None:
+    """The floor's shape on the lockfile's driver: the ROLLBACK goes unanswered, the caller's
+    cancellation lands in it, and SQLAlchemy's graceful close of the connection then waits on the
+    silent server for good (`unbounded_close`, asyncpg 0.30.0's behaviour). The backstop's second
+    cancellation cuts that close short; on SQLAlchemy 2.0.24 that left the pool slot taken for good
+    (measured by the lead). Each step waits on an event, then the clock is moved (`LeapingClock`):
+    the ROLLBACK, then the close, then the bound. With the relay still stalled the call must end
+    and nothing may be checked out; then the store answers once the relay forwards again."""
+    closing = unbounded_close(monkeypatch)
+    clock = LeapingClock(monkeypatch)
+    store = SqlAlchemySessionStore(engine=relayed_engine)
+    await store.connect()
+    steady = verifier(store, lookup_timeout=LONG)
+    assert await one_lookup(steady) == "SessionRevoked"
+    rolling_back = asyncio.Event()
+
+    def stall_the_rollback(_connection: Any) -> None:
+        if not rolling_back.is_set():
+            relay.stall()
+            rolling_back.set()
+
+    event.listen(relayed_engine.sync_engine, "rollback", stall_the_rollback)
+    lookup = asyncio.ensure_future(one_lookup(steady))
+    try:
+        with anyio.fail_after(GUARD):
+            await rolling_back.wait()
+        clock.leap(LONG)
+        with anyio.fail_after(GUARD):
+            refused = await lookup
+            await closing.wait()
+        clock.leap(LONG)
+        with anyio.fail_after(GUARD):
+            await store._handoff.settled()  # pyright: ignore[reportPrivateUsage]
+        held_while_stalled = checked_out(relayed_engine)
+    finally:
+        event.remove(relayed_engine.sync_engine, "rollback", stall_the_rollback)
+        relay.resume()
+        lookup.cancel()
+
+    assert refused == "deadline"
+    assert held_while_stalled == 0, "a return cut short by the backstop kept its pool slot"
+    await recovered(store, relayed_engine)
+    gc.collect()  # a driver future dropped unread is reported when it is collected
+    assert loop_reports == []
