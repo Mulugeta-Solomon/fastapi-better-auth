@@ -59,6 +59,9 @@ HOST_PORT_VARIABLES = {
 JOB_TIMEOUT = re.compile(r"^    timeout-minutes: (?P<minutes>\d+)\s*$", re.MULTILINE)
 """A job-level bound: four spaces deep, beside `runs-on:`, not a step's own six-space one."""
 MAX_JOB_MINUTES = 60
+RUNS_ON = re.compile(r"^    runs-on:", re.MULTILINE)
+MIN_RUNNER_JOBS = 13
+"""test.yml's six, release.yml's three and canary.yml's four: a locator that found fewer is broken."""
 UNLOCKED_SYNC_JOBS = {"floors"}
 """`floors` re-locks with `--resolution lowest-direct` on purpose and then syncs `--frozen`."""
 
@@ -216,14 +219,21 @@ def test_the_test_workflow_is_reusable_and_keeps_its_triggers() -> None:
         assert f"\n  {trigger}" in head, trigger
 
 
-def test_every_test_job_is_bounded_in_time() -> None:
-    """A hung test holds a runner for GitHub's default six hours and reports nothing; a job
+def test_every_job_that_takes_a_runner_is_bounded_in_time() -> None:
+    """A hung step holds a runner for GitHub's default six hours and reports nothing; a job
     bound turns that into a failure within the hour. The bound is generous - the unit lanes take
-    minutes - so it only ever fires on a hang (pytest's `faulthandler_timeout` says where)."""
-    for name, job in jobs(TEST).items():
-        bound = JOB_TIMEOUT.search(job)
-        assert bound is not None, f"test.yml job {name!r} has no job-level timeout-minutes"
-        assert 0 < int(bound.group("minutes")) <= MAX_JOB_MINUTES, (name, bound.group(0))
+    minutes - so it only ever fires on a hang (pytest's `faulthandler_timeout` says where). A job
+    that only `uses:` a reusable workflow takes no runner and no bound; the called jobs carry it."""
+    checked = 0
+    for path in (TEST, RELEASE, CANARY):
+        for name, job in jobs(path).items():
+            if not RUNS_ON.search(job):
+                continue
+            checked += 1
+            bound = JOB_TIMEOUT.search(job)
+            assert bound is not None, f"{path.name} job {name!r} has no job-level timeout-minutes"
+            assert 0 < int(bound.group("minutes")) <= MAX_JOB_MINUTES, (path.name, name)
+    assert checked >= MIN_RUNNER_JOBS, f"only {checked} jobs with runs-on were found"
 
 
 def test_publish_waits_for_main_ancestry_and_the_full_test_workflow() -> None:
