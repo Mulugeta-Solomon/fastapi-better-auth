@@ -22,6 +22,7 @@ from typing import Any
 import anyio
 import pytest
 
+from fastapi_better_auth import SqlAlchemySessionStore
 from fastapi_better_auth._internal.stores.task_handoff import WIND_DOWN_SECONDS, TaskHandoff
 from tests.deadlines import GUARD, LONG
 from tests.stores import TOKEN
@@ -87,6 +88,12 @@ async def test_the_wind_down_bound_is_longer_than_sqlalchemys_own_graceful_close
     """SQLAlchemy gives a graceful close two seconds; a driver that bounds its own clean-up gets
     to finish it cleanly before the backstop forces anything."""
     assert WIND_DOWN_SECONDS > 2.0
+
+
+def test_the_store_documents_the_bound_it_uses() -> None:
+    """The class docstring states the wind-down bound in seconds; it must be this one."""
+    assert f"within {WIND_DOWN_SECONDS:g} seconds" in (SqlAlchemySessionStore.__doc__ or "")
+    assert f"every {WIND_DOWN_SECONDS:g} seconds" in (SqlAlchemySessionStore.__doc__ or "")
 
 
 @pytest.mark.anyio

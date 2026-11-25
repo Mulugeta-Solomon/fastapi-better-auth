@@ -12,11 +12,12 @@ import anyio
 from ..errors import ConfigurationError
 from .outage import OutageLatch, report_once
 from .records import StoredSession, StoredUser
+from .task_handoff import TaskHandoff
 from .thread_handoff import run_in_worker
 
 if TYPE_CHECKING:
     from sqlalchemy import Connection, Engine, Select
-    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
     from ..errors import AuthServiceUnavailable
     from .sqlalchemy_core import Discovered, Plan
@@ -240,6 +241,23 @@ class SqlAlchemySessionStore(_CoreStore):
     `RedisSessionStore` has no equivalent: it reads one stored JSON document, and a document has
     no SELECT to narrow.
 
+    **A lookup that is cancelled or passes its deadline** (a client gone, `CookieVerifier`'s
+    `lookup_timeout`) returns to its caller at once, and its database call is cancelled exactly
+    once. The call runs on an asyncio task of its own for that reason: a cancellation delivered
+    again and again, as anyio delivers it, would cut short the close SQLAlchemy runs on a
+    cancelled statement, and with it the cancel request the driver sends the server - leaving the
+    statement running there, holding a backend and any lock it waits on. Cancelled once, the
+    driver asks the server to stop the statement and the connection is closed in order. Until
+    that has happened the connection stays checked out, so the engine's pool bounds the calls
+    winding down, and lookups that find it full wait for a connection and are refused at their
+    own deadline. A call that has not wound down within 5 seconds (a server that stopped
+    answering) is cancelled again every 5 seconds until it ends, which closes its connection
+    without waiting for the server. A server-side statement timeout shorter than
+    `lookup_timeout` (Postgres `statement_timeout`, MySQL `max_execution_time`) is still the
+    right setting: it ends a slow statement on the server whatever becomes of its client. And a
+    lookup that finds no idle connection opens a new one inside its own deadline, so keep
+    `lookup_timeout` well above the time a new connection takes.
+
     Args:
         engine: An `AsyncEngine`. Always injected, never built here: the pool, the TLS
             configuration and the lifecycle belong to the application, and this store must not
@@ -280,23 +298,29 @@ class SqlAlchemySessionStore(_CoreStore):
             user_columns=user_columns,
         )
         self._engine = self._sql.validated_async_engine(engine)
+        self._handoff = TaskHandoff()
 
     async def _columns(self) -> Discovered:
-        async with self._engine.connect() as connection:
-            return await self._inspected(connection)
+        return await self._handoff.run(self._inspected)
 
-    async def _inspected(self, connection: AsyncConnection) -> Discovered:
-        return await connection.run_sync(self._reflected)
+    async def _inspected(self) -> Discovered:
+        async with self._engine.connect() as connection:
+            return await connection.run_sync(self._reflected)
 
     async def _select(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
+        # Only the database call is handed off. Its error is translated here, in the caller's
+        # task, so an abandoned call that fails late has nobody to report to and trips no latch.
         try:
-            async with self._engine.connect() as connection:
-                return self._sql.rows(await connection.execute(statement, dict(params)))
+            return await self._handoff.run(partial(self._queried, statement, dict(params)))
         except self._sql.SQLAlchemyError as exc:
             failure = self._unavailable(exc, params)
         # Raised outside the `except` so no `__context__` links back to the DBAPIError whose
         # str() embeds the token; `from None` clears `__cause__` as well (A1).
         raise failure from None
+
+    async def _queried(self, statement: Select[Any], params: dict[str, Any]) -> Rows:
+        async with self._engine.connect() as connection:
+            return self._sql.rows(await connection.execute(statement, params))
 
 
 class SyncStoreAdapter(_CoreStore):

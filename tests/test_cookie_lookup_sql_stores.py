@@ -44,6 +44,7 @@ from tests.deadlines import (
     WEDGE_BACKSTOP,
     DriverGate,
     abandoned_once_inside,
+    every_call_ended,
     every_slot_returned,
     kinds,
     verifier,
@@ -229,8 +230,12 @@ class TestAsyncStore:
     ) -> None:
         """The production path: the store's await is cancelled inside the driver, its connection
         goes back to the pool rather than leaking, and a discovery the cancellation interrupted
-        runs again on the next request instead of being left half done or locked."""
+        runs again on the next request instead of being left half done or locked.
+
+        The abandoned call winds down on a task of its own after its caller has gone, so the pool
+        is read only once every such call has ended (`every_call_ended`)."""
         store, _ = async_fixture()
+        assert isinstance(store, SqlAlchemySessionStore)
         if stage == "lookup":
             await store.connect()
         engine = async_fixture.engines[-1]
@@ -239,6 +244,7 @@ class TestAsyncStore:
 
         await abandoned_once_inside(driver.reached.wait, lookup_through(store))
         driver.release.set()
+        await every_call_ended(store)
 
         await served(store)
         assert kinds(records) == []

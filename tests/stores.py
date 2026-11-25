@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from fastapi_better_auth import SqlAlchemySessionStore, SyncStoreAdapter
+from tests.deadlines import every_call_ended
 
 NOW = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
 EXPIRES_AT = datetime(2999, 1, 1, 12, 0, tzinfo=timezone.utc)
@@ -283,12 +284,16 @@ class StoreFixture:
     `store_options` is how a case configures the store rather than the schema: the two table
     names are read from the schema keywords so a renamed table is seeded and pointed at in one
     call, and anything else (`user_columns=`, `session_columns=`) is passed straight through.
+
+    An async store a test abandoned a lookup on may still be winding that call down, on the
+    engine's connection; `aclose()` waits for every such call to end before it disposes anything.
     """
 
     def __init__(self, tmp_path: pathlib.Path, flavour: str) -> None:
         self._tmp_path = tmp_path
         self._flavour = flavour
         self.engines: list[Engine | AsyncEngine] = []
+        self._async_stores: list[SqlAlchemySessionStore] = []
 
     def __call__(
         self, store_options: Mapping[str, Any] | None = None, **schema: Any
@@ -303,6 +308,7 @@ class StoreFixture:
         if self._flavour == "async":
             engine = async_engine(path)
             store = SqlAlchemySessionStore(engine=engine, **options)
+            self._async_stores.append(store)
         else:
             engine = sync_engine(path)
             store = SyncStoreAdapter(engine=engine, **options)
@@ -311,6 +317,8 @@ class StoreFixture:
         return store, log
 
     async def aclose(self) -> None:
+        for store in self._async_stores:
+            await every_call_ended(store)
         for engine in self.engines:
             if isinstance(engine, AsyncEngine):
                 await engine.dispose()
