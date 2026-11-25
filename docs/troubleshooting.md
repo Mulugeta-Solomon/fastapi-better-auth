@@ -84,8 +84,9 @@ One `WARNING` says the session store lookup could not complete and names
 `LookupDeadlineExceeded`. A request's store lookups took longer than `lookup_timeout`, 5 seconds by
 default. Requests are answered again as soon as the store answers in time. If opening a new
 database connection alone takes longer than `lookup_timeout`, no lookup can complete: raise
-`lookup_timeout` or shorten the connection time. See
-[When the database does not answer](stores.md#when-the-database-does-not-answer).
+`lookup_timeout` or shorten the connection time. A SQL store that was not connected at startup
+also reads the schema inside a request, under the same limit: call `await store.connect()` in
+your lifespan. See [When the database does not answer](stores.md#when-the-database-does-not-answer).
 
 After a server has stopped answering altogether, the database driver may log a line of its own
 about the connection that was closed under it. With `asyncpg`, the `asyncio` logger may show

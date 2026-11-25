@@ -105,7 +105,8 @@ keyword-only.
 
 **Call `await store.connect()` in your lifespan.** It reads the live schema once, so a table or a
 required column that is missing stops the application at startup instead of failing the first
-request with a `ConfigurationError`. Without it, the first lookup does the same work.
+request with a `ConfigurationError`. Without it, the first lookup does the same work, inside its
+request's `lookup_timeout`.
 
 ## When the database does not answer
 
@@ -139,6 +140,10 @@ Set these in the database and the driver, for either store:
   own deadline, so keep `lookup_timeout` well above the time a new connection takes.
 - **For `SyncStoreAdapter`, a read timeout in the driver**, so a thread waiting on a server that
   never answers is given back.
+
+A SQL store that was not connected at startup reads the schema inside a request, under that
+request's `lookup_timeout`. A read that takes longer than that never finishes inside a request.
+Call `await store.connect()` in your lifespan, where no such limit applies.
 
 The `[sqlalchemy]` extra needs SQLAlchemy 2.0.38 or newer. Before 2.0.24, a cancelled connection
 is dropped without cancelling its statement on the server. Before 2.0.38, a server that stops

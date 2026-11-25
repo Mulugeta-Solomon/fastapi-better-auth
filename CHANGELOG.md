@@ -38,7 +38,8 @@ Merged on `main` since 0.6.0, not yet on PyPI.
 - **Mode A refuses a request whose store lookups take longer than 5 seconds together.** Before, a
   request waited for as long as the store did. Pass `CookieVerifier(lookup_timeout=...)` to change
   the limit, or `None` for no limit. Keep it well above the time a new database connection takes,
-  and set a statement timeout on the server that is shorter than it. See
+  and set a statement timeout on the server that is shorter than it. A SQL store reads the schema
+  inside a request, under the same limit, unless `await store.connect()` ran at startup. See
   [When the database does not answer](docs/stores.md#when-the-database-does-not-answer).
 - **The `[sqlalchemy]` extra needs SQLAlchemy 2.0.38 or newer** (was 2.0). Older releases cannot
   cancel a statement on the server when its lookup is cancelled, or can leave its connection open
