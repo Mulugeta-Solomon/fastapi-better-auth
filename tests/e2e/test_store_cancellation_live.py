@@ -87,7 +87,15 @@ POLL = 0.05
 # and on a starved machine a 2 s deadline cancelled each attempt before it connected (the
 # constraint the store's docstring warns operators about). Recovery is the property, not speed.
 
-FORGED = f"{COOKIE}={sign('a-token-that-names-no-session')}"
+FORGED_TOKEN = "a-token-that-names-no-session"
+FORGED = f"{COOKIE}={sign(FORGED_TOKEN)}"
+
+DRIVER_REPORT = "Future exception was never retrieved"
+DRIVER_LOST = "unexpected connection_lost() call"
+"""The one loop report asyncpg makes of its own: a future of its protocol, failed with
+`ConnectionError(DRIVER_LOST)` when a connection is torn down while its close is pending, and
+dropped unread by asyncpg itself. Seen every run at SQLAlchemy 2.0.38 with asyncpg 0.30.0 in
+the return-cut-short case, and now and then at the lockfile versions. It names no statement."""
 
 WAITING_ON_THE_LOCK = """
 select count(*) from pg_stat_activity
@@ -170,6 +178,27 @@ async def blocker() -> AsyncIterator[AsyncEngine]:
     built = create_async_engine(POSTGRES_URL)
     yield built
     await built.dispose()
+
+
+def unexpected(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The loop reports a test must not have: every one but asyncpg's own `DRIVER_REPORT`.
+
+    Whatever is allowed, no report may carry the lookup's token - asyncpg's included, so a
+    driver that one day put the statement in that text would fail here, not pass as "known"."""
+    for report in reports:
+        exception = report.get("exception")
+        text = f"{report!r} {exception!s} {getattr(exception, 'args', ())!r}"
+        assert FORGED_TOKEN not in text, "a loop report carries the lookup's token"
+    return [report for report in reports if not _the_drivers_own(report)]
+
+
+def _the_drivers_own(report: dict[str, Any]) -> bool:
+    exception = report.get("exception")
+    return (
+        report.get("message") == DRIVER_REPORT
+        and type(exception) is ConnectionError
+        and str(exception) == DRIVER_LOST
+    )
 
 
 async def backends(observer: AsyncEngine, name: str) -> Backends:
@@ -260,7 +289,7 @@ async def test_lookups_abandoned_at_their_deadline_leave_no_backend_behind(
     assert recovered_in < SETTLE_BACKSTOP
     await every_call_ended(store)
     gc.collect()  # a driver future dropped unread is reported when it is collected
-    assert loop_reports == []
+    assert unexpected(loop_reports) == []
 
 
 # ---------------------------------------------------------------- a server that stopped answering
@@ -419,7 +448,7 @@ async def test_at_the_shipped_bound_calls_abandoned_against_a_stalled_server_end
 
     await recovered(store, relayed_engine, observer, application_name)
     gc.collect()  # a driver future dropped unread is reported when it is collected
-    assert loop_reports == []
+    assert unexpected(loop_reports) == []
 
 
 @pytest.mark.anyio
@@ -459,7 +488,7 @@ async def test_the_backstop_ends_a_clean_up_the_driver_would_never_end(
 
     await recovered(store, relayed_engine, observer, application_name)
     gc.collect()  # a driver future dropped unread is reported when it is collected
-    assert loop_reports == []
+    assert unexpected(loop_reports) == []
 
 
 @pytest.mark.anyio
@@ -509,7 +538,7 @@ async def test_a_call_abandoned_while_its_rollback_is_unanswered_ends_within_the
     assert held_while_stalled == 0, "the connection stayed checked out while the server was silent"
     await recovered(store, relayed_engine, observer, application_name)
     gc.collect()  # a driver future dropped unread is reported when it is collected
-    assert loop_reports == []
+    assert unexpected(loop_reports) == []
 
 
 @pytest.mark.anyio
@@ -563,4 +592,4 @@ async def test_a_return_cut_short_by_the_backstop_still_gives_the_connection_bac
     assert held_while_stalled == 0, "a return cut short by the backstop kept its pool slot"
     await recovered(store, relayed_engine, observer, application_name)
     gc.collect()  # a driver future dropped unread is reported when it is collected
-    assert loop_reports == []
+    assert unexpected(loop_reports) == []
