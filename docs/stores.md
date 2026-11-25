@@ -130,8 +130,9 @@ What happens to the statement that was running depends on the store:
 Set these in the database and the driver, for either store:
 
 - **A statement timeout on the server that is shorter than `lookup_timeout`**, so a statement nobody
-  waits for ends by itself. On Postgres: `ALTER ROLE <role> SET statement_timeout = '3s'`. On MySQL:
-  `max_execution_time`.
+  waits for ends by itself. On Postgres: `ALTER ROLE <role> SET statement_timeout = '3s'`. It
+  applies to connections opened after it, so restart the application or recycle its pool. On
+  MySQL: `max_execution_time`.
 - **A connect timeout in the driver.** A lookup that finds no idle connection opens one inside its
   own deadline, so keep `lookup_timeout` well above the time a new connection takes.
 - **For `SyncStoreAdapter`, a read timeout in the driver**, so a thread waiting on a server that
@@ -142,7 +143,8 @@ connection without cancelling its statement on the server.
 
 `tests/e2e/test_store_cancellation_live.py` proves the async store's part against a live Postgres
 on `asyncpg`. With the `session` table locked, no statement of a refused lookup is left on the
-server. Against a server that stops answering, the abandoned calls end, by the store's own
+server. Against a server that stops answering, during a statement or while a connection is being
+returned to the pool, the abandoned calls end and their connections come back, by the store's own
 5-second limit where the driver would wait for good. The locked-table case was also measured by
 hand on `psycopg`. Other drivers are not measured; the statement timeout above covers them.
 

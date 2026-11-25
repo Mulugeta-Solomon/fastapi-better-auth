@@ -189,7 +189,7 @@ application with `create_app(test_settings)` and takes its override key off `app
 | **Expiry** | Enforced by the verifier. Upstream's `findSession()` does not check `expiresAt`, so a bare DB join honours an expired session forever; this verifier refuses it. |
 | **Signature** | `token + "." + base64(HMAC-SHA256(secret, token))`, standard base64, split at the *last* dot, compared in constant time against a keyring — exact wire parity with better-call. |
 | **CSRF** | Required, and checked **before** the signature, so a cross-site `403` is never an oracle for whether the cookie behind it is currently valid. |
-| **A store that does not answer** | Refused as `AuthServiceUnavailable` (`401`) once the request's store lookups have taken `lookup_timeout` seconds, 5 by default. See [When the database does not answer](stores.md#when-the-database-does-not-answer). |
+| **A store that does not answer** | Refused as `AuthServiceUnavailable` (`401`) once the request's store lookups have taken `lookup_timeout` seconds, 5 by default. A store of your own that shields its lookup from cancellation is refused only when that lookup returns. See [When the database does not answer](stores.md#when-the-database-does-not-answer). |
 
 A **Redis-authoritative** deployment is a hard rule: a store miss is a `401`, never a fall-back to a
 database. When Better Auth runs with `secondaryStorage`, sign-out deletes the Redis key while a stale
