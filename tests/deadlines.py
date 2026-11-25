@@ -206,9 +206,15 @@ class AsyncDriverGate:
     A second cancellation landing on that shielded wait interrupts the clean-up, as it would
     interrupt SQLAlchemy's graceful close, and is counted in `interrupted`. `late_error`, when set,
     is what the statement raises once its clean-up has ended, in place of the cancellation.
+
+    `method` is the dialect call that is held: `do_execute`, a statement, by default; or
+    `do_rollback`, the `ROLLBACK` a connection sends when it is closed and goes back to its pool -
+    which is where a server that stops answering after the statement has answered is met.
     """
 
-    def __init__(self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch) -> None:
+    def __init__(
+        self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, method: str = "do_execute"
+    ) -> None:
         from sqlalchemy.util import await_only
 
         self.release = asyncio.Event()
@@ -221,14 +227,14 @@ class AsyncDriverGate:
         self.late_raised = 0
         self.late_error: type[sqlite3.Error] | None = None
         dialect = engine.sync_engine.dialect
-        original = dialect.do_execute
+        original: Callable[..., object] = getattr(dialect, method)
 
-        def do_execute(cursor: Any, statement: str, parameters: Any, context: Any = None) -> None:
+        def held(*args: Any, **kwargs: Any) -> object:
             if not self.release.is_set():
                 await_only(self._held())
-            original(cursor, statement, parameters, context)
+            return original(*args, **kwargs)
 
-        monkeypatch.setattr(dialect, "do_execute", do_execute)
+        monkeypatch.setattr(dialect, method, held)
 
     async def _held(self) -> None:
         self.entries += 1

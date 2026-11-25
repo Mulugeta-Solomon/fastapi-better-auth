@@ -277,3 +277,62 @@ async def test_a_cancelled_discovery_winds_down_and_runs_again(
     await store.connect()
     await served(store)
     assert checked_out(engine) == 0
+
+
+# ---------------------------------------------------------------- the connection's return
+
+RETURN_STAGES = ("lookup", "discovery")
+"""Where the server stops answering after the statement has: the ROLLBACK a lookup's connection
+sends on its way back to the pool, or the one after schema discovery's reflection."""
+
+
+@pytest.fixture(params=RETURN_STAGES)
+def return_stage(request: pytest.FixtureRequest) -> str:
+    value = request.param
+    assert isinstance(value, str)
+    return value
+
+
+async def warmed(fixture: StoreFixture) -> tuple[SqlAlchemySessionStore, AsyncEngine]:
+    """A store over a fresh database whose engine has connected once, so the dialect's own
+    first-connect rollbacks are behind it and the next ROLLBACK is a connection's return."""
+    store, _ = fixture()
+    assert isinstance(store, SqlAlchemySessionStore)
+    engine = fixture.engines[-1]
+    assert isinstance(engine, AsyncEngine)
+    async with engine.connect():
+        pass
+    return store, engine
+
+
+@pytest.mark.anyio
+async def test_a_call_abandoned_while_its_connection_is_returned_is_cancelled_once(
+    fixture: StoreFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    records: list[logging.LogRecord],
+    return_stage: str,
+) -> None:
+    """The statement answered; the server stops answering while the connection is closed and
+    rolled back on its way to the pool. The caller leaves, and that one cancellation must reach
+    the ROLLBACK - not be absorbed by a close running somewhere it cannot reach, where nothing,
+    not even the backstop, would bound it - so the clean-up runs and the connection comes back."""
+    store, engine = await warmed(fixture)
+    if return_stage == "lookup":
+        await store.connect()
+        abandon: Any = lookup_through(store)
+    else:
+        abandon = store.connect
+    gate = AsyncDriverGate(engine, monkeypatch, method="do_rollback")
+    try:
+        await abandoned_once_inside(gate.arrived.wait, abandon)
+        await asyncio.sleep(0)
+        assert outcome(gate) == (1, 0, 0), "the cancellation did not reach the connection's return"
+    finally:
+        gate.open()
+
+    await every_call_ended(store)
+    assert outcome(gate) == (1, 1, 0)
+    assert checked_out(engine) == 0
+    assert kinds(records) == []
+    await served(store)
+    assert checked_out(engine) == 0
