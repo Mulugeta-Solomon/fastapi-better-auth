@@ -30,13 +30,15 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from fastapi_better_auth import AuthServiceUnavailable, SessionError
-from tests.cookies import COOKIE, http, run, sign
-from tests.deadlines import every_call_ended, verifier
 
 from .conftest import POSTGRES_URL
 
 try:
+    # The test helpers import post-0.1.0 names too, so they belong under the guard as well: the
+    # canary's published-wheel leg installs the last release, and must skip here, not raise.
     from fastapi_better_auth import CookieVerifier, SqlAlchemySessionStore
+    from tests.cookies import COOKIE, http, run, sign
+    from tests.deadlines import every_call_ended, verifier
 except ImportError:
     pytest.skip(
         "this build of fastapi-better-auth-bridge publishes no session stores",
