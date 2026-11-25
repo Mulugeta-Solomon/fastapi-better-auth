@@ -84,7 +84,10 @@ def stage(request: pytest.FixtureRequest) -> str:
 
 
 async def served(store: SqlAlchemySessionStore | SyncStoreAdapter) -> None:
-    session = await run(verifier(store, lookup_timeout=GUARD), http(cookie=COOKIE_PAIR))
+    """The store answers again. Under a deadline no case waits out: recovery after an abandoned
+    discovery opens a fresh connection and reflects the whole schema again, which a starved
+    machine took longer than `GUARD` to do (1 run in 50 under full CPU load)."""
+    session = await run(verifier(store, lookup_timeout=LONG), http(cookie=COOKIE_PAIR))
     assert session is not None
     assert session.id == SESSION_ID
 

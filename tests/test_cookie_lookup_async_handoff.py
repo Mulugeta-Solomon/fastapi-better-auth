@@ -103,7 +103,9 @@ async def connected(fixture: StoreFixture) -> tuple[SqlAlchemySessionStore, Asyn
 
 
 async def served(store: SqlAlchemySessionStore) -> None:
-    session = await run(verifier(store, lookup_timeout=GUARD), http(cookie=COOKIE_PAIR))
+    """The store answers again, under a deadline no case waits out: recovery may rediscover the
+    schema on a fresh connection, which a starved machine can take longer than `GUARD` to do."""
+    session = await run(verifier(store, lookup_timeout=LONG), http(cookie=COOKIE_PAIR))
     assert session is not None
     assert session.id == SESSION_ID
 
