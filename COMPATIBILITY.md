@@ -149,7 +149,7 @@ lockfile and would never exercise a floor.
 | `exceptiongroup` (Python 3.10 only) | `>=1.2` |
 | `httpx` (extra `[httpx]`) | `>=0.27` |
 | `httpx2` (extra `[httpx2]`) | `>=2.0` |
-| `sqlalchemy[asyncio]` (extra `[sqlalchemy]`) | `>=2.0` |
+| `sqlalchemy[asyncio]` (extra `[sqlalchemy]`) | `>=2.0.24` (a cancelled lookup's statement is cancelled on the server) |
 | `redis` (extra `[redis]`) | `>=5.0.1` |
 
 The two store extras are what `SqlAlchemySessionStore` / `SyncStoreAdapter` and
@@ -166,6 +166,12 @@ decision, and pinning one here would be this library choosing it.
 here to call `anyio.to_thread.run_sync`, and anyio 4.0's Trio backend passes a `cancellable=`
 argument Trio removed in 0.23 — so on Trio it raises `TypeError` rather than running the query.
 The floor-resolution lane is what found it.
+
+`sqlalchemy`'s floor moved from `>=2.0` to `>=2.0.24` with the lookup limit. When a lookup is
+cancelled, 2.0.24 and later close its connection in order, which is when the driver asks the
+server to cancel the statement. Earlier releases cut the socket at once, and Postgres keeps running
+a statement nobody is waiting for. Measured against a live Postgres on 2.0.23 and 2.0.24. See
+[When the database does not answer](docs/stores.md#when-the-database-does-not-answer).
 
 ## What a release of this library may change
 

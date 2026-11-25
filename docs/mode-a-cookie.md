@@ -189,6 +189,7 @@ application with `create_app(test_settings)` and takes its override key off `app
 | **Expiry** | Enforced by the verifier. Upstream's `findSession()` does not check `expiresAt`, so a bare DB join honours an expired session forever; this verifier refuses it. |
 | **Signature** | `token + "." + base64(HMAC-SHA256(secret, token))`, standard base64, split at the *last* dot, compared in constant time against a keyring — exact wire parity with better-call. |
 | **CSRF** | Required, and checked **before** the signature, so a cross-site `403` is never an oracle for whether the cookie behind it is currently valid. |
+| **A store that does not answer** | Refused as `AuthServiceUnavailable` (`401`) once the request's store lookups have taken `lookup_timeout` seconds, 5 by default. See [When the database does not answer](stores.md#when-the-database-does-not-answer). |
 
 A **Redis-authoritative** deployment is a hard rule: a store miss is a `401`, never a fall-back to a
 database. When Better Auth runs with `secondaryStorage`, sign-out deletes the Redis key while a stale
@@ -209,3 +210,4 @@ Every parameter is keyword-only. An unusable value is a `ConfigurationError` at 
 | `secure_prefix` | `"__Secure-"` | The prefix read when `secure_cookies` is `True`. `"__Host-"` is the only prefix a sibling subdomain cannot plant; prefer it where Better Auth can emit it. |
 | `secure_cookies` | `True` | `True` reads only `{secure_prefix}{cookie_name}`, Better Auth's production default; `False` reads only `cookie_name`, for a development server over HTTP. Never both. |
 | `now` | `None` | The clock for the expiry and ban checks, for tests. It can only make the verifier stricter. See [Testing](testing.md#moving-the-verifiers-clock). |
+| `lookup_timeout` | `5.0` | Seconds one request's store lookups may take together. A request that runs out is refused as `AuthServiceUnavailable`. `None` sets no limit. See [When the database does not answer](stores.md#when-the-database-does-not-answer). |

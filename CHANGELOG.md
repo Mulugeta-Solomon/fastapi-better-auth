@@ -35,6 +35,14 @@ Merged on `main` since 0.6.0, not yet on PyPI.
   `advanced.database.generateId: "serial"` or `"uuid"`, every session used to read as unusable, so
   every request was a `401`. Ids are now handed on as text: decimal digits, or lowercase
   hyphenated uuids.
+- **Mode A refuses a request whose store lookups take longer than 5 seconds together.** Before, a
+  request waited for as long as the store did. Pass `CookieVerifier(lookup_timeout=...)` to change
+  the limit, or `None` for no limit. Keep it well above the time a new database connection takes,
+  and set a statement timeout on the server that is shorter than it. See
+  [When the database does not answer](docs/stores.md#when-the-database-does-not-answer).
+- **The `[sqlalchemy]` extra needs SQLAlchemy 2.0.24 or newer** (was 2.0). Older releases cannot
+  cancel a statement on the server when its lookup is cancelled. A project that pins an older
+  SQLAlchemy no longer resolves.
 
 ### Added
 
@@ -49,6 +57,8 @@ Merged on `main` since 0.6.0, not yet on PyPI.
 - `now=` on `CookieVerifier` and `RemoteVerifier`: the clock the expiry and ban checks read, for
   tests. It can only make a verifier stricter. (#82, PR #89)
 - `max_stale=` on `JwtVerifier`, default 86400 seconds. (PR #110)
+- `lookup_timeout=` on `CookieVerifier`, default 5.0 seconds, and the `lookup_timeout` property.
+  (PR #112)
 
 ### Changed
 
@@ -68,6 +78,12 @@ Merged on `main` since 0.6.0, not yet on PyPI.
 - Mode C: a transient probe status is no longer remembered as a configuration failure; see Upgrade
   notes. (PR #109)
 - SQL stores: integer and uuid ids; see Upgrade notes. (PR #111)
+- `SqlAlchemySessionStore`: a lookup that was cancelled, by a client disconnect or by the new
+  limit, left its statement running on the server and cut its connection. While the database
+  hung, each such lookup added one more connection on the server, past the pool's size. The
+  statement is now cancelled on the server and the store stays within the engine's pool. (PR #112)
+- `SyncStoreAdapter`: a cancelled lookup no longer gives back its place in `max_concurrency` while
+  its thread is still running, so the adapter cannot run more threads than its limit. (PR #112)
 
 ### Security
 
@@ -84,6 +100,8 @@ Merged on `main` since 0.6.0, not yet on PyPI.
   workflow, the live conformance lane included, has passed for that commit. (PR #108)
 - The conformance harness publishes its ports on `127.0.0.1` only, and each port can be moved with
   a `HARNESS_*_PORT` variable. (PR #108)
+- Every CI job has a time limit, and a test that runs for three minutes prints where it is.
+  (PR #112)
 
 ### Documentation
 

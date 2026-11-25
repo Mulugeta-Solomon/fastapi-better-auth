@@ -78,6 +78,20 @@ longer, pass a longer `max_stale`. See
 The `WARNING` names the driver error class and its SQLSTATE. `42501` means the database role lacks
 `SELECT` on `session` or `user`. See [Session stores](stores.md#the-shipped-stores).
 
+## Mode A: requests are `401` while the store is slow
+
+One `WARNING` says the session store lookup could not complete and names
+`LookupDeadlineExceeded`. A request's store lookups took longer than `lookup_timeout`, 5 seconds by
+default. Requests are answered again as soon as the store answers in time. If opening a new
+database connection alone takes longer than `lookup_timeout`, no lookup can complete: raise
+`lookup_timeout` or shorten the connection time. See
+[When the database does not answer](stores.md#when-the-database-does-not-answer).
+
+On older releases (measured on SQLAlchemy 2.0.24 with asyncpg 0.30.0), a server that stops
+answering altogether also makes SQLAlchemy's pool log one `ERROR`, "Exception terminating
+connection", and the first lookup after the server returns is refused once more. Neither line
+carries the token. SQLAlchemy 2.1.9 with asyncpg 0.32.0 does neither.
+
 ## SQL store: every request is `401`, and ids are integers or uuids
 
 Release 0.6.0 reads only text ids. With `advanced.database.generateId: "serial"` or `"uuid"`, every

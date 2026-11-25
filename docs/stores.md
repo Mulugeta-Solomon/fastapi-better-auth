@@ -101,10 +101,50 @@ keyword-only.
 | `schema` | `None` | The schema both tables are in. `None` is the connection's default schema. |
 | `session_columns` | `None` | Extra `session` columns that may be selected. `None` selects every column. |
 | `user_columns` | `None` | Extra `user` columns that may be selected. `None` selects every column. |
+| `max_concurrency` | `None` | `SyncStoreAdapter` only. The most lookups that may run on worker threads at once. `None` uses the engine pool's size plus overflow, or 8 where the pool states no size. |
 
 **Call `await store.connect()` in your lifespan.** It reads the live schema once, so a table or a
 required column that is missing stops the application at startup instead of failing the first
 request with a `ConfigurationError`. Without it, the first lookup does the same work.
+
+## When the database does not answer
+
+`CookieVerifier` gives one request's store lookups `lookup_timeout` seconds together, 5 by default.
+A request that runs out is refused as `AuthServiceUnavailable`, the uniform `401`. One `WARNING` of
+the kind `LookupDeadlineExceeded` is logged, and not again until a lookup completes. A lookup is
+also cancelled when its client disconnects.
+
+What happens to the statement that was running depends on the store:
+
+- **`SqlAlchemySessionStore`** cancels its database call once and returns to the request at once.
+  SQLAlchemy and the driver then cancel the statement on the server and close that connection, and
+  a later lookup opens a new one. The connection counts against the engine's pool until that has
+  ended, so the store never holds more connections than the pool allows. While the pool is full,
+  further lookups wait for a connection and are refused at their own deadline. If the server has
+  stopped answering, the store closes the connection without it after 5 seconds.
+- **`SyncStoreAdapter`** cannot interrupt a worker thread. The statement runs on, and its thread and
+  its connection stay taken until the database answers or the driver gives up. The adapter never
+  runs more threads than `max_concurrency`. Further lookups wait without starting a thread, and are
+  refused at their own deadline.
+
+Set these in the database and the driver, for either store:
+
+- **A statement timeout on the server that is shorter than `lookup_timeout`**, so a statement nobody
+  waits for ends by itself. On Postgres: `ALTER ROLE <role> SET statement_timeout = '3s'`. On MySQL:
+  `max_execution_time`.
+- **A connect timeout in the driver.** A lookup that finds no idle connection opens one inside its
+  own deadline, so keep `lookup_timeout` well above the time a new connection takes.
+- **For `SyncStoreAdapter`, a read timeout in the driver**, so a thread waiting on a server that
+  never answers is given back.
+
+The `[sqlalchemy]` extra needs SQLAlchemy 2.0.24 or newer. Older releases drop a cancelled
+connection without cancelling its statement on the server.
+
+`tests/e2e/test_store_cancellation_live.py` proves the async store's part against a live Postgres
+on `asyncpg`. With the `session` table locked, no statement of a refused lookup is left on the
+server. Against a server that stops answering, the abandoned calls end, by the store's own
+5-second limit where the driver would wait for good. The locked-table case was also measured by
+hand on `psycopg`. Other drivers are not measured; the statement timeout above covers them.
 
 ## Integer and uuid ids
 

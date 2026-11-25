@@ -48,6 +48,9 @@ One more line at `WARNING`, and the frequency of two lines named above:
   naming its `kid`. The rest of the key set is still used. See [Mode B](mode-b-jwt.md#when-the-key-set-cannot-be-fetched).
 - **Mode B key-set refresh failed** while the set on hand was still within `max_stale`: one line
   per failed refresh, which happens at most once per 10 seconds.
+- **Mode A store lookups that passed `lookup_timeout`.** The kind is `LookupDeadlineExceeded`, with
+  no SQLSTATE. It follows the once-per-kind rule above: one line, then nothing until a lookup
+  completes. A lookup cancelled because its client disconnected logs nothing.
 
 A `now=` clock that raises, or returns anything but an aware `datetime`, is an exception that
 escaped a verifier: the request is the uniform `401`, and the exception is logged at `ERROR` with
