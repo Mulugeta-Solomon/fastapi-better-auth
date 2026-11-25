@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import anyio
 
 from ..errors import ConfigurationError
+from .newest_first import NewestFirstLock
 from .outage import OutageLatch, report_once
 from .records import StoredSession, StoredUser
 from .task_handoff import TaskHandoff
@@ -80,7 +81,7 @@ class _CoreStore(ABC):
             self._sql.validated_columns("session_columns", session_columns),
             self._sql.validated_columns("user_columns", user_columns),
         )
-        self._lock = anyio.Lock()
+        self._turn = NewestFirstLock()
         self._plan: Plan | None = None
         self._outage = OutageLatch()
 
@@ -132,13 +133,20 @@ class _CoreStore(ABC):
         The statement depends on which columns exist - the admin plugin's are surfaced only
         where they were created - so this is not a cache in front of a fixed query, it *is* the
         query. The lock is what stops a burst of first requests each inspecting the schema.
+
+        Without `connect()`, the read runs inside a request, under its `lookup_timeout`, and a
+        read whose caller leaves is abandoned and started again by the next holder. So the turn
+        goes to the newest waiter, which has the most of its deadline left, not the oldest, which
+        has only the gap between two arrivals: first-in-first-out, a read that overran once is
+        cut short again and again for as long as requests arrive faster than one read takes
+        (`NewestFirstLock`, F22).
         """
         plan = self._plan
         if plan is not None:
             return plan
         session, user = self._names
         session_allowed, user_allowed = self._allowed
-        async with self._lock:
+        async with self._turn:
             if self._plan is None:
                 discovered = await self._columns()
                 self._plan = self._sql.plan_for(
