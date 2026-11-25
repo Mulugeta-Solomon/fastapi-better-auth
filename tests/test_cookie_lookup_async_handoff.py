@@ -47,7 +47,7 @@ from tests.deadlines import (
     verifier,
 )
 from tests.log_hygiene import LIBRARY_LOGGER, assert_no_leak, capturing
-from tests.stores import SESSION_ID, TOKEN, DeniedError, DriverFault, StoreFixture
+from tests.stores import SESSION_ID, TOKEN, DeniedError, DriverFault, StalledError, StoreFixture
 
 COOKIE_PAIR = f"{COOKIE}={sign(TOKEN)}"
 
@@ -373,3 +373,35 @@ async def test_a_backstop_cancellation_during_the_return_still_gives_the_connect
     await every_call_ended(store)
     await served(store)
     assert checked_out(engine) == 0
+
+
+@pytest.mark.anyio
+async def test_a_close_that_fails_after_the_statement_failed_is_still_translated(
+    fixture: StoreFixture, monkeypatch: pytest.MonkeyPatch, records: list[logging.LogRecord]
+) -> None:
+    """The connection is now closed in a `finally` on the handed-off call, so a close that fails
+    after the statement failed replaces the statement's error, chained to it. Both carry the token
+    in their text. What reaches the caller is still the uniform refusal, chained to neither, and
+    what is logged names a driver error class and nothing of either message (A1)."""
+    store, engine = await connected(fixture)
+    fault = DriverFault(engine, monkeypatch)
+    dialect = engine.sync_engine.dialect
+    original = dialect.do_rollback
+
+    def do_rollback(dbapi_connection: Any) -> None:
+        if fault.error is not None:
+            raise StalledError(f"rollback failed after matching ({TOKEN})")
+        original(dbapi_connection)
+
+    monkeypatch.setattr(dialect, "do_rollback", do_rollback)
+    fault.error = DeniedError
+    with pytest.raises(AuthServiceUnavailable) as caught:
+        await store.fetch_session_by_token(TOKEN)
+    fault.error = None
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert kinds(records) == ["StalledError"]
+    assert_no_leak([record for record in records if record.name == LIBRARY_LOGGER], TOKEN)
+    assert checked_out(engine) == 0
+    await served(store)
