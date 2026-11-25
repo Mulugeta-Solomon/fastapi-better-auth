@@ -32,6 +32,9 @@ from sqlalchemy import QueuePool
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from fastapi_better_auth import AuthServiceUnavailable, SqlAlchemySessionStore
+from fastapi_better_auth._internal.stores.sqlalchemy_store import (
+    _returned,  # pyright: ignore[reportPrivateUsage]
+)
 from fastapi_better_auth._internal.stores.task_handoff import TaskHandoff
 from tests.cookies import CAPTURED_TOKEN, COOKIE, http, run, sign
 from tests.deadlines import (
@@ -405,3 +408,63 @@ async def test_a_close_that_fails_after_the_statement_failed_is_still_translated
     assert_no_leak([record for record in records if record.name == LIBRARY_LOGGER], TOKEN)
     assert checked_out(engine) == 0
     await served(store)
+
+
+# ---------------------------------------------------------------- the close itself
+
+
+class ClosingStub:
+    """Stands in for a connection: each `close()` raises the next failure it was given, if any."""
+
+    def __init__(self, *failures: BaseException) -> None:
+        self._failures = list(failures)
+        self.closes = 0
+
+    async def close(self) -> None:
+        self.closes += 1
+        if self._failures:
+            raise self._failures.pop(0)
+
+
+async def returned(stub: ClosingStub) -> None:
+    connection: Any = stub
+    await _returned(connection)
+
+
+@pytest.mark.anyio
+async def test_a_close_that_succeeds_is_not_repeated() -> None:
+    stub = ClosingStub()
+    await returned(stub)
+    assert stub.closes == 1
+
+
+FIRST_THEN_SECOND: dict[str, tuple[type[BaseException], type[BaseException] | None]] = {
+    "raises, then raises": (StalledError, DeniedError),
+    "cancelled, then raises": (asyncio.CancelledError, DeniedError),
+    "raises, then cancelled": (StalledError, asyncio.CancelledError),
+    "raises, then closes": (StalledError, None),
+    "cancelled, then closes": (asyncio.CancelledError, None),
+}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("first", "second"), FIRST_THEN_SECOND.values(), ids=FIRST_THEN_SECOND.keys()
+)
+async def test_a_close_that_fails_is_closed_once_more_and_its_first_failure_is_what_leaves(
+    first: type[BaseException], second: type[BaseException] | None
+) -> None:
+    """Whatever the second close does - close, raise, or be cancelled in its turn - the close is
+    attempted exactly twice and the first failure leaves as it was raised, chained to nothing. A
+    cancellation stays a cancellation, and a driver error stays the error `_select` translates:
+    the second attempt's outcome goes nowhere, so its text can reach no log and no caller (A1)."""
+    failure = first("the first close")
+    stub = ClosingStub(failure) if second is None else ClosingStub(failure, second("the second"))
+
+    with pytest.raises(first) as caught:
+        await returned(stub)
+
+    assert caught.value is failure
+    assert stub.closes == 2
+    assert failure.__cause__ is None
+    assert failure.__context__ is None
