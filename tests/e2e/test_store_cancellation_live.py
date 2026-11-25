@@ -383,8 +383,8 @@ async def test_the_backstop_ends_a_clean_up_the_driver_would_never_end(
     winding down - cancelled once, waiting on a server that will not answer. Only when the loop's
     clock passes the bound (`LeapingClock`) does the backstop cancel them again, and then they end
     within a guard; without the backstop they never would. The leap waits until a close has been
-    entered, so the driver's clean-up has begun before the backstop is given its turn. The pool is clean and the store answers
-    once the relay forwards again."""
+    entered, so the driver's clean-up has begun before the backstop is given its turn. The pool is
+    clean and the store answers once the relay forwards again."""
     closing = unbounded_close(monkeypatch)
     clock = LeapingClock(monkeypatch)
     store = SqlAlchemySessionStore(engine=relayed_engine)

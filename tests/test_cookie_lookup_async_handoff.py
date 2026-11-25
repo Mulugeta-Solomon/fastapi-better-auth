@@ -379,10 +379,10 @@ async def test_a_backstop_cancellation_during_the_return_still_gives_the_connect
 async def test_a_close_that_fails_after_the_statement_failed_is_still_translated(
     fixture: StoreFixture, monkeypatch: pytest.MonkeyPatch, records: list[logging.LogRecord]
 ) -> None:
-    """The connection is now closed in a `finally` on the handed-off call, so a close that fails
-    after the statement failed replaces the statement's error, chained to it. Both carry the token
-    in their text. What reaches the caller is still the uniform refusal, chained to neither, and
-    what is logged names a driver error class and nothing of either message (A1)."""
+    """The connection is closed in a `finally` on the handed-off call, so a close that fails after
+    the statement failed replaces the statement's error. Both carry the token in their text here.
+    What reaches the caller is still the uniform refusal, chained to neither, and what is logged
+    names a driver error class and nothing of either message (A1)."""
     store, engine = await connected(fixture)
     fault = DriverFault(engine, monkeypatch)
     dialect = engine.sync_engine.dialect
