@@ -252,12 +252,12 @@ class SqlAlchemySessionStore(_CoreStore):
     that has happened the connection stays checked out, so the engine's pool bounds the calls
     winding down, and lookups that find it full wait for a connection and are refused at their
     own deadline. A call that has not wound down within 5 seconds (a server that stopped
-    answering) is cancelled again every 5 seconds until it ends, which closes its connection
-    without waiting for the server. A server-side statement timeout shorter than
-    `lookup_timeout` (Postgres `statement_timeout`, MySQL `max_execution_time`) is still the
-    right setting: it ends a slow statement on the server whatever becomes of its client. And a
-    lookup that finds no idle connection opens a new one inside its own deadline, so keep
-    `lookup_timeout` well above the time a new connection takes.
+    answering) is cancelled again every 5 seconds until it ends, which gives its connection's
+    place back to the pool without waiting for the server. A server-side statement timeout
+    shorter than `lookup_timeout` (Postgres `statement_timeout`, MySQL `max_execution_time`) is
+    still the right setting: it ends a slow statement on the server whatever becomes of its
+    client. And a lookup that finds no idle connection opens a new one inside its own deadline,
+    so keep `lookup_timeout` well above the time a new connection takes.
 
     Args:
         engine: An `AsyncEngine`. Always injected, never built here: the pool, the TLS
@@ -342,14 +342,12 @@ async def _returned(connection: AsyncConnection) -> None:
 
     A close that fails - cancelled, or raising - is closed once more before its exception leaves.
     On SQLAlchemy 2.0 a close whose `ROLLBACK` raises leaves before the pool's check-in, and the
-    slot would be lost for good (2.1 checks in from a `finally`, and there the second close does
-    nothing); below 2.0.38 so did one whose terminate the backstop cut short. After a cut-short
-    terminate the
-    connection is already force-closed, so the second close only checks it in; after a raising
-    `ROLLBACK` it may try the server again, and the call's deadline and the backstop bound that as
-    they bound everything else here. Its outcome is dropped unread: the first exception is what
-    leaves, to `_select`'s translation or as the cancellation, and nothing of the second goes
-    anywhere.
+    slot would be lost for good; 2.1 checks in from a `finally`, and there the second close does
+    nothing. (Below 2.0.38, which the extra no longer allows, a close whose terminate the backstop
+    cut short lost its slot the same way.) The second close may try the server again, and the
+    call's deadline and the backstop bound that as they bound everything else here. Its outcome
+    is dropped unread: the first exception is what leaves, to `_select`'s translation or as the
+    cancellation, and nothing of the second goes anywhere.
     """
     try:
         await connection.close()

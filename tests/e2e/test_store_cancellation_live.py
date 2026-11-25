@@ -546,8 +546,9 @@ async def test_a_return_cut_short_by_the_backstop_still_gives_the_connection_bac
     silent server for good (`unbounded_close`, asyncpg 0.30.0's behaviour). The backstop's second
     cancellation cuts that close short; below SQLAlchemy 2.0.38 that left the pool slot taken for
     good (measured at 2.0.24), and a backend on the server. Each step waits on an event, then the
-    clock is moved (`LeapingClock`): the ROLLBACK, then the close, then the bound. With the relay still stalled the call must end
-    and nothing may be checked out; then the store answers once the relay forwards again."""
+    clock is moved (`LeapingClock`): the ROLLBACK, then the close, then the bound. With the relay
+    still stalled the call must end and nothing may be checked out; then the store answers once
+    the relay forwards again, and the server holds only the pool's connections."""
     closing = unbounded_close(monkeypatch)
     clock = LeapingClock(monkeypatch)
     store = SqlAlchemySessionStore(engine=relayed_engine)

@@ -62,9 +62,10 @@ any lock it waits on (F20).
 From 2.0.38 `terminate()` also shields asyncpg's own close. Before it, the store's backstop - the
 second cancellation of a call whose clean-up does not end against a server that stopped answering -
 cancels that close, and asyncpg below 0.32 then never drops the transport: the socket stays open
-and the backend stays on the server, idle in a transaction, until the process exits. Measured on
-2.0.24 to 2.0.37 with asyncpg 0.30.0 and 0.31.0; clean from 2.0.38. Nothing in this library can
-make an older release do either.
+and the backend stays on the server, idle in a transaction, until the process exits. Measured
+against a paused Postgres: left behind on 2.0.24, 2.0.30, 2.0.36 and 2.0.37 with asyncpg 0.30.0,
+and on 2.0.24 with 0.31.0; clean on 2.0.38, 2.0.39, 2.0.40 and 2.1.9 with 0.30.0, and on 2.1.9
+with 0.31.0. Nothing in this library can make an older release do either.
 """
 
 SQLALCHEMY = "sqlalchemy[asyncio]"
