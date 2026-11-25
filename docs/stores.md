@@ -119,9 +119,11 @@ What happens to the statement that was running depends on the store:
 - **`SqlAlchemySessionStore`** cancels its database call once and returns to the request at once.
   SQLAlchemy and the driver then cancel the statement on the server and close that connection, and
   a later lookup opens a new one. The connection counts against the engine's pool until that has
-  ended, so the store never holds more connections than the pool allows. While the pool is full,
-  further lookups wait for a connection and are refused at their own deadline. If the server has
-  stopped answering, the store closes the connection without it after 5 seconds.
+  ended, so a database that still answers never has more connections from the store than the pool
+  allows. While the pool is full, further lookups wait for a connection and are refused at their
+  own deadline. If the server has stopped answering altogether, the store stops waiting for it
+  after 5 seconds and frees the connection's place in the pool. When the server answers again, it
+  holds no connection of the store beyond the pool's.
 - **`SyncStoreAdapter`** cannot interrupt a worker thread. The statement runs on, and its thread and
   its connection stay taken until the database answers or the driver gives up. The adapter never
   runs more threads than `max_concurrency`. Further lookups wait without starting a thread, and are
@@ -138,15 +140,18 @@ Set these in the database and the driver, for either store:
 - **For `SyncStoreAdapter`, a read timeout in the driver**, so a thread waiting on a server that
   never answers is given back.
 
-The `[sqlalchemy]` extra needs SQLAlchemy 2.0.24 or newer. Older releases drop a cancelled
-connection without cancelling its statement on the server.
+The `[sqlalchemy]` extra needs SQLAlchemy 2.0.38 or newer. Before 2.0.24, a cancelled connection
+is dropped without cancelling its statement on the server. Before 2.0.38, a server that stops
+answering and then answers again can keep a connection the store has given up.
 
 `tests/e2e/test_store_cancellation_live.py` proves the async store's part against a live Postgres
 on `asyncpg`. With the `session` table locked, no statement of a refused lookup is left on the
 server. Against a server that stops answering, during a statement or while a connection is being
-returned to the pool, the abandoned calls end and their connections come back, by the store's own
-5-second limit where the driver would wait for good. The locked-table case was also measured by
-hand on `psycopg`. Other drivers are not measured; the statement timeout above covers them.
+returned to the pool, the abandoned calls end and their places in the pool come back, by the
+store's own 5-second limit where the driver would wait for good. Once the server answers again,
+it is asked directly, and it holds only the pool's connections. The locked-table case was also
+measured by hand on `psycopg`. Other drivers are not measured; the statement timeout above covers
+them.
 
 ## Integer and uuid ids
 

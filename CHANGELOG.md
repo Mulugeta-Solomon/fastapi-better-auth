@@ -40,9 +40,9 @@ Merged on `main` since 0.6.0, not yet on PyPI.
   the limit, or `None` for no limit. Keep it well above the time a new database connection takes,
   and set a statement timeout on the server that is shorter than it. See
   [When the database does not answer](docs/stores.md#when-the-database-does-not-answer).
-- **The `[sqlalchemy]` extra needs SQLAlchemy 2.0.24 or newer** (was 2.0). Older releases cannot
-  cancel a statement on the server when its lookup is cancelled. A project that pins an older
-  SQLAlchemy no longer resolves.
+- **The `[sqlalchemy]` extra needs SQLAlchemy 2.0.38 or newer** (was 2.0). Older releases cannot
+  cancel a statement on the server when its lookup is cancelled, or can leave its connection open
+  on a server that stopped answering. A project that pins an older SQLAlchemy no longer resolves.
 
 ### Added
 
