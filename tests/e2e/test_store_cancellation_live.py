@@ -27,6 +27,7 @@ Asyncio only: `asyncpg` drives the event loop directly, as in every other store-
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 import secrets
 import time
@@ -50,7 +51,7 @@ try:
     from fastapi_better_auth import CookieVerifier, SqlAlchemySessionStore
     from fastapi_better_auth._internal.stores.task_handoff import WIND_DOWN_SECONDS, TaskHandoff
     from tests.cookies import COOKIE, http, run, sign
-    from tests.deadlines import GUARD, every_call_ended, verifier
+    from tests.deadlines import GUARD, LONG, every_call_ended, verifier
 except ImportError:
     pytest.skip(
         "this build of fastapi-better-auth-bridge publishes no session stores",
@@ -77,6 +78,10 @@ SETTLE_BACKSTOP = 10.0
 """How long a wave's backends may take to go away before the wave counts as leaked. Healthy
 clean-up takes tens of milliseconds; this only ever runs out on a leak."""
 POLL = 0.05
+# Lookups outside the waves - before them, and to prove recovery - run under `LONG`. Every
+# connection a wave touched was closed, so recovery opens new ones inside the lookup's deadline,
+# and on a starved machine a 2 s deadline cancelled each attempt before it connected (the
+# constraint the store's docstring warns operators about). Recovery is the property, not speed.
 
 FORGED = f"{COOKIE}={sign('a-token-that-names-no-session')}"
 
@@ -202,7 +207,8 @@ async def test_lookups_abandoned_at_their_deadline_leave_no_backend_behind(
     store = SqlAlchemySessionStore(engine=engine, schema=schema)
     await store.connect()
     built = verifier(store, lookup_timeout=LOOKUP_TIMEOUT)
-    assert await one_lookup(built) == "SessionRevoked"
+    steady = verifier(store, lookup_timeout=LONG)
+    assert await one_lookup(steady) == "SessionRevoked"
     waves: list[Backends] = []
 
     async with blocker.connect() as lock:
@@ -213,14 +219,15 @@ async def test_lookups_abandoned_at_their_deadline_leave_no_backend_behind(
             waves.append(await settled(observer, application_name))
         await lock.rollback()
     started = time.monotonic()
-    answer = await one_lookup(built)
+    answer = await one_lookup(steady)
     recovered_in = time.monotonic() - started
 
     assert [wave.waiting for wave in waves] == [0] * WAVES, f"backends left behind: {waves}"
     assert max(wave.connected for wave in waves) <= CEILING, f"connections leaked: {waves}"
     assert answer == "SessionRevoked", "the store did not answer once the lock was released"
-    assert recovered_in < LOOKUP_TIMEOUT
+    assert recovered_in < SETTLE_BACKSTOP
     await every_call_ended(store)
+    gc.collect()  # a driver future dropped unread is reported when it is collected
     assert loop_reports == []
 
 
@@ -277,7 +284,8 @@ async def test_lookups_abandoned_against_a_stalled_server_end_within_the_bound(
     store._handoff = TaskHandoff(wind_down=wind_down)  # pyright: ignore[reportPrivateUsage]
     await store.connect()
     built = verifier(store, lookup_timeout=STALL_LOOKUP_TIMEOUT)
-    assert await one_lookup(built) == "SessionRevoked"
+    steady = verifier(store, lookup_timeout=LONG)
+    assert await one_lookup(steady) == "SessionRevoked"
     held: list[int] = []
 
     relay.stall()
@@ -294,11 +302,12 @@ async def test_lookups_abandoned_against_a_stalled_server_end_within_the_bound(
         wound_down_in = time.monotonic() - started
     finally:
         relay.resume()
-    answers = [await one_lookup(built) for _ in range(RECOVERY_LOOKUPS)]
+    answers = [await one_lookup(steady) for _ in range(RECOVERY_LOOKUPS)]
     await every_call_ended(store)
 
     assert max(held) <= CEILING, f"connections checked out per wave: {held}"
     assert wound_down_in <= wind_down + GUARD
     assert checked_out(relayed_engine) == 0
     assert answers == ["SessionRevoked"] * RECOVERY_LOOKUPS, answers
+    gc.collect()  # a driver future dropped unread is reported when it is collected
     assert loop_reports == []
