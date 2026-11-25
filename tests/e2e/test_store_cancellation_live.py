@@ -37,7 +37,6 @@ from typing import Any, NamedTuple
 import anyio
 import pytest
 from sqlalchemy import QueuePool, event, text
-from sqlalchemy import __version__ as sqlalchemy_release
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -66,8 +65,6 @@ if "lookup_timeout" not in inspect.signature(CookieVerifier.__init__).parameters
     )
 
 pytestmark = pytest.mark.e2e
-
-sqlalchemy_version = tuple(int(part) for part in sqlalchemy_release.split(".")[:2])
 
 POOL_SIZE = 2
 MAX_OVERFLOW = 1
@@ -403,12 +400,6 @@ async def stalled_waves(relay: StallingRelay, built: CookieVerifier) -> None:
         assert outcomes == ["deadline"] * PER_WAVE
 
 
-FORCE_CLOSED_HANDED_OUT = 1 if sqlalchemy_version < (2, 1) else 0
-"""Refusals a recovery may open with. SQLAlchemy 2.0's pool can hand out a connection the stall
-force-closed, once, and that lookup is refused (fail-closed) before service resumes - measured at
-the floor, 2.0.24 with asyncpg 0.30.0. 2.1's pool does not, and there none is allowed."""
-
-
 async def recovered(
     store: SqlAlchemySessionStore, engine: AsyncEngine, observer: AsyncEngine, name: str
 ) -> None:
@@ -417,9 +408,9 @@ async def recovered(
     steady = verifier(store, lookup_timeout=LONG)
     answers = [await one_lookup(steady) for _ in range(RECOVERY_LOOKUPS)]
     await every_call_ended(store)
-    opening, rest = answers[:FORCE_CLOSED_HANDED_OUT], answers[FORCE_CLOSED_HANDED_OUT:]
-    assert all(answer in ("store-error", "SessionRevoked") for answer in opening), answers
-    assert rest == ["SessionRevoked"] * len(rest), answers
+    # Strict on every supported release: from SQLAlchemy 2.0.36 no lookup is refused after a
+    # stall (below it the pool handed out a force-closed connection once), and the floor is 2.0.38.
+    assert answers == ["SessionRevoked"] * RECOVERY_LOOKUPS, answers
     assert checked_out(engine) == 0
     leftover = await left_on_the_server(observer, name, engine)
     assert not leftover, f"a backend of the store was left on the server: {leftover}"
@@ -553,9 +544,9 @@ async def test_a_return_cut_short_by_the_backstop_still_gives_the_connection_bac
     """The floor's shape on the lockfile's driver: the ROLLBACK goes unanswered, the caller's
     cancellation lands in it, and SQLAlchemy's graceful close of the connection then waits on the
     silent server for good (`unbounded_close`, asyncpg 0.30.0's behaviour). The backstop's second
-    cancellation cuts that close short; on SQLAlchemy 2.0.24 that left the pool slot taken for good
-    (measured by the lead). Each step waits on an event, then the clock is moved (`LeapingClock`):
-    the ROLLBACK, then the close, then the bound. With the relay still stalled the call must end
+    cancellation cuts that close short; below SQLAlchemy 2.0.38 that left the pool slot taken for
+    good (measured at 2.0.24), and a backend on the server. Each step waits on an event, then the
+    clock is moved (`LeapingClock`): the ROLLBACK, then the close, then the bound. With the relay still stalled the call must end
     and nothing may be checked out; then the store answers once the relay forwards again."""
     closing = unbounded_close(monkeypatch)
     clock = LeapingClock(monkeypatch)
