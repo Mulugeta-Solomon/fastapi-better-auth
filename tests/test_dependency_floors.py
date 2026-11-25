@@ -50,6 +50,52 @@ def test_the_pyjwt_floor_excludes_the_releases_with_known_holes() -> None:
     )
 
 
+SQLALCHEMY_FLOOR = (2, 0, 38)
+"""The first SQLAlchemy release whose cancelled asyncio connection always leaves the server.
+
+Two reasons, from two releases. `SqlAlchemySessionStore` cancels an abandoned lookup's database
+call once, so that SQLAlchemy can close the connection in order - which is where asyncpg sends the
+server its cancel request. Before 2.0.24 `terminate()` aborts the socket at once, the cancel
+request never goes out, and Postgres keeps the abandoned statement running, holding a backend and
+any lock it waits on (F20).
+
+From 2.0.38 `terminate()` also shields asyncpg's own close. Before it, the store's backstop - the
+second cancellation of a call whose clean-up does not end against a server that stopped answering -
+cancels that close, and asyncpg below 0.32 then never drops the transport: the socket stays open
+and the backend stays on the server, idle in a transaction, until the process exits. Measured
+against a paused Postgres: left behind on 2.0.24, 2.0.30, 2.0.36 and 2.0.37 with asyncpg 0.30.0,
+and on 2.0.24 with 0.31.0; clean on 2.0.38, 2.0.39, 2.0.40 and 2.1.9 with 0.30.0, and on 2.1.9
+with 0.31.0. Nothing in this library can make an older release do either.
+"""
+
+SQLALCHEMY = "sqlalchemy[asyncio]"
+SQLALCHEMY_DECLARATIONS = 2
+"""The `[sqlalchemy]` extra a consumer installs, and the dev group every lane of ours runs."""
+
+
+def _declared_floors(pyproject: str, distribution: str) -> list[tuple[int, ...]]:
+    """Every `>=` lower bound declared for `distribution`, in the order they appear."""
+    pattern = rf'"{re.escape(distribution)}>=(?P<floor>[0-9][0-9.]*)[^"]*"'
+    return [
+        tuple(int(part) for part in found.group("floor").split("."))
+        for found in re.finditer(pattern, pyproject)
+    ]
+
+
+def test_the_sqlalchemy_floor_lets_an_abandoned_lookup_leave_nothing_on_the_server() -> None:
+    """Both declarations: the extra is what a consumer resolves, and the dev group is what the
+    declared-floors lane installs to prove the suite at that floor."""
+    declared = _declared_floors(PYPROJECT.read_text(encoding="utf-8"), SQLALCHEMY)
+
+    assert len(declared) == SQLALCHEMY_DECLARATIONS, f"{SQLALCHEMY} is declared {declared}"
+    for floor in declared:
+        assert floor >= SQLALCHEMY_FLOOR, (
+            f"{SQLALCHEMY} is declared >={'.'.join(map(str, floor))}, which permits a release"
+            " that leaves a cancelled connection's statement or backend on the server"
+            f" (see SQLALCHEMY_FLOOR); the floor is {'.'.join(map(str, SQLALCHEMY_FLOOR))}"
+        )
+
+
 @pytest.mark.parametrize(
     ("line", "expected"),
     [
@@ -63,6 +109,12 @@ def test_the_pyjwt_floor_excludes_the_releases_with_known_holes() -> None:
 def test_the_floor_reader_is_a_live_instrument(line: str, expected: tuple[int, ...]) -> None:
     """A guard that reads nothing passes by vacuum; this is the reader firing on planted text."""
     assert _declared_floor(line, "pyjwt[crypto]") == expected
+
+
+def test_the_floors_reader_sees_every_declaration() -> None:
+    """A reader that stopped at the first match would let the second declaration drift alone."""
+    text = f'"{SQLALCHEMY}>=2.0.24",\n    "{SQLALCHEMY}>=2.0",\n    "sqlalchemy>=1.4",'
+    assert _declared_floors(text, SQLALCHEMY) == [(2, 0, 24), (2, 0)]
 
 
 def test_a_dependency_with_no_declared_floor_fails_loudly() -> None:

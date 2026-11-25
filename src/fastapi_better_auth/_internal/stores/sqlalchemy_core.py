@@ -16,36 +16,50 @@ Identifiers are camelCase and one table is called `user`, which is a reserved wo
 SQLAlchemy quotes both for us because it quotes anything that is not a plain lowercase
 non-reserved name - the statements are asserted against, so the day that changes is a red test
 and not a syntax error in production.
+
+The one *type* read from the live database is that of the id columns (`session.id`,
+`session.userId`, `session.impersonatedBy`, `user.id`), from the same reflection call: a
+deployment whose ids the database generates has integer or uuid columns there, and both reading
+an id and binding one to look a user up depend on which (`sql_ids` carries both directions).
+Every other type stays declared, and an id column of any type but integer or uuid is read as text,
+exactly as before.
 """
 
 from __future__ import annotations
 
 import hmac
+import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from sqlalchemy import (
+    BindParameter,
     Boolean,
     Column,
     Connection,
     DateTime,
     Engine,
+    Integer,
     MetaData,
     Select,
     Table,
     Text,
+    Uuid,
     bindparam,
     inspect,
     select,
 )
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.types import TypeEngine
 
 from ..errors import AuthServiceUnavailable, ConfigurationError
 from ..reasons import fingerprint
 from .diagnostics import drifted, unusable
 from .records import StoredSession, StoredUser
+from .sql_ids import INT64_RANGE, IdKind, IntegerRange, bind_id, read_id
+from .sql_widths import integer_range
 from .upstream import as_db_flag, as_moment, as_text
 
 # Re-exported so `sqlalchemy_store` can name the exception class in an `except` without importing
@@ -65,6 +79,10 @@ USER_OPTIONAL: tuple[str, ...] = (
     "updatedAt",
 )
 USER_ADMIN: tuple[str, ...] = ("role", "banned", "banReason", "banExpires")
+
+SESSION_IDS: tuple[str, ...] = ("id", "userId", "impersonatedBy")
+USER_IDS: tuple[str, ...] = ("id",)
+"""The columns holding an id - a row's own or a reference to a user's - whose type is read."""
 
 SESSION_COLUMNS = SESSION_REQUIRED + SESSION_OPTIONAL + SESSION_ADMIN
 USER_COLUMNS = USER_REQUIRED + USER_OPTIONAL + USER_ADMIN
@@ -135,6 +153,42 @@ SYNC_ADVICE = (
 Columns = Mapping[str, "tuple[str, ...] | None"]
 """Each table's columns once discovered, in the database's own order; `None` = no such table."""
 
+Types = Mapping[str, Mapping[str, "TypeEngine[Any]"]]
+"""Each table's reflected column types, by column name; a table or column absent = unknown."""
+
+
+@dataclass(frozen=True)
+class Discovered:
+    """What one reflection pass read: the columns, their types, and the dialect that read them.
+
+    The dialect is part of the answer because a type class does not fix a width: SQLite's
+    `INTEGER` holds 64 bits and Postgres's 32 (`sql_widths`).
+    """
+
+    columns: Columns
+    types: Types = field(default_factory=dict[str, Mapping[str, "TypeEngine[Any]"]])
+    dialect: str | None = None
+
+
+@dataclass(frozen=True)
+class IdColumn:
+    """An id column's kind, and the type a lookup binds against it with.
+
+    The bind type is the *reflected* one, never a family stand-in: Postgres drivers that cast
+    their parameters (asyncpg renders `$1::BIGINT`) would otherwise cast a `bigint` id to
+    `integer` and fail on every id past 2**31.
+
+    `integer_range` is what an integer column holds on its dialect; a lookup outside it is a miss
+    before any statement, because bound it is a driver error rather than an empty result.
+    """
+
+    kind: IdKind = IdKind.TEXT
+    bind_type: TypeEngine[Any] | None = None
+    integer_range: IntegerRange = INT64_RANGE
+
+
+TEXT_ID = IdColumn()
+
 
 @dataclass(frozen=True)
 class Plan:
@@ -144,6 +198,11 @@ class Plan:
     user_columns: tuple[str, ...]
     session_statement: Select[Any]
     user_statement: Select[Any]
+    session_ids: Mapping[str, IdColumn] = field(default_factory=dict[str, IdColumn])
+    user_ids: Mapping[str, IdColumn] = field(default_factory=dict[str, IdColumn])
+
+    def user_id(self) -> IdColumn:
+        return self.user_ids.get("id", TEXT_ID)
 
 
 def validated_name(parameter: str, value: object) -> str:
@@ -196,14 +255,51 @@ def validated_columns(parameter: str, value: object) -> tuple[str, ...] | None:
     return tuple(names)
 
 
-def _column(name: str) -> Column[Any]:
+def kind_of(column_type: TypeEngine[Any] | None) -> IdKind:
+    """An id column's kind from its reflected type: integer and uuid by family, else text.
+
+    Positive classification only. Every type that is neither - `TEXT`, `VARCHAR`, `CHAR`, the
+    `NUMERIC` SQLite answers for a column declared `UUID`, a type reflection could not name - is
+    read as text, which is what this store did for every id column before it read a type at all.
+    """
+    if isinstance(column_type, Integer):
+        return IdKind.INTEGER
+    if isinstance(column_type, Uuid):
+        return IdKind.UUID
+    return IdKind.TEXT
+
+
+def _id_columns(
+    types: Mapping[str, TypeEngine[Any]], names: tuple[str, ...], dialect: str | None
+) -> dict[str, IdColumn]:
+    found: dict[str, IdColumn] = {}
+    for name in names:
+        reflected_type = types.get(name)
+        kind = kind_of(reflected_type)
+        if kind is IdKind.TEXT:
+            found[name] = TEXT_ID
+        elif kind is IdKind.INTEGER:
+            found[name] = IdColumn(kind, reflected_type, integer_range(reflected_type, dialect))
+        else:
+            found[name] = IdColumn(kind, reflected_type)
+    return found
+
+
+def _column(name: str, id_column: IdColumn = TEXT_ID) -> Column[Any]:
     """Typed where this library knows the type, and deliberately untyped where it does not.
 
     An unrecognized name is an `additionalFields` entry, or a column somebody's own migration
     added. It gets SQLAlchemy's `NullType`, which applies no result processing at all, so
     whatever the driver hands back reaches the payload unchanged - the only honest treatment of
     a column whose type is the deployment's business rather than ours.
+
+    An integer or uuid id column is untyped for the same reason `banned` is: `sql_ids.read_id`
+    validates the raw driver value, and a typed result processor would run first - SQLAlchemy's
+    `Uuid` raises `ValueError` on malformed stored text, outside the error handling every lookup
+    has, where `read_id` answers a miss.
     """
+    if id_column.kind is not IdKind.TEXT:
+        return Column(name)
     if name in MOMENTS:
         return Column(name, DateTime(timezone=True))
     if name in TYPED_BOOL:
@@ -219,6 +315,8 @@ def plan_for(
     schema: str | None,
     present: Columns,
     *,
+    types: Types | None = None,
+    dialect: str | None = None,
     session_allowed: tuple[str, ...] | None = None,
     user_allowed: tuple[str, ...] | None = None,
 ) -> Plan:
@@ -239,6 +337,11 @@ def plan_for(
     session is a difference nobody would see until it mattered.
 
     An allow-list narrows exactly that tail and nothing else; `_extras` carries that rule.
+
+    `types` is what reflection said about each column's type, read for the id columns alone;
+    without it (or for a column it does not name) an id is text, the default Better Auth id.
+    `dialect` (the reflecting dialect's name) fixes how wide an integer id column is; without it
+    the width is the signed 64-bit bound.
     """
     session_columns = _accepted(
         session_table,
@@ -251,14 +354,25 @@ def plan_for(
     user_columns = _accepted(
         user_table, present, USER_REQUIRED, USER_OPTIONAL, USER_ADMIN, allowed=user_allowed
     )
+    reflected_types = types or {}
+    session_ids = _id_columns(reflected_types.get(session_table, {}), SESSION_IDS, dialect)
+    user_ids = _id_columns(reflected_types.get(user_table, {}), USER_IDS, dialect)
     metadata = MetaData(schema=schema)
-    session = Table(session_table, metadata, *(_column(name) for name in session_columns))
-    user = Table(user_table, metadata, *(_column(name) for name in user_columns))
+    session = Table(
+        session_table,
+        metadata,
+        *(_column(name, session_ids.get(name, TEXT_ID)) for name in session_columns),
+    )
+    user = Table(
+        user_table, metadata, *(_column(name, user_ids.get(name, TEXT_ID)) for name in user_columns)
+    )
     return Plan(
         session_columns=session_columns,
         user_columns=user_columns,
         session_statement=_session_statement(session, user, session_columns, user_columns),
-        user_statement=_user_statement(user, user_columns),
+        user_statement=_user_statement(user, user_columns, user_ids["id"]),
+        session_ids=session_ids,
+        user_ids=user_ids,
     )
 
 
@@ -325,9 +439,31 @@ def _session_statement(
     )
 
 
-def _user_statement(user: Table, user_columns: tuple[str, ...]) -> Select[Any]:
+def _user_statement(user: Table, user_columns: tuple[str, ...], id_column: IdColumn) -> Select[Any]:
+    """The user by id, the parameter bound with the id column's own reflected type.
+
+    A string compared to an integer column is an error on Postgres and an index-defeating cast
+    elsewhere, so an integer or uuid column is compared to a parameter of its type. A text column
+    keeps the untyped parameter it always had, which takes the declared `Text` from the column.
+    """
     labelled = [user.c[name].label(f"{USER_PREFIX}{name}") for name in user_columns]
-    return select(*labelled).where(user.c["id"] == bindparam(USER_ID_PARAM)).limit(ROW_LIMIT)
+    parameter: BindParameter[Any] = (
+        bindparam(USER_ID_PARAM)
+        if id_column.bind_type is None
+        else bindparam(USER_ID_PARAM, type_=id_column.bind_type)
+    )
+    return select(*labelled).where(user.c["id"] == parameter).limit(ROW_LIMIT)
+
+
+def bound_user_id(plan: Plan, user_id: str) -> str | int | uuid.UUID | None:
+    """The value `fetch_user_by_id` binds, or `None` when no row can hold it.
+
+    `None` is a silent miss with no query, the same answer a blank id or an id nobody has gets:
+    the text came from the caller, not from a stored row, so there is nothing to tell an
+    operator that a lookup by an unknown id would not equally have to tell them.
+    """
+    id_column = plan.user_id()
+    return bind_id(id_column.kind, user_id, id_column.integer_range)
 
 
 def session_from(rows: Sequence[Mapping[str, Any]], plan: Plan, token: str) -> StoredSession | None:
@@ -335,7 +471,7 @@ def session_from(rows: Sequence[Mapping[str, Any]], plan: Plan, token: str) -> S
     row = _only(rows, "session", token)
     if row is None:
         return None
-    payload = _payload(row, plan.session_columns, SESSION_PREFIX)
+    payload = _with_ids(_payload(row, plan.session_columns, SESSION_PREFIX), plan.session_ids)
     user = user_from(rows, plan, token)
     session_id = as_text(payload.get("id"))
     expires_at = as_moment(payload.get("expiresAt"))
@@ -378,10 +514,10 @@ def user_from(
     row = _only(rows, "user", subject)
     if row is None:
         return None
-    payload = _payload(row, plan.user_columns, USER_PREFIX)
+    payload = _with_ids(_payload(row, plan.user_columns, USER_PREFIX), plan.user_ids)
     identifier = as_text(payload.get("id"))
     if identifier is None:
-        unusable("user", "its id is null or blank", subject)
+        unusable("user", "its id is null or blank, or not an id its column's type holds", subject)
         return None
     # `check_identity` re-checks the returned id against `subject` (constant-time): a collation
     # -folding `WHERE id = :subject` can return a different row. The session-join path leaves it
@@ -428,6 +564,24 @@ def _payload(row: Mapping[str, Any], columns: tuple[str, ...], prefix: str) -> d
     return built
 
 
+def _with_ids(payload: Mapping[str, Any], id_columns: Mapping[str, IdColumn]) -> dict[str, Any]:
+    """The payload with each typed id column's value replaced by the text Better Auth would write.
+
+    Done once, where the payload is built, so the record's promoted fields, `Session.raw` and the
+    payload `parse_user` reads all carry the same string - never an `int` here and a `"7"` there.
+    A text column is left exactly as it arrived (the shared `as_text` reads it below, as before).
+    A value its column's type does not promise becomes `None`: the readers below then treat it as
+    absent, which for `id` and `userId` is a miss and for `impersonatedBy` is what an unreadable
+    one has always been - and the raw value never reaches the payload as if it had been read.
+    """
+    typed = {
+        name: read_id(id_column.kind, payload[name])
+        for name, id_column in id_columns.items()
+        if id_column.kind is not IdKind.TEXT and name in payload
+    }
+    return {**payload, **typed}
+
+
 def _why(
     session_id: str | None,
     expires_at: object,
@@ -449,24 +603,25 @@ def _why(
     return f"{', '.join(absent)} is null, blank or unreadable"
 
 
-def reflected(
-    connection: Connection, names: Sequence[str], schema: str | None
-) -> dict[str, tuple[str, ...] | None]:
-    """The column names each table actually has, in the database's own order.
+def reflected(connection: Connection, names: Sequence[str], schema: str | None) -> Discovered:
+    """The column names each table actually has, in the database's own order, and their types.
 
     Ordered rather than a set, because the order is what puts a deployment's own columns after
     the ones this library knows about; `None` is how an absent table is told apart from a table
-    that happens to be missing everything.
+    that happens to be missing everything. The types come from the same `get_columns` call, and
+    `plan_for` reads them for the id columns alone.
     """
     inspector = inspect(connection)
     found: dict[str, tuple[str, ...] | None] = {}
+    types: dict[str, Mapping[str, TypeEngine[Any]]] = {}
     for name in names:
         if not inspector.has_table(name, schema=schema):
             found[name] = None
             continue
         columns = inspector.get_columns(name, schema=schema)
         found[name] = tuple(str(column["name"]) for column in columns)
-    return found
+        types[name] = {str(column["name"]): column["type"] for column in columns}
+    return Discovered(columns=found, types=types, dialect=connection.dialect.name)
 
 
 def rows(result: Any) -> list[Mapping[str, Any]]:
@@ -493,8 +648,20 @@ def lookup_unavailable(params: Mapping[str, Any]) -> AuthServiceUnavailable:
 
 
 def lookup_marker(params: Mapping[str, Any]) -> str:
-    """The fingerprint of what a lookup was asked about - the token or the user id."""
-    return fingerprint(next((value for value in params.values() if isinstance(value, str)), ""))
+    """The fingerprint of what a lookup was asked about - the token or the user id.
+
+    A user id bound to an integer or uuid column is an `int` or a `uuid.UUID` by now; its `str()`
+    is the canonical text it was bound from, so the marker matches the one the caller computed.
+    """
+    return fingerprint(next((_subject(value) for value in params.values() if _subject(value)), ""))
+
+
+def _subject(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, uuid.UUID) or (isinstance(value, int) and not isinstance(value, bool)):
+        return str(value)
+    return ""
 
 
 def validated_async_engine(engine: object) -> AsyncEngine:

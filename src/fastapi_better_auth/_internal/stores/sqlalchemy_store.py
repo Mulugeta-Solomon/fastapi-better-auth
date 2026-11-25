@@ -2,23 +2,27 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import anyio
-from anyio.to_thread import run_sync
 
 from ..errors import ConfigurationError
+from ..newest_first import NewestFirstLock
 from .outage import OutageLatch, report_once
 from .records import StoredSession, StoredUser
+from .task_handoff import TaskHandoff
+from .thread_handoff import run_in_worker
 
 if TYPE_CHECKING:
     from sqlalchemy import Connection, Engine, Select
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
     from ..errors import AuthServiceUnavailable
-    from .sqlalchemy_core import Columns, Plan
+    from .sqlalchemy_core import Discovered, Plan
 
 Row = Mapping[str, Any]
 Rows = Sequence[Row]
@@ -77,7 +81,7 @@ class _CoreStore(ABC):
             self._sql.validated_columns("session_columns", session_columns),
             self._sql.validated_columns("user_columns", user_columns),
         )
-        self._lock = anyio.Lock()
+        self._turn = NewestFirstLock()
         self._plan: Plan | None = None
         self._outage = OutageLatch()
 
@@ -107,11 +111,19 @@ class _CoreStore(ABC):
         return self._sql.session_from(found, plan, token)
 
     async def fetch_user_by_id(self, user_id: str) -> StoredUser | None:
-        """The user row with this id. See `SessionStore.fetch_user_by_id`."""
+        """The user row with this id. See `SessionStore.fetch_user_by_id`.
+
+        Where the database generates ids, `user_id` is the text Better Auth writes for one -
+        `"7"` for a serial id, lowercase hyphenated for a uuid - and is bound as the column's own
+        type. Any other spelling of it (`"07"`, upper-case hex) is a miss, never a query.
+        """
         if not user_id.strip():
             return None
         plan = await self._ready()
-        found = await self._select(plan.user_statement, {self._sql.USER_ID_PARAM: user_id})
+        bound = self._sql.bound_user_id(plan, user_id)
+        if bound is None:
+            return None
+        found = await self._select(plan.user_statement, {self._sql.USER_ID_PARAM: bound})
         self._outage.rearm()
         return self._sql.user_from(found, plan, user_id, check_identity=True)
 
@@ -121,25 +133,35 @@ class _CoreStore(ABC):
         The statement depends on which columns exist - the admin plugin's are surfaced only
         where they were created - so this is not a cache in front of a fixed query, it *is* the
         query. The lock is what stops a burst of first requests each inspecting the schema.
+
+        Without `connect()`, the read runs inside a request, under its `lookup_timeout`, and a
+        read whose caller leaves is abandoned and started again by the next holder. So the turn
+        goes to the newest waiter, which has the most of its deadline left, not the oldest, which
+        has only the gap between two arrivals: first-in-first-out, a read that overran once is
+        cut short again and again for as long as requests arrive faster than one read takes
+        (`NewestFirstLock`, F22).
         """
         plan = self._plan
         if plan is not None:
             return plan
         session, user = self._names
         session_allowed, user_allowed = self._allowed
-        async with self._lock:
+        async with self._turn:
             if self._plan is None:
+                discovered = await self._columns()
                 self._plan = self._sql.plan_for(
                     session,
                     user,
                     self._schema,
-                    await self._columns(),
+                    discovered.columns,
+                    types=discovered.types,
+                    dialect=discovered.dialect,
                     session_allowed=session_allowed,
                     user_allowed=user_allowed,
                 )
             return self._plan
 
-    def _reflected(self, connection: Connection) -> dict[str, tuple[str, ...] | None]:
+    def _reflected(self, connection: Connection) -> Discovered:
         return self._sql.reflected(connection, self._names, self._schema)
 
     def _unavailable(
@@ -150,7 +172,7 @@ class _CoreStore(ABC):
         return self._sql.lookup_unavailable(params)
 
     @abstractmethod
-    async def _columns(self) -> Columns:
+    async def _columns(self) -> Discovered:
         """The columns each table has, read however this flavour reaches the database."""
 
     @abstractmethod
@@ -199,6 +221,15 @@ class SqlAlchemySessionStore(_CoreStore):
     better-auth column that is missing is a loud warning naming it; a missing admin column is
     silence, because that plugin is optional upstream.
 
+    **Ids the database generates.** Discovery also reads the type of the id columns
+    (`session.id`, `session.userId`, `session.impersonatedBy`, `user.id`). Where a deployment lets
+    the database generate ids, an integer column's value is read as its decimal text and a uuid
+    column's as lowercase hyphenated text - what Better Auth puts in its own JSON - so records,
+    `Session.id` and `Session.raw` carry strings either way; `fetch_user_by_id` takes that same
+    text and binds it as the column's type. A column of any other type is read as text, as
+    before. Tested on SQLite (integer ids; uuids as text), where reflection never reports a uuid
+    type: a SQLAlchemy `Uuid` column there reflects as `CHAR(32)` and is read as its stored text.
+
     **Timestamps.** Postgres `timestamptz` answers an aware `datetime` and is the tested path.
     SQLite and MySQL answer a naive one, because those columns carry no offset - it is read as
     UTC, which is what Better Auth wrote. A column holding local time would be misread by
@@ -218,6 +249,23 @@ class SqlAlchemySessionStore(_CoreStore):
     table does not have is a `ConfigurationError` at discovery, beside the missing-column one.
     `RedisSessionStore` has no equivalent: it reads one stored JSON document, and a document has
     no SELECT to narrow.
+
+    **A lookup that is cancelled or passes its deadline** (a client gone, `CookieVerifier`'s
+    `lookup_timeout`) returns to its caller at once, and its database call is cancelled exactly
+    once. The call runs on an asyncio task of its own for that reason: a cancellation delivered
+    again and again, as anyio delivers it, would cut short the close SQLAlchemy runs on a
+    cancelled statement, and with it the cancel request the driver sends the server - leaving the
+    statement running there, holding a backend and any lock it waits on. Cancelled once, the
+    driver asks the server to stop the statement and the connection is closed in order. Until
+    that has happened the connection stays checked out, so the engine's pool bounds the calls
+    winding down, and lookups that find it full wait for a connection and are refused at their
+    own deadline. A call that has not wound down within 5 seconds (a server that stopped
+    answering) is cancelled again every 5 seconds until it ends, which gives its connection's
+    place back to the pool without waiting for the server. A server-side statement timeout
+    shorter than `lookup_timeout` (Postgres `statement_timeout`, MySQL `max_execution_time`) is
+    still the right setting: it ends a slow statement on the server whatever becomes of its
+    client. And a lookup that finds no idle connection opens a new one inside its own deadline,
+    so keep `lookup_timeout` well above the time a new connection takes.
 
     Args:
         engine: An `AsyncEngine`. Always injected, never built here: the pool, the TLS
@@ -259,23 +307,68 @@ class SqlAlchemySessionStore(_CoreStore):
             user_columns=user_columns,
         )
         self._engine = self._sql.validated_async_engine(engine)
+        self._handoff = TaskHandoff()
 
-    async def _columns(self) -> Columns:
-        async with self._engine.connect() as connection:
-            return await self._inspected(connection)
+    async def _columns(self) -> Discovered:
+        return await self._handoff.run(self._inspected)
 
-    async def _inspected(self, connection: AsyncConnection) -> Columns:
-        return await connection.run_sync(self._reflected)
+    async def _inspected(self) -> Discovered:
+        connection = await self._engine.connect()
+        try:
+            return await connection.run_sync(self._reflected)
+        finally:
+            await _returned(connection)
 
     async def _select(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
+        # Only the database call is handed off. Its error is translated here, in the caller's
+        # task, so an abandoned call that fails late has nobody to report to and trips no latch.
         try:
-            async with self._engine.connect() as connection:
-                return self._sql.rows(await connection.execute(statement, dict(params)))
+            return await self._handoff.run(partial(self._queried, statement, dict(params)))
         except self._sql.SQLAlchemyError as exc:
             failure = self._unavailable(exc, params)
         # Raised outside the `except` so no `__context__` links back to the DBAPIError whose
         # str() embeds the token; `from None` clears `__cause__` as well (A1).
         raise failure from None
+
+    async def _queried(self, statement: Select[Any], params: dict[str, Any]) -> Rows:
+        connection = await self._engine.connect()
+        try:
+            return self._sql.rows(await connection.execute(statement, params))
+        finally:
+            await _returned(connection)
+
+
+async def _returned(connection: AsyncConnection) -> None:
+    """Close `connection` here, on the handed-off task, so a cancellation of the call reaches it.
+
+    Closing sends a `ROLLBACK` on the way back to the pool, and a server can stop answering right
+    there. `async with engine.connect()` would run that close where no cancellation reaches it -
+    SQLAlchemy 2.1 swallows them until the close is done, 2.0 orphans it - so the call's one
+    cancellation and every backstop one would pass it by while it held its connection for as long
+    as the server stayed silent. Awaited here, the cancellation lands in the `ROLLBACK` and
+    SQLAlchemy invalidates the connection.
+
+    A close that fails - cancelled, or raising - is closed once more before its exception leaves.
+    On SQLAlchemy 2.0 a close whose `ROLLBACK` raises leaves before the pool's check-in, and the
+    slot would be lost for good; 2.1 checks in from a `finally`, and there the second close does
+    nothing. (Below 2.0.38, which the extra no longer allows, a close whose terminate the backstop
+    cut short lost its slot the same way.) The second close may try the server again, and the
+    call's deadline and the backstop bound that as they bound everything else here. Its outcome
+    is dropped unread: the first exception is what leaves, to `_select`'s translation or as the
+    cancellation, and nothing of the second goes anywhere.
+    """
+    try:
+        await connection.close()
+    except (Exception, asyncio.CancelledError):
+        await _closed_again(connection)
+        raise
+
+
+async def _closed_again(connection: AsyncConnection) -> None:
+    try:
+        await connection.close()
+    except (Exception, asyncio.CancelledError):  # noqa: BLE001 - dropped; see `_returned`
+        return
 
 
 class SyncStoreAdapter(_CoreStore):
@@ -306,9 +399,19 @@ class SyncStoreAdapter(_CoreStore):
     bound, a flood of concurrent (or cancelled) lookups would exhaust the connection pool and error
     a legitimate request with a checkout timeout. The adapter holds its own `anyio.CapacityLimiter`,
     sized to the engine's pool where it is introspectable (a `QueuePool`'s size plus overflow) so
-    the *limiter* is where excess lookups queue - cheap and cancellable - rather than the pool. A
-    cancelled lookup returns to the caller promptly, but the DBAPI call it started still runs to
-    completion on its worker thread and its connection returns to the pool only when it finishes.
+    the *limiter* is where excess lookups queue - cheap and cancellable - rather than the pool.
+
+    **The bound is on worker threads, for each thread's whole life**, on asyncio and trio alike.
+    A cancelled lookup (a client gone, `CookieVerifier`'s `lookup_timeout`) returns to its caller
+    at once, but a thread cannot be interrupted: the DBAPI call it started runs on, holding its
+    pooled connection, and the thread keeps its slot until that call ends. So while the database
+    is not answering, this adapter never holds more than `max_concurrency` threads and
+    connections; further lookups wait for a slot without starting a thread, and are refused at
+    their own deadline. Those slots come back only when the database answers or the driver gives
+    up, so give the database a reason to: a server-side statement timeout (Postgres
+    `statement_timeout`, MySQL `max_execution_time`) and a driver connect/read timeout end an
+    abandoned call, and an engine `pool_timeout` shorter than the request deadline turns a
+    checkout wait into an error rather than a hang.
 
     Args:
         engine: A synchronous `Engine`, injected. Its pool needs room for the worker threads
@@ -356,23 +459,18 @@ class SyncStoreAdapter(_CoreStore):
         )
         self._limiter: anyio.CapacityLimiter | None = None
 
-    async def _columns(self) -> Columns:
-        return await run_sync(self._inspected, abandon_on_cancel=True, limiter=self._get_limiter())
+    async def _columns(self) -> Discovered:
+        return await run_in_worker(self._get_limiter(), self._inspected)
 
-    def _inspected(self) -> Columns:
+    def _inspected(self) -> Discovered:
         with self._engine.connect() as connection:
             return self._reflected(connection)
 
     async def _select(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
-        # abandon_on_cancel frees the async caller on cancellation; the DBAPI call keeps running on
-        # its worker thread and its connection returns to the pool only when it finishes. The
-        # limiter bounds concurrent threads (hence checked-out connections) to the adapter's own.
-        return await run_sync(
-            self._queried,
-            statement,
-            dict(params),
-            abandon_on_cancel=True,
-            limiter=self._get_limiter(),
+        # A cancellation frees the async caller at once; the DBAPI call keeps running on its worker
+        # thread, which keeps its limiter token (and so its connection) until it finishes.
+        return await run_in_worker(
+            self._get_limiter(), partial(self._queried, statement, dict(params))
         )
 
     def _get_limiter(self) -> anyio.CapacityLimiter:

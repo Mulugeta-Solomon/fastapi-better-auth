@@ -275,6 +275,18 @@ def read_the_clock_types() -> None:
     RemoteVerifier(base_url=origin, csrf=policy, clock=moved)  # pyright: ignore[reportArgumentType]
 
 
+def read_the_lookup_timeout_types() -> None:
+    """`lookup_timeout=` is seconds or `None`; a string of seconds is refused by the editor too."""
+    policy = CsrfDisabled(reason="typing call sites, no request is verified")
+    secret = SharedSecret(SECRET)
+
+    bounded = CookieVerifier(secret=secret, store=FakeStore(), csrf=policy, lookup_timeout=2)
+    unbounded = CookieVerifier(secret=secret, store=FakeStore(), csrf=policy, lookup_timeout=None)
+    assert_type(bounded.lookup_timeout, float | None)
+    assert_type(unbounded, CookieVerifier)
+    CookieVerifier(secret=secret, store=FakeStore(), csrf=policy, lookup_timeout="5")  # pyright: ignore[reportArgumentType]
+
+
 # --- the routes are real ------------------------------------------------------------------
 
 app = FastAPI()

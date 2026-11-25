@@ -277,6 +277,7 @@ def test_the_nesting_probe_is_the_deepest_the_cap_admits() -> None:
     assert len(nested_arrays(DEEP_DOCUMENT_DEPTH + 1)) > MAX_JWKS_BYTES
 
 
+@pytest.mark.reaches_recursion_limit
 @pytest.mark.skipif(not DOCUMENT_OVERFLOWS, reason=OUT_OF_REACH)
 def test_the_nesting_probe_really_defeats_this_interpreters_json_parser() -> None:
     """Platform evidence: here the cap admits a body this scanner cannot finish reading.
@@ -287,6 +288,7 @@ def test_the_nesting_probe_really_defeats_this_interpreters_json_parser() -> Non
 
 
 @pytest.mark.anyio
+@pytest.mark.reaches_recursion_limit
 async def test_a_key_set_nested_as_deep_as_the_cap_allows_is_unusable() -> None:
     """The deepest body the cap admits, end to end. Where the probe overflows this
     interpreter, this is the escape route walked for real; where it does not, the scanner
@@ -307,9 +309,10 @@ async def test_an_empty_key_set_is_not_malformed_it_simply_knows_no_kid() -> Non
 
 @pytest.mark.anyio
 async def test_a_key_whose_material_is_broken_is_unavailable() -> None:
-    """An allowed algorithm whose key will not load is a corrupt key set, not an unknown
-    kid: reporting it as unknown would send the operator hunting for a rotation that
-    already happened."""
+    """A key set whose only key will not load is a corrupt key set, not an empty one:
+    reporting its kid as unknown would send the operator hunting for a rotation that
+    already happened. Beside a key that does load, the same entry is skipped instead - see
+    `test_jwks_unloadable_keys.py` - so this holds because *no* key in the set loads."""
     broken = dict(SIGNER.jwk)
     broken["x"] = "not-base64url-material"
     keys, _transport = client(json_reply({"keys": [broken]}))

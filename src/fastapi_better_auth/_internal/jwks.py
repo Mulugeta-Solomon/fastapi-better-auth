@@ -24,6 +24,7 @@ MAX_JWKS_BYTES = 64 * 1024
 MAX_KEYS = 32
 CACHE_TTL = 300.0
 MIN_CACHE_TTL = 60.0
+MAX_STALE = 86400.0
 MIN_RSA_KEY_BITS = 2048
 NEGATIVE_TTL = 60.0
 REFETCH_INTERVAL = 10.0
@@ -40,6 +41,18 @@ LOADERS: Mapping[str, type[Algorithm]] = {
     "RS256": RSAAlgorithm,
 }
 SUPPORTED_ALGORITHMS: tuple[str, ...] = tuple(LOADERS)
+
+
+def monotonic_clock() -> float:
+    """The clock a `JwksClient` built without `clock=` reads: monotonic seconds.
+
+    Monotonic rather than the wall clock, because every rule it times is an age - the cache's
+    freshness, the refetch window, the negative cache - and an age read off the wall clock is
+    stretched or cut by whoever sets that clock. Looked up on every read rather than bound at
+    construction, so a test can wind it for a `JwtVerifier` it built through the public
+    constructor (`tests/jwks_fixtures.py`), and the event loop's own clock is never touched.
+    """
+    return time.monotonic()
 
 
 @dataclass(frozen=True)
@@ -69,10 +82,13 @@ class JwksClient:
     did not contain is remembered so it cannot cost a second one, and no more than one fetch
     happens per refetch window however many new `kid`s arrive.
 
-    Availability is bought exactly once: when a refetch fails, keys already fetched keep
-    verifying tokens they signed. It buys nothing else - a `kid` that is not in the key set on
-    hand is never accepted, and when the set is stale the honest answer is that it cannot be
-    confirmed rather than that it is unknown.
+    Availability is bought exactly once, and for a bounded time: when a refetch fails, keys
+    already fetched keep verifying tokens they signed for at most `max_stale` seconds past the
+    last successful fetch. Past that, the set on hand may carry a key upstream has since
+    withdrawn - after a compromise, say - so it is no longer honoured and every lookup is
+    unavailable until a refetch succeeds. It buys nothing else - a `kid` that is not in the
+    key set on hand is never accepted, and when the set is stale the honest answer is that it
+    cannot be confirmed rather than that it is unknown.
 
     Internal. Nothing here is public API; `JwtVerifier` owns the one instance there is.
 
@@ -83,15 +99,19 @@ class JwksClient:
         algorithms: The verifier's allowlist. A published key outside it is ignored rather
             than refused, because upstream may rotate through an algorithm we do not accept.
         cache_ttl: Seconds a fetched key set stays fresh. At least `MIN_CACHE_TTL`.
+        max_stale: Seconds past its last successful fetch a key set is still honoured while
+            refetches fail; at exactly that age it still is, a moment later it is not. At
+            least `cache_ttl`, finite, and never `None`: there is no way to switch the bound off.
         negative_ttl: Seconds an unknown `kid` is remembered for.
         refetch_interval: The floor between two upstream fetches.
         max_bytes: The body cap handed to the transport.
         max_keys: The most keys a key set may carry.
         clock: A monotonic clock, replaceable so that cache policy can be tested without
-            waiting for it.
+            waiting for it. `None`, the default, reads `monotonic_clock`.
 
     Raises:
-        ConfigurationError: If the transport is not one, or `cache_ttl` is below the floor.
+        ConfigurationError: If the transport is not one, `cache_ttl` is below the floor, or
+            `max_stale` is not a finite number of seconds at least `cache_ttl`.
     """
 
     def __init__(
@@ -101,16 +121,18 @@ class JwksClient:
         transport: Transport,
         algorithms: Sequence[str],
         cache_ttl: float = CACHE_TTL,
+        max_stale: float = MAX_STALE,
         negative_ttl: float = NEGATIVE_TTL,
         refetch_interval: float = REFETCH_INTERVAL,
         max_bytes: int = MAX_JWKS_BYTES,
         max_keys: int = MAX_KEYS,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._uri = f"{base_url}{JWKS_PATH}"
         self._transport = _validated_transport(transport)
         self._algorithms = tuple(algorithms)
         self._cache_ttl = _validated_ttl(cache_ttl)
+        self._max_stale = _validated_max_stale(max_stale, self._cache_ttl)
         self._negative_ttl = float(negative_ttl)
         self._refetch_interval = float(refetch_interval)
         self._max_bytes = max_bytes
@@ -140,13 +162,22 @@ class JwksClient:
     async def key_for(self, kid: str) -> Jwk | None:
         """The key published under `kid`, or `None` when a key set we trust does not carry it.
 
+        A `kid` the honoured-but-stale set carries never waits for the network: one such lookup
+        refreshes and the rest are answered from the set on hand (`_stale_hit`). Every other
+        miss queues behind the lock, where concurrent misses collapse into one fetch.
+
         Raises:
             AuthServiceUnavailable: When there is no key set to answer from - the first fetch
-                failed, or the one on hand is stale and does not carry this `kid`.
+                failed, the one on hand is past `max_stale`, or it is stale and does not carry
+                this `kid`.
         """
         hit = self._fresh_hit(kid)
         if hit is not None:
             return hit
+        held = self._honoured()
+        stale = None if held is None else held.get(kid)
+        if stale is not None:
+            return await self._stale_hit(kid, stale)
         async with self._lock:
             # Re-checked inside the lock: whoever held it may have fetched the answer already.
             hit = self._fresh_hit(kid)
@@ -157,9 +188,35 @@ class JwksClient:
             # inside the window the negative cache still short-circuits, so a flood is bounded.
             if self._may_fetch():
                 await self._refresh()
-            elif self._is_remembered(kid):
+            elif self._honoured() is not None and self._is_remembered(kid):
                 return None
             return self._answer(kid)
+
+    async def _stale_hit(self, kid: str, held: Jwk) -> Jwk | None:
+        """A `kid` the stale, still-honoured set carries: refresh it once, never queue for it.
+
+        The lock is taken without blocking. Whoever gets it refreshes - inside the refetch
+        window like any fetch - and is answered by the set as it stands afterwards, so a key
+        that refresh withdrew is refused. Whoever finds it held is answered from the set on
+        hand at once, rather than waiting on a fetch that may hang until the transport's
+        timeout. No task is spawned, so asyncio and trio behave the same.
+        """
+        if not self._may_fetch():
+            return held
+        try:
+            self._lock.acquire_nowait()
+        except anyio.WouldBlock:
+            return held
+        try:
+            # Re-checked under the lock: a fetch may have finished between the two reads.
+            if self._may_fetch() and not self._is_fresh():
+                await self._refresh()
+            return self._answer(kid)
+        finally:
+            self._lock.release()
+
+    def _now(self) -> float:
+        return monotonic_clock() if self._clock is None else self._clock()
 
     def _fresh_hit(self, kid: str) -> Jwk | None:
         keys = self._keys
@@ -168,26 +225,38 @@ class JwksClient:
         return keys.get(kid)
 
     def _is_fresh(self) -> bool:
-        return self._fetched_at is not None and self._clock() - self._fetched_at < self._cache_ttl
+        return self._fetched_at is not None and self._now() - self._fetched_at < self._cache_ttl
+
+    def _honoured(self) -> Mapping[str, Jwk] | None:
+        """The key set on hand, while it is young enough to answer from; `None` once it is not.
+
+        Every read that answers a lookup goes through here, so no path can serve a set past
+        `max_stale`. The age is measured on the monotonic clock from the last *successful*
+        fetch: a failed refetch confirms nothing about which keys upstream still publishes.
+        """
+        keys, fetched_at = self._keys, self._fetched_at
+        if keys is None or fetched_at is None or self._now() - fetched_at > self._max_stale:
+            return None
+        return keys
 
     def _may_fetch(self) -> bool:
         """One fetch per window, whoever asks. A generated `kid` is not a fetch trigger."""
         if self._attempted_at is None:
             return True
-        return self._clock() - self._attempted_at >= self._refetch_interval
+        return self._now() - self._attempted_at >= self._refetch_interval
 
     async def _refresh(self) -> None:
-        """Attempt a fetch. A failure with keys already on hand is survivable; the first is not."""
+        """Attempt a fetch. A failure is survivable while the set on hand is honoured, not after."""
         # A cancelled attempt produced no answer, so it must not spend the window a bystander is
         # gated behind; a COMPLETED refusal keeps the stamp so a failing upstream stays rate-
         # limited (D-084/D-196). Only the cancellation exception rolls back - never a refusal.
         previous = self._attempted_at
-        self._attempted_at = self._clock()
+        self._attempted_at = self._now()
         cancelled = anyio.get_cancelled_exc_class()
         try:
             keys = await self._fetched()
         except AuthServiceUnavailable:
-            if self._keys is None:
+            if self._honoured() is None:
                 raise
             logger.warning("jwks refresh failed for %s; serving the key set on hand", self._uri)
             return
@@ -195,17 +264,22 @@ class JwksClient:
             self._attempted_at = previous
             raise
         self._keys = keys
-        self._fetched_at = self._clock()
+        self._fetched_at = self._now()
         self._missing.clear()
 
     def _answer(self, kid: str) -> Jwk | None:
-        keys = self._keys
+        keys = self._honoured()
         found = None if keys is None else keys.get(kid)
         if found is not None:
             return found
         if keys is not None and self._is_fresh():
             self._remember(kid)
             return None
+        if keys is None and self._keys is not None:
+            raise AuthServiceUnavailable(
+                reason=f"the key set for {self._uri} is past max_stale={self._max_stale:g}s"
+                f" since its last successful fetch; kid={safe_label(kid)} unconfirmed"
+            )
         raise AuthServiceUnavailable(
             reason=f"no fresh key set for {self._uri}; kid={safe_label(kid)} unconfirmed"
         )
@@ -214,7 +288,7 @@ class JwksClient:
         at = self._missing.get(kid)
         if at is None:
             return False
-        if self._clock() - at >= self._negative_ttl:
+        if self._now() - at >= self._negative_ttl:
             del self._missing[kid]
             return False
         return True
@@ -227,7 +301,7 @@ class JwksClient:
         """
         while len(self._missing) >= MAX_REMEMBERED_MISSES:
             self._missing.pop(next(iter(self._missing)))
-        self._missing[kid] = self._clock()
+        self._missing[kid] = self._now()
 
     async def _fetched(self) -> Mapping[str, Jwk]:
         try:
@@ -254,8 +328,11 @@ class JwksClient:
         if len(entries) > self._max_keys:
             raise self._unusable(f"it carries {len(entries)} keys, over the {self._max_keys} cap")
         keys: dict[str, Jwk] = {}
-        for entry in entries:
-            self._collect(entry, keys)
+        unloadable = sum(0 if self._collect(entry, keys) else 1 for entry in entries)
+        if unloadable and not keys:
+            # Every key that should have loaded did not: a corrupt set, not an empty one, and
+            # answering "unknown kid" would send the operator hunting for a rotation instead.
+            raise self._unusable(f"no key loaded; {unloadable} did not load")
         return keys
 
     def _check_answer(self, response: TransportResponse) -> None:
@@ -284,7 +361,14 @@ class JwksClient:
             raise self._unusable("it is not a JSON object")
         return cast("Mapping[str, Any]", parsed)
 
-    def _collect(self, entry: object, keys: dict[str, Jwk]) -> None:
+    def _collect(self, entry: object, keys: dict[str, Jwk]) -> bool:
+        """Add one published entry to `keys` if it is usable; `False` only if it would not load.
+
+        An entry under an allowed `alg` whose material will not load is skipped, not refused:
+        one key upstream mispublished - or published for a curve this library does not
+        verify - costs the tokens that key signed, never the whole set. Its kid then answers
+        as unknown. An entry that is not even shaped like a key still refuses the document.
+        """
         if not isinstance(entry, dict):
             raise self._unusable("one of its keys is not an object")
         published = cast("Mapping[str, Any]", entry)
@@ -295,19 +379,21 @@ class JwksClient:
         if not isinstance(algorithm, str) or not algorithm:
             raise self._unusable(f"key {safe_label(kid)} declares no 'alg'")
         loader = LOADERS.get(algorithm)
-        if loader is None or algorithm not in self._algorithms:
-            return
-        if kid in keys:
-            return
+        if loader is None or algorithm not in self._algorithms or kid in keys:
+            return True
         declared = _not_for_verifying(published)
         if declared is not None:
             self._skipped(kid, declared)
-            return
-        key = self._loaded(loader, published, kid)
+            return True
+        key = _loaded(loader, published)
+        if key is None:
+            self._skipped(kid, "load")
+            return False
         if loader is RSAAlgorithm and _rsa_bits(key) < MIN_RSA_KEY_BITS:
             self._skipped(kid, "size")
-            return
+            return True
         keys[kid] = Jwk(kid=kid, algorithm=algorithm, key=key, jwk=published)
+        return True
 
     def _skipped(self, kid: str, why: str) -> None:
         """One key dropped from an otherwise usable set - the correct blast radius.
@@ -321,15 +407,20 @@ class JwksClient:
             why,
         )
 
-    def _loaded(self, loader: type[Algorithm], published: Mapping[str, Any], kid: str) -> Any:
-        try:
-            return loader.from_jwk(dict(published))
-        except Exception:  # noqa: BLE001 - every library failure here means the same thing
-            failure = self._unusable(f"key {safe_label(kid)} did not load")
-        raise failure from None  # outside the handler, as in `_fetched`
-
     def _unusable(self, why: str) -> AuthServiceUnavailable:
         return AuthServiceUnavailable(reason=f"jwks at {self._uri} is unusable: {why}")
+
+
+def _loaded(loader: type[Algorithm], published: Mapping[str, Any]) -> Any | None:
+    """The loaded public key, or `None` when this entry's material will not load.
+
+    Nothing of the failure is kept: the library's exception can quote the material it choked
+    on, and the caller's warning names the key by a sanitized `kid` and one reason word only.
+    """
+    try:
+        return loader.from_jwk(dict(published))
+    except Exception:  # noqa: BLE001 - every library failure here means the same thing
+        return None
 
 
 def _not_for_verifying(published: Mapping[str, Any]) -> str | None:
@@ -383,3 +474,22 @@ def _validated_ttl(cache_ttl: object) -> float:
             " cache's name, and upstream's rate limit is then part of your auth path."
         )
     return float(cache_ttl)
+
+
+def _validated_max_stale(max_stale: object, cache_ttl: float) -> float:
+    """A finite bound no shorter than the cache TTL. There is deliberately no "off" value."""
+    if isinstance(max_stale, bool) or not isinstance(max_stale, (int, float)):
+        raise ConfigurationError(
+            f"max_stale must be a number of seconds; got {type(max_stale).__name__}. There is no"
+            " way to switch the bound off: a key set honoured forever keeps a key upstream"
+            " withdrew verifying tokens for as long as the key set cannot be refetched. Pass a"
+            " long explicit duration if a day is too short for your outages."
+        )
+    if not math.isfinite(max_stale) or max_stale < cache_ttl:
+        raise ConfigurationError(
+            f"max_stale must be a finite number of seconds no shorter than cache_ttl"
+            f" ({cache_ttl:g}); got {max_stale!r}. It bounds how long a key set is honoured past"
+            " its last successful fetch, and a set is honoured for cache_ttl without a refetch"
+            " at all, so a shorter bound would refuse fresh keys."
+        )
+    return float(max_stale)

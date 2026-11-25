@@ -237,7 +237,7 @@ class TestMalformedValues:
             ("banned-not-a-boolean", stored(user=wire_user(banned="yes"))),
             ("banned-a-number", stored(user=wire_user(banned=1))),
             ("ban-expiry-not-a-date", stored(user=wire_user(banExpires="whenever"))),
-            ("deeply-nested", NESTED_BOMB),
+            pytest.param("deeply-nested", NESTED_BOMB, marks=pytest.mark.reaches_recursion_limit),
             ("surrogate-token", stored(session=wire_session(token=LONE_SURROGATE_TOKEN))),
         ],
         ids=_labelled,

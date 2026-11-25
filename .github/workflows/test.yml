@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # release.yml calls this whole workflow, e2e included, for the tagged commit before it
+  # builds anything; a release publishes only if every gating job here passed in that run.
+  workflow_call:
 
 permissions:
   contents: read
@@ -13,17 +16,23 @@ jobs:
   unit:
     name: unit (py${{ matrix.python }})
     runs-on: ubuntu-latest
+    # Every job is bounded: a hung test would otherwise hold the runner for six hours and say
+    # nothing. Unit lanes take minutes; pytest's faulthandler_timeout dumps the stacks first.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: pyproject.toml
           python-version: ${{ matrix.python }}
       - name: Sync (dev group)
-        run: uv sync
+        run: uv sync --locked
       - name: Lint
         run: uv run ruff check .
       - name: Format
@@ -38,30 +47,38 @@ jobs:
   types:
     name: pyright strict (py3.13)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: pyproject.toml
           python-version: "3.13"
       - name: Sync (dev group)
-        run: uv sync
+        run: uv sync --locked
       - name: Pyright (strict, src + tests + .github/scripts)
         run: uv run pyright
 
   os:
     name: unit (${{ matrix.os }}, py3.13)
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: pyproject.toml
           python-version: "3.13"
       - name: Sync (dev group)
-        run: uv sync
+        run: uv sync --locked
       - name: Test (unit lane)
         run: uv run pytest -q
 
@@ -70,10 +87,14 @@ jobs:
     # so the declared floors are never actually exercised. This lane installs them.
     name: unit (declared floors, py3.10)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: pyproject.toml
           python-version: "3.10"
       - name: Resolve every direct dependency to its declared floor
         run: uv lock --resolution lowest-direct
@@ -87,24 +108,33 @@ jobs:
     # 3.15 pre-release because no stable 3.15 exists yet.
     name: unit (py3.15 pre-release, advisory)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: pyproject.toml
           python-version: "3.15"
       - name: Sync (dev group)
-        run: uv sync
+        run: uv sync --locked
       - name: Test (unit lane)
         run: uv run pytest -q
 
   e2e:
     name: e2e conformance + combined coverage
     runs-on: ubuntu-latest
+    # Longer: it builds and starts the harness, then runs the unit lane and the conformance lane.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: pyproject.toml
           python-version: "3.13"
       - name: Start harness (every posture)
         # --profile redis brings up auth-redis on :3101 alongside the default :3100 server.
@@ -113,7 +143,7 @@ jobs:
         # need: a bearer plugin with requireSignature on, and a real rate limit on get-session.
         run: docker compose -f harness/docker-compose.yml --profile redis --profile strict --profile throttled up --build -d --wait
       - name: Sync (dev group)
-        run: uv sync
+        run: uv sync --locked
       - name: Unit lane (coverage, no gate)
         run: uv run pytest -q --cov=fastapi_better_auth --cov-append
       - name: Conformance lane (gate on combined unit + e2e coverage)

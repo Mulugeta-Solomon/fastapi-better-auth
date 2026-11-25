@@ -33,8 +33,10 @@ import aiosqlite
 import pytest
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from fastapi_better_auth import SqlAlchemySessionStore, SyncStoreAdapter
+from tests.deadlines import every_call_ended
 
 NOW = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
 EXPIRES_AT = datetime(2999, 1, 1, 12, 0, tzinfo=timezone.utc)
@@ -143,10 +145,19 @@ def _relaxed(
     )
 
 
+def _retyped(
+    columns: Sequence[tuple[str, str]], types: Mapping[str, str]
+) -> tuple[tuple[str, str], ...]:
+    """Replace the declared type of the named columns, keeping every other column as it was."""
+    return tuple((name, types.get(name, kind)) for name, kind in columns)
+
+
 def build_schema(
     path: pathlib.Path,
     *,
     admin: bool = True,
+    session_types: Mapping[str, str] | None = None,
+    user_types: Mapping[str, str] | None = None,
     sessions: Sequence[Mapping[str, Any]] = (SESSION_ROW,),
     users: Sequence[Mapping[str, Any]] = (USER_ROW,),
     drop_session_columns: Sequence[str] = (),
@@ -159,9 +170,18 @@ def build_schema(
     session_table: str = "session",
     user_table: str = "user",
 ) -> None:
-    """Create and seed a SQLite database that mirrors better-auth's migrated schema."""
-    session_columns = BASE_SESSION_COLUMNS + (ADMIN_SESSION_COLUMNS if admin else ())
-    user_columns = BASE_USER_COLUMNS + (ADMIN_USER_COLUMNS if admin else ())
+    """Create and seed a SQLite database that mirrors better-auth's migrated schema.
+
+    `session_types` / `user_types` replace a column's whole declaration (type and constraints),
+    which is how a deployment's id mode is modelled: `generateId: "serial"` migrates every id
+    column to an integer, `"uuid"` to the database's uuid type where it has one.
+    """
+    session_columns = _retyped(
+        BASE_SESSION_COLUMNS + (ADMIN_SESSION_COLUMNS if admin else ()), session_types or {}
+    )
+    user_columns = _retyped(
+        BASE_USER_COLUMNS + (ADMIN_USER_COLUMNS if admin else ()), user_types or {}
+    )
     session_columns = _relaxed(
         tuple(c for c in session_columns if c[0] not in drop_session_columns),
         relax_session_columns,
@@ -199,7 +219,10 @@ def build_schema(
 
 
 def async_engine(path: pathlib.Path) -> AsyncEngine:
-    return create_async_engine(f"sqlite+aiosqlite:///{path}")
+    # The pool is named rather than left to the dialect: SQLAlchemy 2.0.0 gives a file-backed
+    # aiosqlite engine a `NullPool`, later releases an `AsyncAdaptedQueuePool`, and a test that
+    # asks the pool what it has handed out needs the same answer on every supported version.
+    return create_async_engine(f"sqlite+aiosqlite:///{path}", poolclass=AsyncAdaptedQueuePool)
 
 
 def sync_engine(path: pathlib.Path) -> Engine:
@@ -261,12 +284,16 @@ class StoreFixture:
     `store_options` is how a case configures the store rather than the schema: the two table
     names are read from the schema keywords so a renamed table is seeded and pointed at in one
     call, and anything else (`user_columns=`, `session_columns=`) is passed straight through.
+
+    An async store a test abandoned a lookup on may still be winding that call down, on the
+    engine's connection; `aclose()` waits for every such call to end before it disposes anything.
     """
 
     def __init__(self, tmp_path: pathlib.Path, flavour: str) -> None:
         self._tmp_path = tmp_path
         self._flavour = flavour
         self.engines: list[Engine | AsyncEngine] = []
+        self._async_stores: list[SqlAlchemySessionStore] = []
 
     def __call__(
         self, store_options: Mapping[str, Any] | None = None, **schema: Any
@@ -281,6 +308,7 @@ class StoreFixture:
         if self._flavour == "async":
             engine = async_engine(path)
             store = SqlAlchemySessionStore(engine=engine, **options)
+            self._async_stores.append(store)
         else:
             engine = sync_engine(path)
             store = SyncStoreAdapter(engine=engine, **options)
@@ -289,6 +317,8 @@ class StoreFixture:
         return store, log
 
     async def aclose(self) -> None:
+        for store in self._async_stores:
+            await every_call_ended(store)
         for engine in self.engines:
             if isinstance(engine, AsyncEngine):
                 await engine.dispose()
