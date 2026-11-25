@@ -24,7 +24,7 @@ import asyncio
 import logging
 import pathlib
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 import anyio
@@ -43,6 +43,7 @@ from tests.deadlines import (
     OVERRUN_REASON,
     WEDGE_BACKSTOP,
     DriverGate,
+    abandoned_once_inside,
     every_slot_returned,
     kinds,
     verifier,
@@ -79,16 +80,6 @@ def stage(request: pytest.FixtureRequest) -> str:
     value = request.param
     assert isinstance(value, str)
     return value
-
-
-async def abandoned_once_inside(arrived: Callable[[], Awaitable[object]], lookup: Any) -> None:
-    """Start `lookup`, wait until the driver has seen it arrive, then cancel its caller."""
-    with anyio.fail_after(GUARD), anyio.CancelScope() as caller:
-        async with anyio.create_task_group() as group:
-            group.start_soon(lookup)
-            await arrived()
-            caller.cancel()
-    assert caller.cancelled_caught
 
 
 async def served(store: SqlAlchemySessionStore | SyncStoreAdapter) -> None:

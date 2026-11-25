@@ -7,8 +7,11 @@ of that would be two chances to stop agreeing.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import sqlite3
 import threading
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 import anyio
@@ -17,11 +20,13 @@ import pytest
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
 from fastapi_better_auth import (
     CookieVerifier,
     CsrfDisabled,
     SessionStore,
+    SqlAlchemySessionStore,
     StoredSession,
     StoredUser,
     SyncStoreAdapter,
@@ -106,6 +111,16 @@ def verifier(store: SessionStore, **options: Any) -> CookieVerifier:
     )
 
 
+async def abandoned_once_inside(arrived: Callable[[], Awaitable[object]], lookup: Any) -> None:
+    """Start `lookup`, wait until the driver has seen it arrive, then cancel its caller."""
+    with anyio.fail_after(GUARD), anyio.CancelScope() as caller:
+        async with anyio.create_task_group() as group:
+            group.start_soon(lookup)
+            await arrived()
+            caller.cancel()
+    assert caller.cancelled_caught
+
+
 class DriverGate:
     """Holds every statement a sync engine sends in `do_execute` until released, and counts.
 
@@ -175,6 +190,114 @@ async def every_slot_returned(store: SyncStoreAdapter) -> None:
         for probe in probes:
             if probe in held:
                 limiter.release_on_behalf_of(probe)
+
+
+class AsyncDriverGate:
+    """`DriverGate`'s twin for an async engine: holds every statement until released, and records
+    what a cancellation does to the statement it lands on.
+
+    SQLAlchemy runs `do_execute` in a greenlet on the event loop, and `await_only` is the bridge
+    the driver itself awaits through, so the hold is a real await a cancellation can land on. A
+    statement that is cancelled behaves as SQLAlchemy does with a cancelled `execute`: it runs a
+    clean-up under `asyncio.shield` - where asyncpg would send the server its cancel request -
+    and only then lets the cancellation go. The clean-up ends when `acknowledged` is set, which is
+    how a test holds an abandoned call open for as long as it needs to look at it.
+
+    A second cancellation landing on that shielded wait interrupts the clean-up, as it would
+    interrupt SQLAlchemy's graceful close, and is counted in `interrupted`. `late_error`, when set,
+    is what the statement raises once its clean-up has ended, in place of the cancellation.
+    """
+
+    def __init__(self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch) -> None:
+        from sqlalchemy.util import await_only
+
+        self.release = asyncio.Event()
+        self.acknowledged = asyncio.Event()
+        self.arrived = asyncio.Event()
+        self.entries = 0
+        self.cancellations = 0
+        self.cleaned_up = 0
+        self.interrupted = 0
+        self.late_raised = 0
+        self.late_error: type[sqlite3.Error] | None = None
+        dialect = engine.sync_engine.dialect
+        original = dialect.do_execute
+
+        def do_execute(cursor: Any, statement: str, parameters: Any, context: Any = None) -> None:
+            if not self.release.is_set():
+                await_only(self._held())
+            original(cursor, statement, parameters, context)
+
+        monkeypatch.setattr(dialect, "do_execute", do_execute)
+
+    async def _held(self) -> None:
+        self.entries += 1
+        self.arrived.set()
+        try:
+            # No timeout of its own: a test that holds the gate bounds every wait on it by
+            # `GUARD`, and releases it in a `finally`.
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancellations += 1
+            await self._cleaned_up()
+            raise
+
+    async def _cleaned_up(self) -> None:
+        try:
+            await asyncio.shield(self.acknowledged.wait())
+        except asyncio.CancelledError:
+            self.interrupted += 1
+            raise
+        self.cleaned_up += 1
+        if self.late_error is not None:
+            self.late_raised += 1
+            raise self.late_error(f"the statement failed late while matching ({CAPTURED_TOKEN})")
+
+    def open(self) -> None:
+        """Let every statement through, and end every clean-up that is waiting."""
+        self.release.set()
+        self.acknowledged.set()
+
+
+class LeapingClock:
+    """The running loop's clock, made to leap forward when a test says so.
+
+    A deadline that must land at a known point - after the statement has reached the database,
+    never before - cannot be a short timer: a busy machine can fire it anywhere. So the test
+    configures a deadline it would never wait out (`LONG`), waits for the event that says the
+    statement is held, and then moves the loop's clock past it. anyio's deadlines are read from
+    `loop.time()`, so the deadline fires through anyio's own timer, on the next loop iteration.
+
+    Every other timer on the loop sees the leap too. A `fail_after(GUARD)` entered before it
+    would expire with it, so a guard is entered only after the leap, or exited before.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        loop = asyncio.get_running_loop()
+        original = loop.time
+        self._offset = 0.0
+        monkeypatch.setattr(loop, "time", lambda: original() + self._offset)
+
+    def leap(self, seconds: float) -> None:
+        self._offset += seconds
+
+
+async def every_call_ended(store: SqlAlchemySessionStore) -> None:
+    """Wait until every database call the store abandoned has ended, or fail the test saying so.
+
+    An abandoned call keeps its pooled connection while SQLAlchemy and the driver wind it down;
+    disposing the engine or closing the loop before then cuts that short. The store keeps the
+    tasks itself, so this asks it rather than guessing from the pool.
+    """
+    handoff = store._handoff  # pyright: ignore[reportPrivateUsage]
+    try:
+        with anyio.fail_after(GUARD):
+            await handoff.settled()
+    except TimeoutError:
+        pytest.fail(
+            f"{handoff.winding_down} abandoned database call(s) still winding down {GUARD}s"
+            " after the database was released"
+        )
 
 
 def outage_lines(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
