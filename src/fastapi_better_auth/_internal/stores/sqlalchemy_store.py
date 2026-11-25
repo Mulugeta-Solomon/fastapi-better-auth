@@ -341,9 +341,10 @@ async def _returned(connection: AsyncConnection) -> None:
     SQLAlchemy invalidates the connection.
 
     A close that fails - cancelled, or raising - is closed once more before its exception leaves.
-    On SQLAlchemy 2.0 a close whose `ROLLBACK` raises, or whose terminate the backstop cut short,
-    leaves before the pool's check-in, and the slot would be lost for good (2.1 checks in from a
-    `finally`, and there the second close does nothing). After a cut-short terminate the
+    On SQLAlchemy 2.0 a close whose `ROLLBACK` raises leaves before the pool's check-in, and the
+    slot would be lost for good (2.1 checks in from a `finally`, and there the second close does
+    nothing); below 2.0.38 so did one whose terminate the backstop cut short. After a cut-short
+    terminate the
     connection is already force-closed, so the second close only checks it in; after a raising
     `ROLLBACK` it may try the server again, and the call's deadline and the backstop bound that as
     they bound everything else here. Its outcome is dropped unread: the first exception is what
