@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 import anyio
 
 from ..errors import ConfigurationError
-from .newest_first import NewestFirstLock
+from ..newest_first import NewestFirstLock
 from .outage import OutageLatch, report_once
 from .records import StoredSession, StoredUser
 from .task_handoff import TaskHandoff

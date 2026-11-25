@@ -12,7 +12,7 @@ from __future__ import annotations
 import anyio
 import pytest
 
-from fastapi_better_auth._internal.stores.newest_first import NewestFirstLock
+from fastapi_better_auth._internal.newest_first import NewestFirstLock
 from tests.deadlines import GUARD
 
 WAITERS = ("first", "second", "third")
