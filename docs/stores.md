@@ -133,8 +133,9 @@ changes there.
 **A Redis ACL must let the store read that key too.** Its full name is
 `<key_prefix>revoked-sessions-before-<userId>`, so an ACL that allows `GET` on the whole prefix
 already covers it. The second `GET` is sent only when the first found a session the store could
-read; a miss stops before it. If the Redis user may not read the key, such a lookup is refused as
-`AuthServiceUnavailable` and a `WARNING` is logged, and not again until a lookup completes.
+read; a miss stops before it. If the Redis user may not read the key, the store raises redis-py's
+error for that lookup. `CookieVerifier` then refuses the request as `AuthServiceUnavailable`, the
+uniform `401`. It logs one `WARNING`, and no more until a lookup completes.
 
 **A revocation the store cannot read is still a revocation.** If the key holds anything but a
 whole number of milliseconds, or the session has no readable `createdAt` while the key exists,
