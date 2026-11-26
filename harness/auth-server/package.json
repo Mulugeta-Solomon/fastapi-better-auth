@@ -6,11 +6,11 @@
     "start": "node src/index.mjs"
   },
   "dependencies": {
-    "@hono/node-server": "^1.14.0",
+    "@hono/node-server": "^2.1.11",
     "auth": "1.7.1",
     "better-auth": "1.7.1",
-    "hono": "^4.7.0",
-    "ioredis": "^5.6.0",
-    "pg": "^8.16.0"
+    "hono": "^4.13.19",
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.1"
   }
 }
