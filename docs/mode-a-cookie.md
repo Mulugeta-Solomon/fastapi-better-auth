@@ -194,7 +194,9 @@ application with `create_app(test_settings)` and takes its override key off `app
 A **Redis-authoritative** deployment is a hard rule: a store miss is a `401`, never a fall-back to a
 database. When Better Auth runs with `secondaryStorage`, sign-out deletes the Redis key while a stale
 row can still sit in Postgres, so a fall-back would resurrect exactly the sessions a sign-out
-revoked.
+revoked. On Better Auth 1.7.16 or later, "revoke all sessions" and an admin ban also refuse a
+session whose key is still in Redis, and the store refuses it too; see
+[The Redis store](stores.md#the-redis-store).
 
 ## Configuration
 

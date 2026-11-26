@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-VERIFIED_BETTER_AUTH: tuple[str, ...] = ("1.6.30", "1.7.1", "1.7.5", "1.7.6")
+VERIFIED_BETTER_AUTH: tuple[str, ...] = ("1.6.30", "1.7.1", "1.7.5", "1.7.6", "1.7.28")
 """The Better Auth versions this release was **tested against**, oldest first, newest last.
 
 Not a support matrix and not a promise: Better Auth publishes no wire-format stability

@@ -292,7 +292,10 @@ async def test_no_sql_write_is_emitted_and_no_row_changes(
 
 @pytest.mark.anyio
 async def test_no_redis_command_but_get_is_ever_issued() -> None:
-    client = RecordingRedis({TOKEN: stored()})
+    """Over both reads: the session key, then its user's revocation watermark - present here, so
+    the second read finds a value and still writes nothing back."""
+    seeded = {TOKEN: stored(), f"revoked-sessions-before-{USER_ID}": "0"}
+    client = RecordingRedis(seeded)
     store = RedisSessionStore(client=client)
 
     await store.fetch_session_by_token(TOKEN)
@@ -300,5 +303,6 @@ async def test_no_redis_command_but_get_is_ever_issued() -> None:
     await store.fetch_session_by_token("")
     await store.fetch_user_by_id(USER_ID)
 
+    assert len(client.calls) == 3, "the watermark read was not exercised"
     assert client.commands == {"get"}
-    assert client.values == {TOKEN: stored()}
+    assert client.values == seeded

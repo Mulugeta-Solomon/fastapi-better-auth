@@ -20,7 +20,8 @@ posture asserted in only one direction is not asserted at all.
 | 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408) |
 | 1.7.5 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408) |
 | 1.7.6 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408) |
-| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408), `latest` = 1.7.6 that day |
+| 1.7.28 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-11-25 (run 45535204980), as `latest` |
+| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-11-25 (run 45535204980), `latest` = 1.7.28 that day |
 
 That list is readable from a running application as `fastapi_better_auth.VERIFIED_BETTER_AUTH` — the
 canary matrix without its `latest` entry, which is a dist-tag rather than a version — and
@@ -60,9 +61,9 @@ wheel rather than on HEAD.
 
 ### Between 1.7.1 and 1.7.6
 
-The gating lane pins 1.7.1 and the newest verified version is 1.7.6. Across that gap, three things a
-deployment of this library depends on or runs into, each read out of the published packages' `dist/`
-at the version cited. A file cited at 1.7.5 with no 1.7.6 line beside it is byte-identical at 1.7.6
+The gating lane pins 1.7.1. Across the gap to 1.7.6, three things a deployment of this library
+depends on or runs into, each read out of the published packages' `dist/` at the version
+cited. A file cited at 1.7.5 with no 1.7.6 line beside it is byte-identical at 1.7.6
 (compared by sha256).
 
 - **The wire format did not move.** The session and user field definitions are byte-identical at
@@ -119,6 +120,20 @@ at the version cited. A file cited at 1.7.5 with no 1.7.6 line beside it is byte
   (`:241-244`, `:290`).
   [The shared rate-limit bucket](docs/mode-c-remote.md#the-shared-rate-limit-bucket) holds at 1.7.5 and 1.7.6 as written: its `create-context.mjs` lines
   sit where they do at 1.7.5 (`better-auth@1.7.6` `dist/context/create-context.mjs:172-174`).
+
+### Between 1.7.6 and 1.7.28
+
+What moved that this library reads or depends on:
+
+- **Secondary storage gained a revocation key at 1.7.16.** "Revoke all sessions" and an admin ban
+  now also write `revoked-sessions-before-<userId>`, a time in milliseconds, and Better Auth
+  refuses every session created before it. The key is absent from
+  `packages/better-auth/src/db/internal-adapter.ts` at the tag `v1.7.15` and present at `v1.7.16`;
+  the maintainers' advisory is GHSA-fvxx-76fc-893x. `RedisSessionStore` reads that key from
+  release 0.7.0 of this library, and was run live against 1.7.27 and 1.7.28
+  (`tests/e2e/test_redis_watermark_live.py`).
+- **Cookie signing kept its behaviour.** The peer package `better-call` moved from `1.4.0` to
+  `1.4.6`, and every cookie-mode leg ran green against 1.7.28 (run 45535204980).
 
 ## Python
 
@@ -194,9 +209,12 @@ with SQLAlchemy 2.0.24 and 2.1.9). See
   upstream change to either the cookie signing or the store layout may force a change here inside a
   minor release. That coupling is stated rather than hidden: Mode C (remote `get-session`) is the
   path with less of it, because it asks the server instead of reading its internals. The stores read
-  three internal shapes, all asserted against a running better-auth in the conformance lane, in both
-  of its topologies: the `session` and `user` tables' column names, the secondary-storage key (the
-  raw session token, with no namespace), and the JSON that key holds (`{session, user}`).
+  four internal shapes: the `session` and `user` tables' column names, the secondary-storage key
+  (the raw session token, with no namespace), the JSON that key holds (`{session, user}`), and,
+  from better-auth 1.7.16, the key `revoked-sessions-before-<userId>` (a time in milliseconds,
+  as digits). The first three are asserted against a running better-auth in the conformance lane, in
+  both of its topologies. The fourth is asserted wherever the running version writes it: the
+  canary's 1.7.28 and `latest` legs. The gating lane's 1.7.1 does not write it.
 - **Mode C (remote get-session)** couples to *less*, and the honest word for it is "less", never
   "format-independent". It is **tested against better-auth 1.7.1**, verified live on
   **2026-09-25** across all four harness postures. Its dependencies are exactly these four, and
