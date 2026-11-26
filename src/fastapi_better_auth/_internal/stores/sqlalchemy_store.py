@@ -14,6 +14,7 @@ from ..errors import ConfigurationError
 from ..newest_first import NewestFirstLock
 from .outage import OutageLatch, report_once
 from .records import StoredSession, StoredUser
+from .statement_timeout import validated_statement_timeout
 from .task_handoff import TaskHandoff
 from .thread_handoff import run_in_worker
 
@@ -279,11 +280,16 @@ class SqlAlchemySessionStore(_CoreStore):
             refused rather than iterated one character at a time.
         user_columns: The same for the user table - the columns beyond Better Auth's own that a
             verified request's `session.user` may carry.
+        statement_timeout: Seconds, or `None` (the default) to send nothing of the kind. PostgreSQL
+            only: a transaction-local `statement_timeout`, rounded up to whole milliseconds, set
+            first in every transaction the store opens - each lookup and the schema read.
 
     Raises:
         ConfigurationError: If `sqlalchemy` is not installed, if `engine` is not an
             `AsyncEngine`, if either table name is blank or the two are the same, if either
-            allow-list is not a sequence of distinct non-blank names, or - from `connect()` or
+            allow-list is not a sequence of distinct non-blank names, if `statement_timeout` is not
+            a positive, finite number of seconds within what Postgres accepts or is set on an
+            engine that is not PostgreSQL, or - from `connect()` or
             the first lookup - if the schema cannot answer a lookup at all or an allow-list
             names a column the table does not have.
     """
@@ -297,6 +303,7 @@ class SqlAlchemySessionStore(_CoreStore):
         schema: str | None = None,
         session_columns: Sequence[str] | None = None,
         user_columns: Sequence[str] | None = None,
+        statement_timeout: float | None = None,
     ) -> None:
         super().__init__(
             adapter="SqlAlchemySessionStore",
@@ -307,6 +314,9 @@ class SqlAlchemySessionStore(_CoreStore):
             user_columns=user_columns,
         )
         self._engine = self._sql.validated_async_engine(engine)
+        self._timeout = self._sql.bounded_engine(
+            self._engine, validated_statement_timeout(statement_timeout)
+        )
         self._handoff = TaskHandoff()
 
     async def _columns(self) -> Discovered:
@@ -315,6 +325,7 @@ class SqlAlchemySessionStore(_CoreStore):
     async def _inspected(self) -> Discovered:
         connection = await self._engine.connect()
         try:
+            await self._bounded(connection)
             return await connection.run_sync(self._reflected)
         finally:
             await _returned(connection)
@@ -333,9 +344,22 @@ class SqlAlchemySessionStore(_CoreStore):
     async def _queried(self, statement: Select[Any], params: dict[str, Any]) -> Rows:
         connection = await self._engine.connect()
         try:
+            await self._bounded(connection)
             return self._sql.rows(await connection.execute(statement, params))
         finally:
             await _returned(connection)
+
+    async def _bounded(self, connection: AsyncConnection) -> None:
+        """Open the transaction with the store's bound, when it has one; else send nothing.
+
+        The first statement of every transaction the store opens, so every statement after it is
+        bounded, and transaction-local, so it ends with the `ROLLBACK` `_returned` sends.
+        """
+        if self._timeout is None:
+            return
+        await connection.execute(
+            self._sql.timeout_statement(), self._sql.timeout_params(self._timeout)
+        )
 
 
 async def _returned(connection: AsyncConnection) -> None:
