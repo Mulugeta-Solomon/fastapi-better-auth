@@ -78,8 +78,12 @@ def refuse_autocommit(engine: AsyncEngine) -> None:
     Free, and run for every transaction, so an engine switched after `connect()` is caught too
     (`update_execution_options`). An engine *built* with `isolation_level="AUTOCOMMIT"` does not
     say so in its options; `confirmed_bound` catches that one, at discovery.
+
+    The level is compared as SQLAlchemy reads it, not as it was written: SQLAlchemy takes
+    `"autocommit"` in any case and keeps the spelling it was given in the options.
     """
-    if engine.get_execution_options().get(ISOLATION_LEVEL) == AUTOCOMMIT:
+    level = engine.get_execution_options().get(ISOLATION_LEVEL)
+    if isinstance(level, str) and level.replace("_", " ").upper() == AUTOCOMMIT:
         raise ConfigurationError(NO_TRANSACTION)
 
 
