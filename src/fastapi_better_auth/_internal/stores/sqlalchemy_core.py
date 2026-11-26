@@ -1,8 +1,9 @@
 """Everything in this package that touches SQLAlchemy - which is why nothing imports it eagerly.
 
 `sqlalchemy` is an optional extra, so importing `fastapi_better_auth` must work without it. This
-module is the one place the library names it, and `sqlalchemy_store` reaches it through a guarded
-import at construction time - the same shape `httpx_transports` uses for its own extra.
+module, and the two it alone imports (`sql_widths`, `sqlalchemy_bound`), are the only places the
+library names it, and `sqlalchemy_store` reaches it through a guarded import at construction
+time - the same shape `httpx_transports` uses for its own extra.
 
 Better Auth's schema as SQLAlchemy Core sees it: two tables, quoted, and two SELECTs.
 
