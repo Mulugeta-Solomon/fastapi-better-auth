@@ -10,7 +10,9 @@ notes". The full release notes for each version are on the
 
 ## [Unreleased]
 
-Merged on `main` since 0.6.0, not yet on PyPI.
+Nothing yet.
+
+## [0.7.0] - 2026-11-26
 
 ### Upgrade notes
 
@@ -44,6 +46,15 @@ Merged on `main` since 0.6.0, not yet on PyPI.
 - **The `[sqlalchemy]` extra needs SQLAlchemy 2.0.38 or newer** (was 2.0). Older releases cannot
   cancel a statement on the server when its lookup is cancelled, or can leave its connection open
   on a server that stopped answering. A project that pins an older SQLAlchemy no longer resolves.
+- **`RedisSessionStore` reads Better Auth's revocation key.** After the session, it reads
+  `revoked-sessions-before-<userId>` and refuses a session created before the time it holds. An
+  accepted session now costs two `GET`s, not one. If that key holds anything but a whole number
+  of milliseconds, every session of that user is refused until the key is corrected or expires.
+  See [The Redis store](docs/stores.md#the-redis-store).
+- **A `RedisSessionStore` built from `url=` has socket deadlines:** 3 seconds to connect and 2
+  seconds for each socket operation. Before, it waited for as long as Redis did. Change them
+  with `socket_timeout=` and `socket_connect_timeout=`, or in the URL's query string. A deadline
+  that is not a positive, finite number of seconds is a `ConfigurationError`, in the URL too.
 
 ### Added
 
@@ -60,6 +71,8 @@ Merged on `main` since 0.6.0, not yet on PyPI.
 - `max_stale=` on `JwtVerifier`, default 86400 seconds. (PR #110)
 - `lookup_timeout=` on `CookieVerifier`, default 5.0 seconds, and the `lookup_timeout` property.
   (PR #112)
+- `socket_timeout=` and `socket_connect_timeout=` on `RedisSessionStore`, for a client built from
+  `url=`.
 
 ### Changed
 
@@ -70,6 +83,8 @@ Merged on `main` since 0.6.0, not yet on PyPI.
   instead of refusing the whole set. A set in which no key loads is still refused. (PR #110)
 - `uv.lock` updated to current releases; the build backend `uv_build` and the required uv version
   are pinned to the 0.13 line. (PR #107)
+- `VERIFIED_BETTER_AUTH` now ends with 1.7.28, the newest Better Auth this release was tested
+  against. The weekly canary tests it as a pinned version.
 
 ### Fixed
 
@@ -88,6 +103,13 @@ Merged on `main` since 0.6.0, not yet on PyPI.
 
 ### Security
 
+- **`RedisSessionStore` accepted a session that Better Auth had revoked.** On Better Auth 1.7.16
+  or later with `secondaryStorage`, "revoke all sessions" and an admin ban refuse every session
+  created before them, even one whose key is still in Redis. The store read only the session's
+  own key, so it still accepted such a session. It now reads the revocation key as well.
+  Releases 0.2.0 to 0.6.0 are affected. Upgrade if you use `RedisSessionStore`.
+- `RedisSessionStore`: when a Redis read fails, the store's own stack frames no longer hold the
+  token, the key or the stored session.
 - PyJWT floor raised to 2.15.0, so no release before PyJWT's 2.14.0 security release can be
   installed. (#92, PR #107)
 - Mode C: a client can no longer put bytes outside the cookie-octets into the outbound `cookie`
@@ -210,7 +232,8 @@ it.
 
 Name reservation on PyPI. Not usable.
 
-[Unreleased]: https://github.com/Mulugeta-Solomon/fastapi-better-auth/compare/v0.6.0...main
+[Unreleased]: https://github.com/Mulugeta-Solomon/fastapi-better-auth/compare/v0.7.0...main
+[0.7.0]: https://github.com/Mulugeta-Solomon/fastapi-better-auth/releases/tag/v0.7.0
 [0.6.0]: https://github.com/Mulugeta-Solomon/fastapi-better-auth/releases/tag/v0.6.0
 [0.5.0]: https://github.com/Mulugeta-Solomon/fastapi-better-auth/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Mulugeta-Solomon/fastapi-better-auth/releases/tag/v0.4.0
