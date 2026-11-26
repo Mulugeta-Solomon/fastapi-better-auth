@@ -10,7 +10,10 @@ notes". The full release notes for each version are on the
 
 ## [Unreleased]
 
-Nothing yet.
+### Documentation
+
+- The 0.7.0 upgrade notes and [The Redis store](docs/stores.md#the-redis-store) now say what a
+  Redis ACL must allow for the store's revocation read. Nothing in the library changed.
 
 ## [0.7.0] - 2026-11-26
 
