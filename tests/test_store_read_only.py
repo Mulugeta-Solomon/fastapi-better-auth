@@ -38,6 +38,8 @@ from fastapi_better_auth import (
     SyncStoreAdapter,
 )
 from tests.stores import (
+    SETTING,
+    SETTINGS_STATEMENT,
     TOKEN,
     USER_ID,
     RecordingRedis,
@@ -46,12 +48,12 @@ from tests.stores import (
     build_schema,
     stored,
     sync_engine,
+    writes_emitted,
 )
 
 PACKAGE = pathlib.Path(__file__).resolve().parent.parent / "src" / "fastapi_better_auth"
 STORES = PACKAGE / "_internal" / "stores"
 
-READ_VERBS = frozenset({"SELECT", "PRAGMA"})
 UNKNOWN_TOKEN = "5RmMvJt3xQ8bWfKcApZnUhLd2YeGsT7q"
 
 
@@ -285,9 +287,68 @@ async def test_no_sql_write_is_emitted_and_no_row_changes(
         engine.dispose()
 
     assert log.statements, "nothing was executed; this proves nothing"
-    assert log.verbs <= READ_VERBS, f"a non-read statement was emitted: {sorted(log.verbs)}"
+    assert writes_emitted(log) == [], f"a non-read statement was emitted: {sorted(log.verbs)}"
     assert snapshot(observer) == before
     observer.dispose()
+
+
+# ---------------------------------------------------------------- the instrument that names the one setting
+
+
+def logged(*entries: tuple[str, tuple[Any, ...]]) -> StatementLog:
+    log = StatementLog()
+    for statement, parameters in entries:
+        log.statements.append(statement)
+        log.parameters.append(parameters)
+    return log
+
+
+LOOKUP = ('SELECT "session".id FROM "session" WHERE "session".token = $1::VARCHAR', (TOKEN,))
+SETTINGS = (SETTINGS_STATEMENT, (SETTING, "1500"))
+
+
+def test_the_settings_statement_is_allowed_only_at_the_value_the_store_was_given() -> None:
+    """Without `milliseconds` - the option unset - not even the right statement is allowed."""
+    assert writes_emitted(logged(SETTINGS, LOOKUP), 1500) == []
+    assert writes_emitted(logged(SETTINGS, LOOKUP)) == [SETTINGS_STATEMENT]
+    assert writes_emitted(logged(SETTINGS, LOOKUP), 3000) == [SETTINGS_STATEMENT]
+
+
+@pytest.mark.parametrize(
+    ("statement", "parameters"),
+    [
+        (SETTINGS_STATEMENT.replace(", true)", ", false)"), (SETTING, "1500")),
+        (
+            "SELECT set_config($1::VARCHAR, $2::VARCHAR, $3::BOOLEAN) AS set_config_1",
+            (SETTING, "1500", False),
+        ),
+        (SETTINGS_STATEMENT, ("search_path", "1500")),
+        ("SELECT 1, set_config('statement_timeout', '0', false)", ()),
+    ],
+    ids=["session-flag", "bound-flag", "another-setting", "inside-another-select"],
+)
+def test_any_other_set_config_is_refused_although_it_starts_with_select(
+    statement: str, parameters: tuple[Any, ...]
+) -> None:
+    """The verb filter alone waves every one of these through. The named statement does not."""
+    log = logged((statement, parameters))
+
+    assert log.verbs == {"SELECT"}
+    assert writes_emitted(log, 1500) == [statement]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        'UPDATE "session" SET "expiresAt" = now()',
+        'DELETE FROM "session"',
+        'INSERT INTO "session" (id) VALUES ($1::VARCHAR)',
+        'WITH gone AS (DELETE FROM "session" RETURNING id) SELECT id FROM gone',
+    ],
+    ids=["update", "delete", "insert", "data-modifying-cte"],
+)
+def test_a_write_is_refused_whatever_the_settings_allowance(statement: str) -> None:
+    assert writes_emitted(logged((statement, ())), 1500) == [statement]
 
 
 @pytest.mark.anyio

@@ -229,8 +229,22 @@ def sync_engine(path: pathlib.Path) -> Engine:
     return create_engine(f"sqlite+pysqlite:///{path}")
 
 
+READ_VERBS = frozenset({"SELECT", "PRAGMA"})
+"""What a read starts with: SQLite's reflection is `PRAGMA`, everything else a `SELECT`."""
+
+SETTING = "statement_timeout"
+SETTINGS_STATEMENT = "SELECT set_config($1::VARCHAR, $2::VARCHAR, true) AS set_config_1"
+"""The one statement a store may send that is not a read, exactly as asyncpg receives it.
+
+`SqlAlchemySessionStore(statement_timeout=...)` sends it first in every transaction it opens. It
+starts with `SELECT`, so a filter on the verb alone would wave it through, and with it any other
+function call that changes state; the invariant names it instead (`writes_emitted`). The final
+`true` makes the setting transaction-local, which is what keeps it out of the pool's other
+checkouts."""
+
+
 class StatementLog:
-    """Every SQL statement an engine actually sent to its driver, in order.
+    """Every SQL statement an engine actually sent to its driver, in order, with its parameters.
 
     The read-only invariant is asserted against this and not against the store's source: an
     intention to read is not evidence, and a write emitted through a path nobody read is
@@ -239,6 +253,7 @@ class StatementLog:
 
     def __init__(self) -> None:
         self.statements: list[str] = []
+        self.parameters: list[Any] = []
         self.threads: list[int] = []
 
     def attach(self, engine: Engine | AsyncEngine) -> None:
@@ -255,18 +270,55 @@ class StatementLog:
         executemany: bool,
     ) -> None:
         self.statements.append(statement)
+        self.parameters.append(parameters)
         self.threads.append(threading.get_ident())
 
     @property
     def verbs(self) -> frozenset[str]:
-        return frozenset(
-            line.split(maxsplit=1)[0].upper() for line in self.statements if line.split()
-        )
+        return frozenset(_verb(line) for line in self.statements if line.split())
+
+    @property
+    def settings(self) -> list[str]:
+        """Every statement that calls `set_config`, whatever else it says."""
+        return [line for line in self.statements if _sets_config(line)]
 
     @property
     def selects(self) -> list[str]:
-        """The SELECTs alone: schema discovery emits PRAGMA/reflection traffic around them."""
-        return [line for line in self.statements if line.lstrip().upper().startswith("SELECT")]
+        """The SELECTs that read: schema discovery emits PRAGMA/reflection traffic around them,
+        and the settings statement is a `SELECT` that reads nothing."""
+        return [
+            line
+            for line in self.statements
+            if line.lstrip().upper().startswith("SELECT") and not _sets_config(line)
+        ]
+
+
+def writes_emitted(log: StatementLog, milliseconds: int | None = None) -> list[str]:
+    """Every statement in `log` the read-only invariant refuses; empty when the store only read.
+
+    A statement is allowed when it starts with a read verb and calls no `set_config`, or when it
+    is exactly `SETTINGS_STATEMENT` carrying `statement_timeout` and `milliseconds` - the one
+    store setting, at the value the store was given. With `milliseconds=None` (the option unset)
+    no settings statement is allowed at all.
+    """
+    refused: list[str] = []
+    for statement, parameters in zip(log.statements, log.parameters, strict=True):
+        if _sets_config(statement):
+            expected = None if milliseconds is None else (SETTING, str(milliseconds))
+            if statement != SETTINGS_STATEMENT or tuple(parameters) != expected:
+                refused.append(statement)
+        elif _verb(statement) not in READ_VERBS:
+            refused.append(statement)
+    return refused
+
+
+def _verb(statement: str) -> str:
+    words = statement.split(maxsplit=1)
+    return words[0].upper() if words else ""
+
+
+def _sets_config(statement: str) -> bool:
+    return "set_config" in statement.lower()
 
 
 FLAVOURS = ("async", "sync")
