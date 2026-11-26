@@ -13,7 +13,7 @@ more lookups than the pool has connections; after each one, the store's backends
 lock must go back to none and the store's connections must stay within the pool. The waits poll
 for the condition with a generous backstop instead of sleeping for a guess.
 
-The other two cases are a server that stops answering altogether, which no cancel request
+The other cases are a server that stops answering altogether, which no cancel request
 reaches: a relay between the store and Postgres stops forwarding both ways (`relay.py`). At the
 shipped bound, every abandoned call must have ended within it; on the lockfile's asyncpg the
 driver's own two-second close timeout ends them, so that case claims the bound and no more. The

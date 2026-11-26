@@ -239,7 +239,8 @@ setting would end before the lookup runs. With `statement_timeout=` set, `connec
 lookup raise `ConfigurationError` on such an engine, and no lookup reaches the database. That holds
 for an engine built with `isolation_level="AUTOCOMMIT"`, for a copy made with
 `engine.execution_options(isolation_level="AUTOCOMMIT")`, and for an engine switched that way after
-`connect()`.
+`connect()`. One case is not seen: code of your own that puts single pooled connections into
+autocommit after the schema was read, in a pool event listener for example.
 
 `tests/e2e/test_store_statement_timeout_live.py` proves all of this against a live Postgres on
 `asyncpg`, for a role holding only `SELECT` on the two tables. Other drivers are not tested.
