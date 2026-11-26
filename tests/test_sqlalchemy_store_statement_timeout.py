@@ -135,7 +135,9 @@ class TestTheDialect:
     def test_another_dialect_is_refused_when_the_store_is_built(
         self, tmp_path: pathlib.Path
     ) -> None:
-        engine = async_engine(tmp_path / "other.sqlite")
+        """Only the dialect's name is quoted, never the engine's URL. A SQLite URL has one place
+        for a secret, the file's name, so the secret is put there."""
+        engine = async_engine(tmp_path / f"{PASSWORD}.sqlite")
 
         with pytest.raises(ConfigurationError, match="statement_timeout") as caught:
             SqlAlchemySessionStore(engine=engine, statement_timeout=1)
@@ -143,6 +145,7 @@ class TestTheDialect:
         message = str(caught.value)
         assert "PostgreSQL only" in message
         assert "sqlite" in message
+        assert_quiet_about_the_url(caught.value)
 
     def test_another_dialect_builds_as_before_without_it(self, tmp_path: pathlib.Path) -> None:
         engine = async_engine(tmp_path / "other.sqlite")
