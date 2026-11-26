@@ -53,6 +53,9 @@ auth = BetterAuth(
 # Where other services also own the `user` table, name the extra columns that may travel:
 #   store = SqlAlchemySessionStore(engine=engine, user_columns=["tenantId"])
 
+# On Postgres, let the server end any statement of the store that runs past 3 seconds:
+#   store = SqlAlchemySessionStore(engine=engine, statement_timeout=3)
+
 # Redis secondary-storage instead of SQL:
 #   from fastapi_better_auth import RedisSessionStore
 #   store = RedisSessionStore(url=os.environ["REDIS_URL"])   # a miss is a 401, never a DB fall-back
@@ -102,6 +105,7 @@ keyword-only.
 | `session_columns` | `None` | Extra `session` columns that may be selected. `None` selects every column. |
 | `user_columns` | `None` | Extra `user` columns that may be selected. `None` selects every column. |
 | `max_concurrency` | `None` | `SyncStoreAdapter` only. The most lookups that may run on worker threads at once. `None` uses the engine pool's size plus overflow, or 8 where the pool states no size. |
+| `statement_timeout` | `None` | `SqlAlchemySessionStore` only, on PostgreSQL only. Seconds after which the server ends any statement of the store. Keep it below `lookup_timeout`. `None` sends nothing of the kind. See [When the database does not answer](#when-the-database-does-not-answer). |
 
 **Call `await store.connect()` in your lifespan.** It reads the live schema once, so a table or a
 required column that is missing stops the application at startup instead of failing the first
@@ -176,20 +180,15 @@ What happens to the call that was running depends on the store:
   never read by a later lookup, because redis-py closes the connection of a cancelled command.
   `tests/e2e/test_redis_cut_reply_live.py` proves that against a live Redis.
 
-Set these in the database and the driver, for either store:
+Set these for either store:
 
 - **A statement timeout on the server that is shorter than `lookup_timeout`**, so a statement nobody
-  waits for ends by itself. On Postgres: `ALTER ROLE <role> SET statement_timeout = '3s'`. It
-  applies to connections opened after it, so restart the application or recycle its pool. On
-  MySQL: `max_execution_time`.
+  waits for ends by itself. There are two ways to set it, described in
+  [A statement timeout](#a-statement-timeout).
 - **A connect timeout in the driver.** A lookup that finds no idle connection opens one inside its
   own deadline, so keep `lookup_timeout` well above the time a new connection takes.
 - **For `SyncStoreAdapter`, a read timeout in the driver**, so a thread waiting on a server that
   never answers is given back.
-
-A SQL store that was not connected at startup reads the schema inside a request, under that
-request's `lookup_timeout`. A read that takes longer than that never finishes inside a request.
-Call `await store.connect()` in your lifespan, where no such limit applies.
 
 The `[sqlalchemy]` extra needs SQLAlchemy 2.0.38 or newer. Before 2.0.24, a cancelled connection
 is dropped without cancelling its statement on the server. Before 2.0.38, a server that stops
@@ -200,8 +199,64 @@ on `asyncpg`. With the `session` table locked, no statement of a refused lookup 
 server. Against a server that stops answering, during a statement or while a connection is being
 returned to the pool, the abandoned calls end and their places in the pool come back, by the
 store's own 5-second limit where the driver would wait for good. Once the server answers again,
-it is asked directly, and it holds only the pool's connections. The same cases were also measured
-by hand on `psycopg`. Other drivers are not measured; the statement timeout above covers them.
+it is asked directly, and it holds only the pool's connections. Each case runs with and without
+`statement_timeout=`, and one more case stops the server at the statement that sets the timeout.
+The cases without it were also measured by hand on `psycopg`. Other drivers are not measured; a
+statement timeout covers them.
+
+### A statement timeout
+
+**On Postgres, with `SqlAlchemySessionStore`, pass `statement_timeout=`.** It bounds only the
+store's own statements, so it works on an engine the store shares with the rest of the
+application:
+
+- Every transaction the store opens starts with
+  `SELECT set_config('statement_timeout', <ms>, true)`. That covers each lookup, and the schema read
+  that `connect()` and the first lookup run.
+- The setting lasts until the end of that transaction, and the store always ends it with a
+  `ROLLBACK`. Other statements on the same pool keep their own timeout.
+- For the store's transactions, the store's value replaces a timeout set on the role or the
+  database, even a shorter one.
+- The value is in seconds and is rounded up to whole milliseconds. Below one millisecond it is
+  one, never zero, because Postgres reads zero as no timeout. It must be positive and finite, and
+  at most 2147483.647 seconds. Otherwise the store raises `ConfigurationError` when it is built.
+- Keep it below `lookup_timeout`, so the server ends a slow statement before the request gives up
+  on it.
+- On any other database the option raises `ConfigurationError` when the store is built.
+- It bounds the statements that follow it in a transaction. It does not bound itself, the
+  `ROLLBACK`, or the statements SQLAlchemy sends when it opens a connection.
+- With the option set, a lookup sends two statements instead of one: the setting, then the lookup.
+  The schema read sends two more: the setting, and a read of `pg_settings` that checks it held.
+- The role needs no grant for it beyond `SELECT` on the two tables.
+
+When the server ends a lookup, the store raises `AuthServiceUnavailable`, the uniform `401`. It
+logs one `WARNING` naming SQLSTATE `57014`, and no more until a lookup completes. When the server
+ends the schema read in `connect()`, `connect()` raises SQLAlchemy's `DBAPIError`, as it does for
+any database error. Nothing is kept, so the next `connect()` or lookup reads the schema again.
+
+**An engine in `AUTOCOMMIT` is refused.** There each statement is a transaction of its own, so the
+setting would end before the lookup runs. With `statement_timeout=` set, `connect()` and every
+lookup raise `ConfigurationError` on such an engine, and no lookup reaches the database. That holds
+for an engine built with `isolation_level="AUTOCOMMIT"`, for a copy made with
+`engine.execution_options(isolation_level="AUTOCOMMIT")`, and for an engine switched that way after
+`connect()`.
+
+`tests/e2e/test_store_statement_timeout_live.py` proves all of this against a live Postgres on
+`asyncpg`, for a role holding only `SELECT` on the two tables. Other drivers are not tested.
+
+**Everywhere else, set the timeout on the role.** That covers `SyncStoreAdapter`, which has no
+`statement_timeout=`, and other databases. On Postgres:
+`ALTER ROLE <role> SET statement_timeout = '3s'`. It applies to connections opened after it, so
+restart the application or recycle its pool. On MySQL: `max_execution_time`. A role-level timeout
+bounds every statement the role runs, so give the store a role of its own if the application must
+run longer statements.
+
+### Reading the schema at startup
+
+A SQL store that was not connected at startup reads the schema inside a request, under that
+request's `lookup_timeout`. A read that takes longer than that never finishes inside a request.
+Call `await store.connect()` in your lifespan, where no request's `lookup_timeout` applies. With
+`statement_timeout=` set, each statement of that read is still bounded by it.
 
 ## Integer and uuid ids
 

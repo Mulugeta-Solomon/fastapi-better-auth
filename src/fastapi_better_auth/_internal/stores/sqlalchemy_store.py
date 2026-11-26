@@ -96,11 +96,15 @@ class _CoreStore(ABC):
 
         Raises:
             ConfigurationError: If a table is absent, or is missing a column every lookup reads.
+            SQLAlchemyError: A database error while reading, as SQLAlchemy raised it (a
+                `DBAPIError`, the driver's own error under `.orig`) - one a
+                `statement_timeout=` bound ended included. Nothing is kept: the next call, or
+                the first lookup, reads the schema again.
         """
         await self._ready()
 
     async def fetch_session_by_token(self, token: str) -> StoredSession | None:
-        """The session stored under this raw token, with its user, in one statement.
+        """The session stored under this raw token, with its user, in one SELECT.
 
         See `SessionStore.fetch_session_by_token`. A blank token never reaches the database.
         """
@@ -185,7 +189,7 @@ class SqlAlchemySessionStore(_CoreStore):
     """Better Auth's `session` and `user` tables, read through an async SQLAlchemy engine.
 
     The store for the shared-database topology: Better Auth writes sessions into Postgres (or
-    MySQL, or SQLite) and this reads them, one statement per lookup and no ORM anywhere -
+    MySQL, or SQLite) and this reads them, one SELECT per lookup and no ORM anywhere -
     SQLAlchemy Core against a declared, quoted schema, so nothing here depends on your models,
     your metadata or your session lifecycle.
 
@@ -211,8 +215,10 @@ class SqlAlchemySessionStore(_CoreStore):
     until a lookup completes again.
 
     **The session and its user arrive together**, joined in one statement, so the happy path is
-    a single round trip and the record's `user` is already populated. `fetch_user_by_id` is
-    there for callers that need a user on its own.
+    one query and the record's `user` is already populated. `fetch_user_by_id` is there for
+    callers that need a user on its own. Unset, `statement_timeout=` adds nothing: a lookup sends
+    that one statement. Set, it sends two (the bound, then the lookup) and discovery sends two
+    more (the bound and its readback); counted from the engine's own events on the live lane.
 
     **The schema is read once, on first use** (or from `connect()`), and it decides two things.
     That every column a lookup needs is there - and if one is not, that is a
@@ -268,6 +274,24 @@ class SqlAlchemySessionStore(_CoreStore):
     client. And a lookup that finds no idle connection opens a new one inside its own deadline,
     so keep `lookup_timeout` well above the time a new connection takes.
 
+    **A statement timeout of the store's own** (`statement_timeout=`, seconds, Postgres only) is
+    that setting without touching the role or the pool the application lends: a role-level or
+    engine-level timeout would bound every other statement the application runs as well. Set,
+    every transaction the store opens - each lookup, and the schema read that `connect()` and the
+    first lookup run - starts with `SELECT set_config('statement_timeout', :ms, true)`, the value
+    rounded up to whole milliseconds. The setting is transaction-local, so it ends with the
+    `ROLLBACK` the store sends, and no other checkout of the pool ever sees it. For the store's
+    own transactions it replaces a role-level or database-level value, even a shorter one. Keep it
+    below `lookup_timeout`. A lookup the server ends is refused as above (`AuthServiceUnavailable`,
+    one WARNING naming SQLSTATE 57014); a schema read it ends raises from `connect()` as any
+    database error does. It bounds the statements after it in each transaction, not itself, the
+    `ROLLBACK`, or what SQLAlchemy sends to open a connection. On an engine in `AUTOCOMMIT` the
+    setting would end with the statement that made it, so the store refuses such an engine with a
+    `ConfigurationError` before any lookup reaches the database: from the engine's options before
+    every transaction, and from the setting read back at discovery. Tested on asyncpg; the role
+    needs no grant beyond the `SELECT` above. `SyncStoreAdapter` has no such option: give its
+    role the timeout (`ALTER ROLE ... SET statement_timeout`), as for any other database.
+
     Args:
         engine: An `AsyncEngine`. Always injected, never built here: the pool, the TLS
             configuration and the lifecycle belong to the application, and this store must not
@@ -282,16 +306,18 @@ class SqlAlchemySessionStore(_CoreStore):
             verified request's `session.user` may carry.
         statement_timeout: Seconds, or `None` (the default) to send nothing of the kind. PostgreSQL
             only: a transaction-local `statement_timeout`, rounded up to whole milliseconds, set
-            first in every transaction the store opens - each lookup and the schema read.
+            first in every transaction the store opens - each lookup and the schema read. Keep
+            it below `CookieVerifier`'s `lookup_timeout`.
 
     Raises:
         ConfigurationError: If `sqlalchemy` is not installed, if `engine` is not an
             `AsyncEngine`, if either table name is blank or the two are the same, if either
             allow-list is not a sequence of distinct non-blank names, if `statement_timeout` is not
             a positive, finite number of seconds within what Postgres accepts or is set on an
-            engine that is not PostgreSQL, or - from `connect()` or
-            the first lookup - if the schema cannot answer a lookup at all or an allow-list
-            names a column the table does not have.
+            engine that is not PostgreSQL, or - from `connect()` or the first lookup - if the
+            schema cannot answer a lookup at all, if an allow-list names a column the table does
+            not have, or if `statement_timeout` is set on an engine in `AUTOCOMMIT` (from a
+            lookup too, when the engine was switched after `connect()`).
     """
 
     def __init__(

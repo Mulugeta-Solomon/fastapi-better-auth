@@ -10,6 +10,25 @@ notes". The full release notes for each version are on the
 
 ## [Unreleased]
 
+### Added
+
+- **`SqlAlchemySessionStore(statement_timeout=...)`** (#121). Seconds, `None` by default, and
+  PostgreSQL only. When set, every transaction the store opens starts with a transaction-local
+  `statement_timeout`, so the server ends any statement of the store that runs past it. That
+  covers each lookup and the schema read in `connect()`. The setting ends with the store's own
+  transaction, so other statements on the same engine keep their own timeout. For the store's
+  transactions it replaces a role-level or database-level value, even a shorter one. Keep it below
+  `lookup_timeout`. A lookup the server ends is refused as `AuthServiceUnavailable`. An engine in
+  `AUTOCOMMIT` is refused with `ConfigurationError`, because there the setting would end before
+  the lookup runs. Tested on `asyncpg`. `SyncStoreAdapter` has no such option; set the timeout on
+  its role. See [A statement timeout](docs/stores.md#a-statement-timeout).
+
+### Fixed
+
+- **`RedisSessionStore` refuses a deadline too large for a float as `ConfigurationError`.** An int
+  such as `10**400` for `socket_timeout` or `socket_connect_timeout` raised `OverflowError` from
+  the constructor before.
+
 ### Documentation
 
 - The 0.7.0 upgrade notes and [The Redis store](docs/stores.md#the-redis-store) now say what a
