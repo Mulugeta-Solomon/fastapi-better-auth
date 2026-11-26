@@ -123,9 +123,9 @@ and `client` is given.
 | `socket_timeout` | `2.0` | Seconds a client built from `url` waits on one socket operation. |
 | `socket_connect_timeout` | `3.0` | Seconds a client built from `url` waits to connect. |
 
-**A lookup is two `GET`s.** The first reads the session stored under the token. The second reads
-`revoked-sessions-before-<userId>`. Better Auth 1.7.16 and later writes that key when all of a
-user's sessions are revoked, or when the user is banned through the admin plugin. A session
+**A lookup is up to two `GET`s.** The first reads the session stored under the token. The second
+reads `revoked-sessions-before-<userId>`. Better Auth 1.7.16 and later writes that key when all of
+a user's sessions are revoked, or when the user is banned through the admin plugin. A session
 created before the time it holds is a miss, as it is for Better Auth itself, even when the
 session's own key is still in Redis. An earlier Better Auth does not write the key, and nothing
 changes there.
