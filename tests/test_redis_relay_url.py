@@ -44,6 +44,11 @@ HARNESS_URLS = {
         "&health_check_interval=3&max_connections=2&retry_on_timeout=true&client_name=x"
     ),
     "no database at all": "redis://localhost:56379",
+    # redis-py decodes option names too (`parse_qs`): `%64b` is `db`, `socket%5Ftimeout` is
+    # `socket_timeout`. The first must travel, and the second must not.
+    "an encoded db name": "redis://localhost:56379/2?%64b=5",
+    "an encoded password name": "redis://localhost:56379?pass%77ord=s3cret",
+    "an encoded deadline name": "redis://localhost:56379/1?socket%5Ftimeout=0.5",
 }
 
 
