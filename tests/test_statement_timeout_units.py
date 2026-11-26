@@ -15,6 +15,8 @@ is what keeps the bound out of the pool's other checkouts, and no live test can 
 
 from __future__ import annotations
 
+import enum
+
 import pytest
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
@@ -48,6 +50,32 @@ from tests.stores import SETTINGS_STATEMENT
     ],
 )
 def test_seconds_become_whole_milliseconds_rounded_up(seconds: float, expected: int) -> None:
+    assert statement_timeout.milliseconds(seconds) == expected
+
+
+class Seconds(float):
+    """A float with a `repr` of its own, as NumPy's `float64` has (`np.float64(1.1)`)."""
+
+    def __repr__(self) -> str:
+        return f"Seconds({float(self)})"
+
+
+class Whole(enum.IntEnum):
+    """An int with a `repr` of its own: `<Whole.FIVE: 5>`."""
+
+    FIVE = 5
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [(Seconds(1.1), 1100), (Seconds(0.0001), 1), (Whole.FIVE, 5000)],
+    ids=["float-subclass", "float-subclass-below-a-millisecond", "int-subclass"],
+)
+def test_a_number_is_read_by_its_value_not_by_a_repr_of_its_own(
+    seconds: float, expected: int
+) -> None:
+    """The conversion reads the decimal a float was written as, which is the built-in float's
+    `repr`. A subclass may print itself as anything; its value is still the number given."""
     assert statement_timeout.milliseconds(seconds) == expected
 
 
