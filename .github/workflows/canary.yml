@@ -148,13 +148,15 @@ jobs:
       # [sqlalchemy] / [redis] extras: those extras do not exist on releases before 0.2.0, and
       # this leg installs whatever is currently on PyPI. The store conformance module skips
       # itself on a build that publishes no stores, so the leg stays green until 0.2.0 ships.
+      # aiosqlite is for the lane's shared helpers: tests/stores.py imports it, and a live module
+      # that builds on those helpers would otherwise skip itself here instead of running.
       - name: Install the published wheel and the conformance lane's test dependencies
         run: |
           uv venv --python 3.13 "$WHEEL_VENV"
           uv pip install --python "$WHEEL_VENV/bin/python" --refresh \
             --index-url https://pypi.org/simple/ \
             "fastapi-better-auth-bridge[httpx,httpx2]" "pytest>=8" "trio>=0.27" \
-            "sqlalchemy[asyncio]>=2.0" "asyncpg>=0.30" "redis>=5.0.1"
+            "sqlalchemy[asyncio]>=2.0" "asyncpg>=0.30" "redis>=5.0.1" "aiosqlite>=0.20"
       - name: Instrument liveness — the library under test must be the installed wheel
         id: guard
         run: |
