@@ -26,7 +26,7 @@ services:
       retries: 15
 
   redis:
-    image: redis:7.4-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
+    image: redis:8.0-alpine@sha256:5f61955be8ab2ccee9372b84ae4d4da2e2b156f87281e3f218544055e7ee04d4
     ports:
       - "127.0.0.1:${HARNESS_REDIS_PORT:-16379}:6379"
     healthcheck:
