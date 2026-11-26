@@ -1,4 +1,5 @@
-"""The two pieces of `statement_timeout=` that need no server: the conversion, and the statement.
+"""The pieces of `statement_timeout=` that need no server: the conversion, the statement, and the
+two checks that refuse an engine on which the bound would not hold.
 
 **Milliseconds, rounded up.** Postgres takes `statement_timeout` as an int of milliseconds and reads
 zero as no timeout, so seconds are rounded up, never down: below one millisecond is one. The
@@ -17,9 +18,16 @@ from __future__ import annotations
 import pytest
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
+from sqlalchemy.ext.asyncio import create_async_engine
 
+from fastapi_better_auth import ConfigurationError
 from fastapi_better_auth._internal.stores import statement_timeout
-from fastapi_better_auth._internal.stores.sqlalchemy_core import timeout_params, timeout_statement
+from fastapi_better_auth._internal.stores.sqlalchemy_core import (
+    confirmed_bound,
+    refuse_autocommit,
+    timeout_params,
+    timeout_statement,
+)
 from tests.stores import SETTINGS_STATEMENT
 
 
@@ -62,3 +70,38 @@ def test_the_local_flag_is_in_the_text_for_every_postgres_driver() -> None:
 
     assert compiled.startswith("SELECT set_config(")
     assert ", true)" in compiled
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [("0", "default")],
+        [("1500", "user")],
+        [("1500", "database")],
+        [("1500", "client")],
+        [("3000", "session")],
+        [],
+    ],
+    ids=["server-default", "role-equal", "database-equal", "connect-equal", "other-value", "none"],
+)
+def test_only_the_stores_own_value_set_in_this_session_is_a_bound_that_held(
+    rows: list[tuple[str, str]],
+) -> None:
+    """Read back on an engine in AUTOCOMMIT, the setting has ended, and what is read is someone
+    else's - even an equal value, from the role or the database, which would bound the store only
+    until it changed. Only the store's value from `session` is its own."""
+    with pytest.raises(ConfigurationError, match="AUTOCOMMIT"):
+        confirmed_bound(rows, 1500)
+
+
+def test_the_stores_own_value_set_in_this_session_is_a_bound_that_held() -> None:
+    confirmed_bound([("1500", "session")], 1500)
+
+
+def test_an_engine_whose_options_say_autocommit_is_refused() -> None:
+    """No connection is opened: the engine's options are read."""
+    engine = create_async_engine("postgresql+asyncpg://bridge@db-host.invalid/app")
+
+    refuse_autocommit(engine)
+    with pytest.raises(ConfigurationError, match="AUTOCOMMIT"):
+        refuse_autocommit(engine.execution_options(isolation_level="AUTOCOMMIT"))

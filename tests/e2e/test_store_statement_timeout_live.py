@@ -56,7 +56,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from fastapi_better_auth import AuthServiceUnavailable, ConfigurationError, SessionError
 
 from .conftest import PASSWORD, POSTGRES_URL, raw_token, sign_in, sign_out, sign_up
-from .roles import READ_BOTH, engine_as, login_granted
+from .roles import READ_BOTH, as_superuser, engine_as, login_granted
 
 try:
     # Post-0.1.0 names belong under the guard: the published-wheel lane must skip, not raise.
@@ -530,3 +530,29 @@ async def test_an_engine_switched_to_autocommit_after_connect_is_refused_at_the_
     await every_call_ended(store)
 
     assert lookups_sent(log, schema) == []
+
+
+@pytest.mark.anyio
+async def test_autocommit_is_refused_even_where_the_roles_own_value_is_the_same(
+    harness: str,
+) -> None:
+    """The role's own `statement_timeout` equals the store's, so on an engine in AUTOCOMMIT the
+    value read back is the same number. It came from the role, not from the store's statement,
+    and would bound the store only until somebody changed the role: still refused."""
+    async with login_granted(READ_BOTH) as login:
+        await as_superuser(
+            f"ALTER ROLE \"{login.name}\" SET statement_timeout = '{int(BOUND * 1000)}ms'",
+            step="giving the role its own statement_timeout",
+        )
+        engine = create_async_engine(login.url, isolation_level=AUTOCOMMIT)
+        try:
+            async with engine.connect() as connection:
+                roles_own = str(await connection.scalar(text(SERVER_VALUE)))
+            store = SqlAlchemySessionStore(engine=engine, statement_timeout=BOUND)
+            with pytest.raises(ConfigurationError, match=AUTOCOMMIT):
+                await store.connect()
+            await every_call_ended(store)
+        finally:
+            await engine.dispose()
+
+    assert roles_own == f"{int(BOUND * 1000)}ms", "the role's own value did not take"
