@@ -360,7 +360,9 @@ async def test_connect_is_bounded_and_raises_what_it_raises_for_any_database_err
         await lock.execute(text(f"LOCK TABLE {schema}.session IN ACCESS EXCLUSIVE MODE"))
         by_hand = await cancelled_by_hand(unbounded, observer, application_name)
         started = time.monotonic()
-        with pytest.raises(DBAPIError) as by_the_bound:
+        # The guard only ever runs out red: a schema read with no bound would wait on the lock
+        # this block holds, for good.
+        with pytest.raises(DBAPIError) as by_the_bound, anyio.fail_after(CLIENT_SIDE):
             await bounded.connect()
         took = time.monotonic() - started
         await lock.rollback()
