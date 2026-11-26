@@ -10,7 +10,10 @@ notes". The full release notes for each version are on the
 
 ## [Unreleased]
 
-Nothing yet.
+### Documentation
+
+- The 0.7.0 upgrade notes and [The Redis store](docs/stores.md#the-redis-store) now say what a
+  Redis ACL must allow for the store's revocation read. Nothing in the library changed.
 
 ## [0.7.0] - 2026-11-26
 
@@ -50,6 +53,10 @@ Nothing yet.
   `revoked-sessions-before-<userId>` and refuses a session created before the time it holds. An
   accepted session now costs two `GET`s, not one. If that key holds anything but a whole number
   of milliseconds, every session of that user is refused until the key is corrected or expires.
+  The key is read under the same `key_prefix`, so a Redis ACL that allows `GET` on the whole
+  prefix already covers it. The second `GET` is sent only when the first found a session the
+  store could read; a miss stops before it. If the Redis user may not read the key, such a
+  request is refused as `AuthServiceUnavailable` and a `WARNING` is logged.
   See [The Redis store](docs/stores.md#the-redis-store).
 - **A `RedisSessionStore` built from `url=` has socket deadlines:** 3 seconds to connect and 2
   seconds for each socket operation. Before, it waited for as long as Redis did. Change them

@@ -50,6 +50,7 @@ import anyio
 import pytest
 
 from .conftest import REDIS_URL
+from .redis_relay_url import relay_url
 from .relay import StallingRelay
 
 try:
@@ -234,9 +235,8 @@ async def relay() -> AsyncIterator[StallingRelay]:
 
 @pytest.fixture
 async def store(relay: StallingRelay, scenario: Scenario) -> AsyncIterator[RedisSessionStore]:
-    database = urllib.parse.urlsplit(REDIS_URL).path or "/0"
     async with RedisSessionStore(
-        url=f"redis://127.0.0.1:{relay.port}{database}",
+        url=relay_url(REDIS_URL, relay.port),
         key_prefix=scenario.prefix,
         socket_timeout=REDIS_DEADLINE,
         socket_connect_timeout=REDIS_DEADLINE,

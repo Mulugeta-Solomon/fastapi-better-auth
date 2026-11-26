@@ -123,12 +123,19 @@ and `client` is given.
 | `socket_timeout` | `2.0` | Seconds a client built from `url` waits on one socket operation. |
 | `socket_connect_timeout` | `3.0` | Seconds a client built from `url` waits to connect. |
 
-**A lookup is two `GET`s.** The first reads the session stored under the token. The second reads
-`revoked-sessions-before-<userId>`. Better Auth 1.7.16 and later writes that key when all of a
-user's sessions are revoked, or when the user is banned through the admin plugin. A session
+**A lookup is up to two `GET`s.** The first reads the session stored under the token. The second
+reads `revoked-sessions-before-<userId>`. Better Auth 1.7.16 and later writes that key when all of
+a user's sessions are revoked, or when the user is banned through the admin plugin. A session
 created before the time it holds is a miss, as it is for Better Auth itself, even when the
 session's own key is still in Redis. An earlier Better Auth does not write the key, and nothing
 changes there.
+
+**A Redis ACL must let the store read that key too.** Its full name is
+`<key_prefix>revoked-sessions-before-<userId>`, so an ACL that allows `GET` on the whole prefix
+already covers it. The second `GET` is sent only when the first found a session the store could
+read; a miss stops before it. If the Redis user may not read the key, the store raises redis-py's
+error for that lookup. `CookieVerifier` then refuses the request as `AuthServiceUnavailable`, the
+uniform `401`. It logs one `WARNING`, and no more until a lookup completes.
 
 **A revocation the store cannot read is still a revocation.** If the key holds anything but a
 whole number of milliseconds, or the session has no readable `createdAt` while the key exists,
