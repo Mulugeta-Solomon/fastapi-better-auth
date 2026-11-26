@@ -325,7 +325,7 @@ class SqlAlchemySessionStore(_CoreStore):
     async def _inspected(self) -> Discovered:
         connection = await self._engine.connect()
         try:
-            await self._bounded(connection)
+            await self._bounded(connection, confirm=True)
             return await connection.run_sync(self._reflected)
         finally:
             await _returned(connection)
@@ -349,17 +349,24 @@ class SqlAlchemySessionStore(_CoreStore):
         finally:
             await _returned(connection)
 
-    async def _bounded(self, connection: AsyncConnection) -> None:
+    async def _bounded(self, connection: AsyncConnection, *, confirm: bool = False) -> None:
         """Open the transaction with the store's bound, when it has one; else send nothing.
 
         The first statement of every transaction the store opens, so every statement after it is
-        bounded, and transaction-local, so it ends with the `ROLLBACK` `_returned` sends.
+        bounded, and transaction-local, so it ends with the `ROLLBACK` `_returned` sends. On an
+        engine in `AUTOCOMMIT` it would end with itself, so that engine is refused: from its
+        options before every transaction, and - for discovery, which every lookup waits on - by
+        reading the setting back in the same transaction, which also sees an engine built so.
         """
         if self._timeout is None:
             return
+        self._sql.refuse_autocommit(self._engine)
         await connection.execute(
             self._sql.timeout_statement(), self._sql.timeout_params(self._timeout)
         )
+        if confirm:
+            found = await connection.execute(self._sql.readback_statement())
+            self._sql.confirmed_bound(found.all(), self._timeout)
 
 
 async def _returned(connection: AsyncConnection) -> None:

@@ -62,6 +62,9 @@ from .sql_ids import INT64_RANGE, IdKind, IntegerRange, bind_id, read_id
 from .sql_widths import integer_range
 from .sqlalchemy_bound import (
     bounded_engine,
+    confirmed_bound,
+    readback_statement,
+    refuse_autocommit,
     timeout_params,
     timeout_statement,
 )
@@ -73,6 +76,9 @@ from .upstream import as_db_flag, as_moment, as_text
 __all__ = [
     "SQLAlchemyError",
     "bounded_engine",
+    "confirmed_bound",
+    "readback_statement",
+    "refuse_autocommit",
     "timeout_params",
     "timeout_statement",
 ]
