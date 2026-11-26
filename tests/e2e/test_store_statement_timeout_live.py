@@ -514,17 +514,20 @@ async def test_an_engine_in_autocommit_is_refused_before_any_lookup(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("spelling", [AUTOCOMMIT, "autocommit"])
 async def test_an_engine_switched_to_autocommit_after_connect_is_refused_at_the_lookup(
-    engine: AsyncEngine, schema: str
+    spelling: str, engine: AsyncEngine, schema: str
 ) -> None:
     """Discovery read the bound back on a transaction; the engine was changed in place since.
-    The next lookup refuses rather than run without the bound."""
+    The next lookup refuses rather than run without the bound. In lower case too: SQLAlchemy
+    takes the level in any case and keeps the spelling it was given, and nothing after
+    discovery reads the setting back."""
     store = SqlAlchemySessionStore(engine=engine, schema=schema, statement_timeout=BOUND)
     await store.connect()
     log = StatementLog()
     log.attach(engine)
 
-    engine.sync_engine.update_execution_options(isolation_level=AUTOCOMMIT)
+    engine.sync_engine.update_execution_options(isolation_level=spelling)
     with pytest.raises(ConfigurationError, match=AUTOCOMMIT):
         await store.fetch_session_by_token(FORGED_TOKEN)
     await every_call_ended(store)

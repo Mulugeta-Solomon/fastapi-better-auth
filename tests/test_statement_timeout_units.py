@@ -98,10 +98,20 @@ def test_the_stores_own_value_set_in_this_session_is_a_bound_that_held() -> None
     confirmed_bound([("1500", "session")], 1500)
 
 
-def test_an_engine_whose_options_say_autocommit_is_refused() -> None:
-    """No connection is opened: the engine's options are read."""
+@pytest.mark.parametrize("spelling", ["AUTOCOMMIT", "autocommit", "AutoCommit"])
+def test_an_engine_whose_options_say_autocommit_is_refused(spelling: str) -> None:
+    """No connection is opened: the engine's options are read. SQLAlchemy takes the level in any
+    case and keeps it as it was written, so the check cannot depend on the spelling."""
     engine = create_async_engine("postgresql+asyncpg://bridge@db-host.invalid/app")
 
     refuse_autocommit(engine)
     with pytest.raises(ConfigurationError, match="AUTOCOMMIT"):
-        refuse_autocommit(engine.execution_options(isolation_level="AUTOCOMMIT"))
+        refuse_autocommit(engine.execution_options(isolation_level=spelling))
+
+
+@pytest.mark.parametrize("level", ["READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"])
+def test_an_isolation_level_that_keeps_a_transaction_is_not_refused(level: str) -> None:
+    """Only `AUTOCOMMIT` runs without a transaction; the bound holds under every other level."""
+    engine = create_async_engine("postgresql+asyncpg://bridge@db-host.invalid/app")
+
+    refuse_autocommit(engine.execution_options(isolation_level=level))
