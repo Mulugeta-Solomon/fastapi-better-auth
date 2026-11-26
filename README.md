@@ -36,6 +36,7 @@ they cannot be combined. The full comparison is in
 ## Install
 
 The distribution is `fastapi-better-auth-bridge`; the import is `fastapi_better_auth`.
+`fastapi-betterauth` on PyPI is a different library by another author.
 
 ```bash
 pip install "fastapi-better-auth-bridge[httpx]"   # or: uv add "fastapi-better-auth-bridge[httpx]"
