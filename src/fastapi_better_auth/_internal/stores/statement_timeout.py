@@ -40,9 +40,12 @@ def milliseconds(seconds: float) -> int:
     """`seconds` as whole milliseconds, rounded up, read as the decimal it was written as.
 
     `repr` of a float is the shortest decimal that reads back as the same float, so `Decimal`
-    of it is the number the caller wrote. An int is exact already.
+    of it is the number the caller wrote. An int is exact already. The built-in types are asked,
+    never the value's own class: a subclass may print itself as anything (NumPy's `float64`, an
+    `IntEnum`), and its value is still the number given.
     """
-    return math.ceil(Decimal(repr(seconds)) * MILLISECONDS_PER_SECOND)
+    written = int(seconds) if isinstance(seconds, int) else float.__repr__(float(seconds))
+    return math.ceil(Decimal(written) * MILLISECONDS_PER_SECOND)
 
 
 def validated_statement_timeout(seconds: object) -> int | None:
