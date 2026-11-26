@@ -17,6 +17,7 @@ import os
 import time
 from collections.abc import AsyncIterator, Callable
 
+import anyio
 import pytest
 
 from tests.e2e.relay import CHUNK_BYTES, StallingRelay
@@ -234,11 +235,49 @@ async def test_a_hang_up_while_stalled_reaches_the_server_after_what_was_held(ri
     await until(lambda: rig.relay.holds(NEEDLE), "holds() finding the needle across two reads")
 
     await client.close()
+    await until(lambda: rig.relay.ended == 1, "the relay reading the hang-up while stalled")
     rig.relay.resume()
 
     await until(lambda: rig.upstream.ended[0], "the hang-up reaching the server")
     assert rig.upstream.got(0) == NEEDLE
     assert rig.relay.held == 0
+
+
+@pytest.mark.anyio
+async def test_a_server_hang_up_while_stalled_reaches_the_client_after_what_was_held(
+    rig: Rig,
+) -> None:
+    client = await rig.connect()
+    rig.relay.stall()
+    server_side = rig.upstream.writers[0]
+    server_side.write(NEEDLE)
+    await server_side.drain()
+    await until(lambda: rig.relay.held == 1, "the relay holding the server's bytes")
+
+    server_side.close()
+    await until(lambda: rig.relay.ended == 1, "the relay reading the server's hang-up")
+    rig.relay.resume()
+
+    with anyio.fail_after(BACKSTOP):
+        assert await client.reader.read() == NEEDLE
+    assert rig.relay.held == 0
+
+
+@pytest.mark.anyio
+async def test_bytes_a_resume_passed_on_still_begin_a_needle(rig: Rig) -> None:
+    """Resumed, the relay remembers what it passed on, as it does for bytes never held."""
+    client = await rig.connect()
+    rig.relay.stall()
+    await client.send(FIRST)
+    await until(lambda: rig.relay.holds(FIRST), "the relay holding the first part")
+    rig.relay.resume()
+    await until(lambda: rig.upstream.got(0) == FIRST, "the first part passing")
+
+    rig.relay.stall()
+    await client.send(SECOND)
+    await until(lambda: rig.relay.held == 1, "the relay holding the second part")
+
+    assert rig.relay.holds(NEEDLE)
 
 
 @pytest.mark.parametrize("needle", [b"", b"x" * (CHUNK_BYTES + 2)], ids=["empty", "too long"])

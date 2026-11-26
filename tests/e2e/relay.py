@@ -13,9 +13,10 @@ into reads. A hang-up or a reset read from a side is held behind that side's byt
 only once they have been passed on.
 
 What is held right now can be asked, by a condition rather than a timer: `holds()` says whether
-a client is being kept from sending some bytes, and `held` counts every chunk held either way.
-That is how a test knows that a command reached the relay and went no further - or, once
-resumed, that everything held has been passed on.
+a client is being kept from sending some bytes, `held` counts every chunk held either way, and
+`ended` counts the sides whose hang-up or reset has been read and not yet passed on. That is how a
+test knows that a command reached the relay and went no further, that a side hung up while
+stalled, or, once resumed, that everything held has been passed on.
 
 A connection the client gave up on while the relay was stalled stays open on the relay's side
 until it resumes, as it would in a kernel's backlog, so how many connections the relay holds says
@@ -98,6 +99,13 @@ class StallingRelay:
         """How many chunks, either way, are read and not yet passed on. A chunk is one read, so
         a side that sent more while stalled can account for several; 0 means nothing is held."""
         return sum(len(stream.held) for stream in self._streams)
+
+    @property
+    def ended(self) -> int:
+        """How many sides, either way, have hung up or reset, read by the relay, with that end not
+        yet passed on. While stalled an end waits behind the side's held bytes, so this stays up
+        until a resume has passed them on; while forwarding it is passed on at once."""
+        return sum(stream.ended for stream in self._streams)
 
     def holds(self, needle: bytes) -> bool:
         """Whether a client is being kept from sending `needle` right now.
