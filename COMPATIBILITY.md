@@ -16,12 +16,12 @@ posture asserted in only one direction is not asserted at all.
 | 1.7.1 with `secondaryStorage` (Redis) | conformance, gating | every pull request, and every push to `main` | — (HEAD only) |
 | 1.7.1 with `bearer({ requireSignature: true })` | conformance (strict posture), gating | every pull request, and every push to `main` | — (HEAD only) |
 | 1.7.1 with `rateLimit: { enabled: true, customRules: { "/get-session": { window: 10, max: 3 } } }` | conformance (throttled posture), gating | every pull request, and every push to `main` | — (HEAD only) |
-| 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408) |
-| 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408) |
-| 1.7.5 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408) |
-| 1.7.6 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-09-25 (run 36109363408) |
-| 1.7.28 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-11-25 (run 45535204980), as `latest` |
-| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.6.0 on 2026-11-25 (run 45535204980), `latest` = 1.7.28 that day |
+| 1.6.30 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.7.0 on 2026-11-26 (run 45751103010) |
+| 1.7.1 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.7.0 on 2026-11-26 (run 45751103010) |
+| 1.7.5 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.7.0 on 2026-11-26 (run 45751103010) |
+| 1.7.6 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.7.0 on 2026-11-26 (run 45751103010) |
+| 1.7.28 | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.7.0 on 2026-11-26 (run 45751103010) |
+| `latest` | conformance, canary (HEAD + published wheel) | weekly, and when better-auth publishes | 0.7.0 on 2026-11-26 (run 45751103010), `latest` = 1.7.28 that day |
 
 That list is readable from a running application as `fastapi_better_auth.VERIFIED_BETTER_AUTH` — the
 canary matrix without its `latest` entry, which is a dist-tag rather than a version — and
