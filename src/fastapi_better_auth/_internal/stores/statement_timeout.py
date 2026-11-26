@@ -5,7 +5,7 @@ The option is seconds, like every other deadline in this library. Postgres takes
 conversion rounds up, never down: a value below one millisecond is one, not the zero that would
 leave every statement unbounded while its operator believes otherwise. And it reads the value as
 the decimal it was written as, so binary float error cannot move it by a millisecond:
-`1.1 * 1000` is `1100.0000000000002` as a float, and `1.1` seconds is still 1100 ms.
+`16.1 * 1000` is `16100.000000000002` as a float, and `16.1` seconds is still 16100 ms.
 
 A value the server would refuse is refused here instead, when the store is built: above
 `MAX_MILLISECONDS` once rounded, Postgres answers `SET` with an error, and every lookup would be
