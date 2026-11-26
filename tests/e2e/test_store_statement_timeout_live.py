@@ -556,3 +556,73 @@ async def test_autocommit_is_refused_even_where_the_roles_own_value_is_the_same(
             await engine.dispose()
 
     assert roles_own == f"{int(BOUND * 1000)}ms", "the role's own value did not take"
+
+
+# ---------------------------------------------------------------- what the option sends
+
+
+class Counted:
+    """The statements one store sends through `log`, step by step: discovery, then each lookup."""
+
+    def __init__(self, log: StatementLog) -> None:
+        self.log = log
+        self.steps: list[int] = []
+        self._seen = 0
+
+    def step(self) -> None:
+        self.steps.append(len(self.log.statements) - self._seen)
+        self._seen = len(self.log.statements)
+
+
+async def drive(engine: AsyncEngine, schema: str, **options: Any) -> Counted:
+    """Discovery, a lookup by token and one by user id, counted from the engine's own events."""
+    log = StatementLog()
+    log.attach(engine)
+    counted = Counted(log)
+    store = SqlAlchemySessionStore(engine=engine, schema=schema, **options)
+    try:
+        await store.connect()
+        counted.step()
+        await store.fetch_session_by_token(FORGED_TOKEN)
+        counted.step()
+        await store.fetch_user_by_id("nobody")
+        counted.step()
+        await every_call_ended(store)
+    finally:
+        log.detach(engine)
+    return counted
+
+
+def without_the_bound(log: StatementLog) -> list[tuple[str, Any]]:
+    """`log` less the settings statement and its readback: what the store reads."""
+    return [
+        (statement, parameters)
+        for statement, parameters in zip(log.statements, log.parameters, strict=True)
+        if statement not in log.settings and "pg_settings" not in statement
+    ]
+
+
+@pytest.mark.anyio
+async def test_the_bound_adds_its_statements_and_nothing_else(
+    engine: AsyncEngine, schema: str
+) -> None:
+    """Counted on a warmed engine, so SQLAlchemy's own first-connect statements are not in it.
+    Unset: discovery's reads, then one statement per lookup. Set: discovery also sends the
+    settings statement and its readback, each lookup sends the settings statement first, and
+    everything else is byte for byte what the unset store sent. Both stores pass the read-only
+    invariant, the set one only for its own settings statement at its own value."""
+    async with engine.connect():
+        pass
+    unset = await drive(engine, schema)
+    bounded = await drive(engine, schema, statement_timeout=BOUND)
+    discovery_unset, *lookups_unset = unset.steps
+    discovery_bounded, *lookups_bounded = bounded.steps
+
+    assert lookups_unset == [1, 1]
+    assert lookups_bounded == [2, 2]
+    assert discovery_bounded == discovery_unset + 2
+    assert unset.log.settings == []
+    assert len(bounded.log.settings) == 3
+    assert without_the_bound(bounded.log) == without_the_bound(unset.log)
+    assert writes_emitted(unset.log) == []
+    assert writes_emitted(bounded.log, int(BOUND * 1000)) == []

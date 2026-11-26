@@ -257,8 +257,10 @@ class StatementLog:
         self.threads: list[int] = []
 
     def attach(self, engine: Engine | AsyncEngine) -> None:
-        target = engine.sync_engine if isinstance(engine, AsyncEngine) else engine
-        event.listen(target, "before_cursor_execute", self._record)
+        event.listen(_sync(engine), "before_cursor_execute", self._record)
+
+    def detach(self, engine: Engine | AsyncEngine) -> None:
+        event.remove(_sync(engine), "before_cursor_execute", self._record)
 
     def _record(
         self,
@@ -291,6 +293,10 @@ class StatementLog:
             for line in self.statements
             if line.lstrip().upper().startswith("SELECT") and not _sets_config(line)
         ]
+
+
+def _sync(engine: Engine | AsyncEngine) -> Engine:
+    return engine.sync_engine if isinstance(engine, AsyncEngine) else engine
 
 
 def writes_emitted(log: StatementLog, milliseconds: int | None = None) -> list[str]:
