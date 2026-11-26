@@ -22,6 +22,12 @@ here proves one half of that against the harness Postgres:
   error, and the store reads the schema again on the next try.
 - **Least privilege.** A role holding `SELECT` on the two tables and nothing else sets the bound
   and reads a real session: `set_config` on `statement_timeout` needs no grant.
+- **No transaction, no bound.** A transaction-local setting ends with the statement that made it
+  when the engine runs in `AUTOCOMMIT`, so every lookup would run unbounded. The store refuses
+  such an engine with a `ConfigurationError` before any lookup reaches the database, whether the
+  engine was built that way, is a copy made with `execution_options`, or was switched after
+  `connect()`. This is also where the local flag shows: a session-level `set_config` would hold
+  on such an engine, pass the store's own check, and stay on the pool's connections.
 
 The locked tables are copies in a schema of this module's own, so the auth server and every other
 lane keep reading theirs. No case sleeps to synchronise: each waits for the condition it needs,
@@ -47,7 +53,7 @@ from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from fastapi_better_auth import AuthServiceUnavailable, SessionError
+from fastapi_better_auth import AuthServiceUnavailable, ConfigurationError, SessionError
 
 from .conftest import PASSWORD, POSTGRES_URL, raw_token, sign_in, sign_out, sign_up
 from .roles import READ_BOTH, engine_as, login_granted
@@ -454,3 +460,73 @@ async def test_select_on_both_tables_is_all_the_bound_needs(
     assert user.id == user_id
     assert len(log.settings) == 3, "one per transaction: discovery and two lookups"
     assert writes_emitted(log, int(BOUND * 1000)) == []
+
+
+# ---------------------------------------------------------------- an engine without a transaction
+
+AUTOCOMMIT = "AUTOCOMMIT"
+
+
+def autocommit_engine(how: str, application_name: str) -> AsyncEngine:
+    """An engine that runs every statement in a transaction of its own: built so, or lent so."""
+    options: dict[str, Any] = {
+        "pool_size": POOL_SIZE,
+        "max_overflow": 0,
+        "connect_args": {"server_settings": {"application_name": application_name}},
+    }
+    if how == "built":
+        return create_async_engine(POSTGRES_URL, isolation_level=AUTOCOMMIT, **options)
+    return create_async_engine(POSTGRES_URL, **options).execution_options(
+        isolation_level=AUTOCOMMIT
+    )
+
+
+def lookups_sent(log: StatementLog, schema: str) -> list[str]:
+    """The statements that read the session or user table itself: lookups, not discovery."""
+    return [statement for statement in log.statements if f"FROM {schema}." in statement]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("how", ["built", "lent-copy"])
+async def test_an_engine_in_autocommit_is_refused_before_any_lookup(
+    how: str, observer: AsyncEngine, schema: str, application_name: str
+) -> None:
+    """`connect()` and the lookup both refuse, as configuration, and neither sends a lookup.
+    Afterwards the pool's connections carry the server's own value, as they would not had the
+    store's setting been session-level."""
+    engine = autocommit_engine(how, application_name)
+    log = StatementLog()
+    log.attach(engine)
+    store = SqlAlchemySessionStore(engine=engine, schema=schema, statement_timeout=BOUND)
+    try:
+        with pytest.raises(ConfigurationError, match=AUTOCOMMIT) as refused:
+            await store.connect()
+        with pytest.raises(ConfigurationError, match=AUTOCOMMIT):
+            await store.fetch_session_by_token(FORGED_TOKEN)
+        await every_call_ended(store)
+        readings = await every_connection_reads(engine)
+    finally:
+        await engine.dispose()
+
+    assert "statement_timeout" in str(refused.value)
+    assert lookups_sent(log, schema) == []
+    assert readings == [await server_value(observer)] * POOL_SIZE
+
+
+@pytest.mark.anyio
+async def test_an_engine_switched_to_autocommit_after_connect_is_refused_at_the_lookup(
+    engine: AsyncEngine, schema: str
+) -> None:
+    """Discovery read the bound back on a transaction; the engine was changed in place since.
+    The next lookup refuses rather than run without the bound."""
+    store = SqlAlchemySessionStore(engine=engine, schema=schema, statement_timeout=BOUND)
+    await store.connect()
+    log = StatementLog()
+    log.attach(engine)
+
+    engine.sync_engine.update_execution_options(isolation_level=AUTOCOMMIT)
+    with pytest.raises(ConfigurationError, match=AUTOCOMMIT):
+        await store.fetch_session_by_token(FORGED_TOKEN)
+    await every_call_ended(store)
+
+    assert lookups_sent(log, schema) == []
