@@ -107,7 +107,8 @@ Nothing yet.
   or later with `secondaryStorage`, "revoke all sessions" and an admin ban refuse every session
   created before them, even one whose key is still in Redis. The store read only the session's
   own key, so it still accepted such a session. It now reads the revocation key as well.
-  Releases 0.2.0 to 0.6.0 are affected. Upgrade if you use `RedisSessionStore`.
+  Releases 0.2.0 to 0.6.0 are affected. Upgrade if you use `RedisSessionStore`. Advisory:
+  [GHSA-j42v-2755-f6vc](https://github.com/Mulugeta-Solomon/fastapi-better-auth/security/advisories/GHSA-j42v-2755-f6vc).
 - `RedisSessionStore`: when a Redis read fails, the store's own stack frames no longer hold the
   token, the key or the stored session.
 - PyJWT floor raised to 2.15.0, so no release before PyJWT's 2.14.0 security release can be
