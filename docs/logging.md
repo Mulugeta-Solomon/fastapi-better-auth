@@ -39,7 +39,7 @@ header, headers that are not text): that one is logged at `ERROR` with its class
 broke, never its headers or its `detail`, and answered as the uniform `403`.
 None of these lines carries a raw token, a cookie value or a signature.
 
-One more line at `WARNING`, and the frequency of two lines named above:
+More lines at `WARNING`, and how often some of the lines named above are logged:
 
 - **Mode C readiness probe answered a temporary status** (`408`, `425`, `429` or any `5xx`). Once
   per `RemoteVerifier`, naming the status and its class and never the body. Every request is
@@ -51,6 +51,9 @@ One more line at `WARNING`, and the frequency of two lines named above:
 - **Mode A store lookups that passed `lookup_timeout`.** The kind is `LookupDeadlineExceeded`, with
   no SQLSTATE. It follows the once-per-kind rule above: one line, then nothing until a lookup
   completes. A lookup cancelled with its request logs nothing.
+- **Redis store: a revocation key it cannot read.** One line for each lookup it refuses for that
+  reason, with a fingerprint of the session's key. A session that was revoked logs nothing. See
+  [The Redis store](stores.md#the-redis-store).
 
 A `now=` clock that raises, or returns anything but an aware `datetime`, is an exception that
 escaped a verifier: the request is the uniform `401`, and the exception is logged at `ERROR` with

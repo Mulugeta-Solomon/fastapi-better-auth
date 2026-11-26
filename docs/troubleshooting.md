@@ -96,9 +96,29 @@ carries the token.
 
 ## SQL store: every request is `401`, and ids are integers or uuids
 
-Release 0.6.0 reads only text ids. With `advanced.database.generateId: "serial"` or `"uuid"`, every
-valid session read as unusable. This is fixed on `main` and not yet released; see the
-[changelog](../CHANGELOG.md) and [Session stores](stores.md#integer-and-uuid-ids).
+Releases up to 0.6.0 read only text ids. With `advanced.database.generateId: "serial"` or
+`"uuid"`, every valid session read as unusable. Release 0.7.0 reads them: upgrade, and see
+[Session stores](stores.md#integer-and-uuid-ids).
+
+## Redis store: a signed-in user is `401` after "revoke all sessions" or a ban
+
+That is the revocation working. On Better Auth 1.7.16 or later, both write a revocation time for
+the user, and every session created before it is refused, by Better Auth and by the store. After
+"revoke all sessions" the user signs in again and gets a new session. See
+[The Redis store](stores.md#the-redis-store).
+
+## Redis store: a `WARNING` that a stored watermark is unusable
+
+The key `revoked-sessions-before-<userId>` holds something other than digits. Better Auth writes
+only a whole number of milliseconds there, so something else wrote the key. Every session of that
+user is refused until the key is corrected or expires. See
+[The Redis store](stores.md#the-redis-store).
+
+## Redis store: `ConfigurationError` about `socket_timeout` or `socket_connect_timeout`
+
+A deadline must be a positive, finite number of seconds, whether it is passed as an argument or
+written in the URL's query string. With `client=`, neither argument may be changed: set the
+deadlines on your own client.
 
 ## A field of my user model is always `None`
 

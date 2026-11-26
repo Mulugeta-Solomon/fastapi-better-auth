@@ -36,7 +36,10 @@ written straight into the database is still caught here, in Mode A on SQL and in
 **not** caught when Better Auth runs with `secondaryStorage` and the ban is written straight to the
 database: the session document in Redis was written before the ban and still says `banned: false`,
 and that document is what both Mode A and Mode C read there. On that topology, ban through the
-admin route — it deletes the sessions, and then every mode sees a sign-out.
+admin route, which deletes the user's sessions. A session key that the delete misses still says
+`banned: false`. On Better Auth 1.7.16 or later the ban also writes a revocation time, and both
+Better Auth and Mode A's Redis store refuse a session created before it. On an earlier Better Auth
+nothing refuses such a session, so run 1.7.16 or later with `secondaryStorage`.
 
 **Picking one.** If FastAPI can share the database or Redis your Node service writes sessions to,
 Mode A is the cheapest instant revocation. If it can only reach that service over the network, that

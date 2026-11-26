@@ -108,6 +108,42 @@ required column that is missing stops the application at startup instead of fail
 request with a `ConfigurationError`. Without it, the first lookup does the same work, inside its
 request's `lookup_timeout`.
 
+## The Redis store
+
+`RedisSessionStore` is for a Better Auth server that runs with `secondaryStorage`. It needs the
+`[redis]` extra, or a client of your own. Every parameter is keyword-only, and exactly one of `url`
+and `client` is given.
+
+| Name | Default | Meaning |
+|---|---|---|
+| `url` | `None` | A Redis URL. The store builds a client from it and closes that client in `aclose()`. |
+| `client` | `None` | Your own `redis.asyncio.Redis`. The store never changes it and never closes it. |
+| `key_prefix` | `""` | Put in front of every key the store reads. Better Auth itself uses none. |
+| `max_bytes` | `65536` | The largest stored value the store parses. A larger one is a miss, with a `WARNING`. |
+| `socket_timeout` | `2.0` | Seconds a client built from `url` waits on one socket operation. |
+| `socket_connect_timeout` | `3.0` | Seconds a client built from `url` waits to connect. |
+
+**A lookup is two `GET`s.** The first reads the session stored under the token. The second reads
+`revoked-sessions-before-<userId>`. Better Auth 1.7.16 and later writes that key when all of a
+user's sessions are revoked, or when the user is banned through the admin plugin. A session
+created before the time it holds is a miss, as it is for Better Auth itself, even when the
+session's own key is still in Redis. An earlier Better Auth does not write the key, and nothing
+changes there.
+
+**A revocation the store cannot read is still a revocation.** If the key holds anything but a
+whole number of milliseconds, or the session has no readable `createdAt` while the key exists,
+the lookup is a miss and a `WARNING` is logged. Better Auth's own comparison lets such a session
+through. This store does not, so a wrong value in that key refuses every session of that user
+until the key is corrected or expires.
+
+**The two deadlines apply to a client built from `url`.** An option of the same name in the URL's
+query string, such as `?socket_timeout=5`, wins over the argument. Either way the value must be a
+positive, finite number of seconds, or the store raises `ConfigurationError` when it is built.
+With `client=`, set the deadlines on your own client: either argument with a value other than its
+default raises `ConfigurationError`. A deadline covers one socket operation, so a Redis that has
+stopped answering can cost one lookup a few multiples of it. `lookup_timeout` bounds the request
+as a whole.
+
 ## When the database does not answer
 
 `CookieVerifier` gives one request's store lookups `lookup_timeout` seconds together, 5 by default.
@@ -115,7 +151,7 @@ A request that runs out is refused as `AuthServiceUnavailable`, the uniform `401
 the kind `LookupDeadlineExceeded` is logged, and not again until a lookup completes. A lookup is
 also cancelled when its request is cancelled, as a server may do when the client has gone.
 
-What happens to the statement that was running depends on the store:
+What happens to the call that was running depends on the store:
 
 - **`SqlAlchemySessionStore`** cancels its database call once and returns to the request at once.
   SQLAlchemy and the driver then cancel the statement on the server and close that connection, and
@@ -129,6 +165,9 @@ What happens to the statement that was running depends on the store:
   its connection stay taken until the database answers or the driver gives up. The adapter never
   runs more threads than `max_concurrency`. Further lookups wait without starting a thread, and are
   refused at their own deadline.
+- **`RedisSessionStore`** cancels the `GET` it was waiting for. A reply that arrives afterwards is
+  never read by a later lookup, because redis-py closes the connection of a cancelled command.
+  `tests/e2e/test_redis_cut_reply_live.py` proves that against a live Redis.
 
 Set these in the database and the driver, for either store:
 

@@ -121,8 +121,12 @@ a `crit` header at all, because Better Auth never emits one and no extension is 
   is handed. When Better Auth runs with `secondaryStorage`, that record is the session document
   written to Redis at sign-in, so a ban written straight into the database is invisible to Mode A
   and Mode C alike — the document still says `banned: false` and stays that way until the session
-  ends. The admin plugin's own ban route deletes the user's sessions, which every mode sees at once;
-  that is the path to use. On a SQL topology the record is read live and a database-direct ban is
+  ends. The admin plugin's own ban route deletes the user's sessions; that is the path to use. A
+  session key the delete misses still says `banned: false`. Better Auth 1.7.16 and later also
+  write a revocation time on a ban, and refuse a session created before it; `RedisSessionStore`
+  reads the same key and refuses it too. On an earlier Better Auth nothing refuses such a session,
+  so run 1.7.16 or later with `secondaryStorage` (the Better Auth maintainers' advisory is
+  GHSA-fvxx-76fc-893x). On a SQL topology the record is read live and a database-direct ban is
   caught. Verified live against better-auth 1.7.1 in both topologies for Mode C
   (`tests/e2e/test_remote_live.py`); Mode A reads the same stored document through its stores and has
   not been driven through a database-direct ban live.
