@@ -130,6 +130,12 @@ created before the time it holds is a miss, as it is for Better Auth itself, eve
 session's own key is still in Redis. An earlier Better Auth does not write the key, and nothing
 changes there.
 
+**A Redis ACL must let the store read that key too.** Its full name is
+`<key_prefix>revoked-sessions-before-<userId>`, so an ACL that allows `GET` on the whole prefix
+already covers it. The second `GET` is sent only when the first found a session the store could
+read; a miss stops before it. If the Redis user may not read the key, such a lookup is refused as
+`AuthServiceUnavailable` and a `WARNING` is logged, and not again until a lookup completes.
+
 **A revocation the store cannot read is still a revocation.** If the key holds anything but a
 whole number of milliseconds, or the session has no readable `createdAt` while the key exists,
 the lookup is a miss and a `WARNING` is logged. Better Auth's own comparison lets such a session
