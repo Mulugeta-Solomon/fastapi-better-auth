@@ -257,7 +257,7 @@ async def test_startup_turns_an_unreachable_service_into_a_configuration_error()
     verifier = RemoteVerifier(
         base_url=ORIGIN,
         transport=transport,
-        csrf=CsrfDisabled(reason="startup only"),
+        csrf=CsrfDisabled(reason="the startup lane does not exercise CSRF"),
         secure_cookies=False,
     )
     auth = BetterAuth(verifiers=[verifier], **OPT_IN)

@@ -237,7 +237,7 @@ def test_mode_c_an_unconfirmed_probe_is_503_opted_in() -> None:
     verifier = RemoteVerifier(
         base_url=remote.ORIGIN,
         transport=transport,
-        csrf=CsrfDisabled(reason="probe lane"),
+        csrf=CsrfDisabled(reason="the probe lane does not exercise CSRF"),
         secure_cookies=False,
     )
 
