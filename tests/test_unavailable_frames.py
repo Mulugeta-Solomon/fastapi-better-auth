@@ -7,7 +7,9 @@ same instrument as every other refusal, through the resolver FastAPI itself awai
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
+from types import FrameType
 from typing import Any
 
 import pytest
@@ -196,3 +198,31 @@ async def test_a_leaf_left_alone_is_raised_as_itself_with_the_verifier_s_own_fra
     holders = holding_reachable(error, GROUPED_CREDENTIAL, ignore=[connection])
     assert type(error) is AuthServiceUnavailable
     assert holders == ["test_unavailable_frames.py:verify.credential"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("refusal", "settings"),
+    [(plain, OPT_IN), (foreign, {})],
+    ids=["opt-in-replaces-the-leaf", "default-rebuilds-the-503-form"],
+)
+async def test_after_a_replacement_the_dispatcher_frame_holds_no_refusal_and_no_live_frame(
+    refusal: Callable[[], AuthServiceUnavailable], settings: dict[str, Any]
+) -> None:
+    """What `_verified` keeps once it has raised the replacement, read off its own frame."""
+    error = await refused_with(Regrouping(refusal), request(x_cred=GROUPED_CREDENTIAL), **settings)
+
+    frames: list[FrameType] = []
+    traceback = error.__traceback__
+    while traceback:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    (verified,) = [frame for frame in frames if frame.f_code.co_name == "_verified"]
+    kept: dict[str, Any] = dict(verified.f_locals)
+
+    assert error is kept["failure"]
+    assert kept["credential"] is None
+    others = [value for key, value in kept.items() if key != "failure"]
+    assert not any(isinstance(value, BaseException) for value in others)
+    assert inspect.iscoroutine(kept["answer"])
+    assert kept["answer"].cr_frame is None, "the verifier's coroutine still holds its frame"
