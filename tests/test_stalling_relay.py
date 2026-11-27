@@ -7,6 +7,9 @@ reason that is not the store's. Loopback usually delivers two writes as one read
 here is made by hand: the first part is written, the relay is seen to hold it, and only then is
 the second part written - which the relay can then only read on its own.
 
+`stall_before()` is the store cancellation module's: it stalls on the read that completes a
+needle, so one command is answered and the next is held. The same splits apply to it.
+
 A plain local TCP server stands in for the real one; no harness is needed.
 """
 
@@ -286,3 +289,72 @@ def test_a_needle_it_cannot_answer_for_is_refused(needle: bytes) -> None:
 
     with pytest.raises(ValueError, match="a needle must be"):
         relay.holds(needle)
+    with pytest.raises(ValueError, match="a needle must be"):
+        relay.stall_before(needle)
+
+
+# ---------------------------------------------------------------- a stall that waits for a command
+
+
+@pytest.mark.anyio
+async def test_stall_before_passes_what_comes_first_and_holds_the_needle(rig: Rig) -> None:
+    """The command before the needle reaches the server; the one that carries it does not."""
+    client = await rig.connect()
+    tripped = rig.relay.stall_before(NEEDLE)
+
+    await client.send(OTHER)
+    await until(lambda: rig.upstream.got(0) == OTHER, "the first command passing")
+    await client.send(NEEDLE)
+    with anyio.fail_after(BACKSTOP):
+        await tripped.wait()
+
+    assert rig.relay.holds(NEEDLE)
+    assert rig.upstream.got(0) == OTHER
+
+
+@pytest.mark.anyio
+async def test_stall_before_finds_a_needle_begun_in_bytes_already_passed(rig: Rig) -> None:
+    client = await rig.connect()
+    tripped = rig.relay.stall_before(NEEDLE)
+
+    await client.send(FIRST)
+    await until(lambda: rig.upstream.got(0) == FIRST, "the first part passing")
+    assert not tripped.is_set()
+    await client.send(SECOND)
+    with anyio.fail_after(BACKSTOP):
+        await tripped.wait()
+
+    assert rig.relay.holds(NEEDLE)
+    assert rig.upstream.got(0) == FIRST
+
+
+@pytest.mark.anyio
+async def test_stall_before_trips_once_and_resume_forwards_everything_in_order(rig: Rig) -> None:
+    client = await rig.connect()
+    tripped = rig.relay.stall_before(NEEDLE)
+    await client.send(NEEDLE)
+    with anyio.fail_after(BACKSTOP):
+        await tripped.wait()
+
+    rig.relay.resume()
+    await client.send(NEEDLE)
+
+    expected = NEEDLE + NEEDLE
+    await until(lambda: len(rig.upstream.got(0)) >= len(expected), "every byte passing")
+    assert rig.upstream.got(0) == expected
+    assert rig.relay.held == 0
+
+
+@pytest.mark.anyio
+async def test_stall_before_is_never_tripped_by_the_server(rig: Rig) -> None:
+    client = await rig.connect()
+    tripped = rig.relay.stall_before(NEEDLE)
+    server_side = rig.upstream.writers[0]
+
+    server_side.write(NEEDLE)
+    await server_side.drain()
+    with anyio.fail_after(BACKSTOP):
+        assert await client.reader.readexactly(len(NEEDLE)) == NEEDLE
+
+    assert not tripped.is_set()
+    assert rig.relay.held == 0

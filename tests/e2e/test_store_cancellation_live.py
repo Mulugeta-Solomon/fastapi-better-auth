@@ -13,13 +13,18 @@ more lookups than the pool has connections; after each one, the store's backends
 lock must go back to none and the store's connections must stay within the pool. The waits poll
 for the condition with a generous backstop instead of sleeping for a guess.
 
-The other two cases are a server that stops answering altogether, which no cancel request
+The other cases are a server that stops answering altogether, which no cancel request
 reaches: a relay between the store and Postgres stops forwarding both ways (`relay.py`). At the
 shipped bound, every abandoned call must have ended within it; on the lockfile's asyncpg the
 driver's own two-second close timeout ends them, so that case claims the bound and no more. The
 backstop case makes the driver's close unbounded, as asyncpg 0.30.0's is against a silent peer,
 and proves by order that the backstop is what ends the calls. Both then require a clean pool and
 a store that answers as soon as the relay forwards again.
+
+Every case runs twice where the build has `statement_timeout=`: without it, and with a bound no
+case reaches, because each transaction then opens with one more statement (two at discovery,
+the probe and the bound) for a stall or a cancellation to land in. One more case lands the stall
+exactly there.
 
 Asyncio only: `asyncpg` drives the event loop directly, as in every other store-backed lane.
 """
@@ -66,6 +71,12 @@ if "lookup_timeout" not in inspect.signature(CookieVerifier.__init__).parameters
 
 pytestmark = pytest.mark.e2e
 
+BOUNDED = "statement_timeout" in inspect.signature(SqlAlchemySessionStore.__init__).parameters
+WELL_PAST_THE_TEST = 120.0
+"""The `statement_timeout` the bounded cases give the store: one no case runs long enough to
+reach. They prove that the settings statement each transaction now opens with changes nothing
+about how an abandoned call winds down; `test_store_statement_timeout_live.py` proves the bound."""
+
 POOL_SIZE = 2
 MAX_OVERFLOW = 1
 CEILING = POOL_SIZE + MAX_OVERFLOW
@@ -111,6 +122,25 @@ class Backends(NamedTuple):
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture(
+    params=[
+        pytest.param({}, id="unbounded"),
+        pytest.param(
+            {"statement_timeout": WELL_PAST_THE_TEST},
+            id="bounded",
+            marks=pytest.mark.skipif(
+                not BOUNDED,
+                reason="this build predates SqlAlchemySessionStore(statement_timeout=...)",
+            ),
+        ),
+    ]
+)
+def store_options(request: pytest.FixtureRequest) -> dict[str, Any]:
+    """Each case runs on a store without the option and, where the build has it, with it."""
+    options: dict[str, Any] = request.param
+    return options
 
 
 @pytest.fixture
@@ -246,13 +276,14 @@ async def test_lookups_abandoned_at_their_deadline_leave_no_backend_behind(
     application_name: str,
     monkeypatch: pytest.MonkeyPatch,
     loop_reports: list[dict[str, Any]],
+    store_options: dict[str, Any],
 ) -> None:
     """Each wave's deadline lands by order, not by a short timer: the lookups run under `LONG`,
     the test waits until every connection the pool has holds a statement queued on the lock, and
     only then moves the loop's clock past the deadline. A wave whose lookups never reached the
     lock - connection setup eating a short deadline on a slow runner - fails, not passes."""
     clock = LeapingClock(monkeypatch)
-    store = SqlAlchemySessionStore(engine=engine, schema=schema)
+    store = SqlAlchemySessionStore(engine=engine, schema=schema, **store_options)
     await store.connect()
     steady = verifier(store, lookup_timeout=LONG)
     assert await one_lookup(steady) == "SessionRevoked"
@@ -423,11 +454,12 @@ async def test_at_the_shipped_bound_calls_abandoned_against_a_stalled_server_end
     observer: AsyncEngine,
     application_name: str,
     loop_reports: list[dict[str, Any]],
+    store_options: dict[str, Any],
 ) -> None:
     """The store as shipped: every abandoned call has ended within one wind-down bound (plus a
     guard) of the last wave. On the lockfile's asyncpg the driver's own two-second close timeout
     is what ends them; this case claims only the bound, which holds whoever ends them."""
-    store = SqlAlchemySessionStore(engine=relayed_engine)
+    store = SqlAlchemySessionStore(engine=relayed_engine, **store_options)
     await store.connect()
     assert await one_lookup(verifier(store, lookup_timeout=LONG)) == "SessionRevoked"
     try:
@@ -450,6 +482,7 @@ async def test_the_backstop_ends_a_clean_up_the_driver_would_never_end(
     application_name: str,
     monkeypatch: pytest.MonkeyPatch,
     loop_reports: list[dict[str, Any]],
+    store_options: dict[str, Any],
 ) -> None:
     """By order, not by speed. The driver's close is unbounded (`unbounded_close`) and the
     store's bound is one nobody waits out, so after the waves the abandoned calls are still
@@ -460,7 +493,7 @@ async def test_the_backstop_ends_a_clean_up_the_driver_would_never_end(
     clean and the store answers once the relay forwards again."""
     closing = unbounded_close(monkeypatch)
     clock = LeapingClock(monkeypatch)
-    store = SqlAlchemySessionStore(engine=relayed_engine)
+    store = SqlAlchemySessionStore(engine=relayed_engine, **store_options)
     store._handoff = TaskHandoff(wind_down=LONG)  # pyright: ignore[reportPrivateUsage]
     await store.connect()
     assert await one_lookup(verifier(store, lookup_timeout=LONG)) == "SessionRevoked"
@@ -490,6 +523,7 @@ async def test_a_call_abandoned_while_its_rollback_is_unanswered_ends_within_the
     application_name: str,
     monkeypatch: pytest.MonkeyPatch,
     loop_reports: list[dict[str, Any]],
+    store_options: dict[str, Any],
 ) -> None:
     """The statement has answered; the server stops answering at the ROLLBACK the connection
     sends on its way back to the pool. The relay is stalled from SQLAlchemy's `rollback` event,
@@ -498,7 +532,7 @@ async def test_a_call_abandoned_while_its_rollback_is_unanswered_ends_within_the
     and its connection must come back - the one cancellation, or the backstop, has to reach the
     return - and the store must answer once the relay forwards again."""
     clock = LeapingClock(monkeypatch)
-    store = SqlAlchemySessionStore(engine=relayed_engine)
+    store = SqlAlchemySessionStore(engine=relayed_engine, **store_options)
     await store.connect()
     steady = verifier(store, lookup_timeout=LONG)
     assert await one_lookup(steady) == "SessionRevoked"
@@ -540,6 +574,7 @@ async def test_a_return_cut_short_by_the_backstop_still_gives_the_connection_bac
     application_name: str,
     monkeypatch: pytest.MonkeyPatch,
     loop_reports: list[dict[str, Any]],
+    store_options: dict[str, Any],
 ) -> None:
     """The floor's shape on the lockfile's driver: the ROLLBACK goes unanswered, the caller's
     cancellation lands in it, and SQLAlchemy's graceful close of the connection then waits on the
@@ -551,7 +586,7 @@ async def test_a_return_cut_short_by_the_backstop_still_gives_the_connection_bac
     the relay forwards again, and the server holds only the pool's connections."""
     closing = unbounded_close(monkeypatch)
     clock = LeapingClock(monkeypatch)
-    store = SqlAlchemySessionStore(engine=relayed_engine)
+    store = SqlAlchemySessionStore(engine=relayed_engine, **store_options)
     await store.connect()
     steady = verifier(store, lookup_timeout=LONG)
     assert await one_lookup(steady) == "SessionRevoked"
@@ -582,6 +617,93 @@ async def test_a_return_cut_short_by_the_backstop_still_gives_the_connection_bac
 
     assert refused == "deadline"
     assert held_while_stalled == 0, "a return cut short by the backstop kept its pool slot"
+    await recovered(store, relayed_engine, observer, application_name)
+    gc.collect()  # a driver future dropped unread is reported when it is collected
+    assert unexpected(loop_reports) == []
+
+
+SETTINGS_PARAMETER = b"statement_timeout"
+"""The settings statement's first parameter, as the driver sends it: the setting's name. The SQL
+text carries only `$1`, and on a warmed connection asyncpg sends no text at all, only the
+prepared statement's parameters, so this is what marks that statement on the wire."""
+BEGIN = b"BEGIN"
+
+
+class Phase(NamedTuple):
+    """Where a transaction stood when the relay stalled: what the server and the relay say."""
+
+    in_transaction: list[str]
+    """The command of the last query of each store backend idle in a transaction."""
+    active: int
+    """The store backends running a statement."""
+    settings_held: bool
+    begin_held: bool
+
+
+async def stall_phase(observer: AsyncEngine, name: str, relay: StallingRelay) -> Phase:
+    rows = await server_backends(observer, name)
+    return Phase(
+        in_transaction=[_command(str(row[2])) for row in rows if row[1] == IDLE_IN_TRANSACTION],
+        active=sum(1 for row in rows if row[1] == "active"),
+        settings_held=relay.holds(SETTINGS_PARAMETER),
+        begin_held=relay.holds(BEGIN),
+    )
+
+
+def _command(query: str) -> str:
+    """The command a query starts with, as asyncpg sends it (`BEGIN;`): `BEGIN`."""
+    words = query.split()
+    return words[0].rstrip(";").upper() if words else ""
+
+
+ANSWERED_BEGIN_HELD_SETTINGS = Phase(["BEGIN"], 0, settings_held=True, begin_held=False)
+"""`BEGIN` answered, the server idle in that transaction, and the settings statement held."""
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    not BOUNDED, reason="this build predates SqlAlchemySessionStore(statement_timeout=...)"
+)
+async def test_a_call_abandoned_while_its_settings_statement_is_unanswered_ends_within_the_bound(
+    relay: StallingRelay,
+    relayed_engine: AsyncEngine,
+    observer: AsyncEngine,
+    application_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    loop_reports: list[dict[str, Any]],
+) -> None:
+    """With `statement_timeout=` set, each transaction opens with the settings statement, and the
+    server can stop answering right there: after `BEGIN` was answered, with the settings statement
+    in flight. That is where the relay stalls: on the bytes that carry the statement's first
+    parameter (`stall_before`). Not from SQLAlchemy's `before_cursor_execute`: it fires before the
+    asyncpg adapter sends `BEGIN`, so a stall from there holds `BEGIN` instead. The phase is
+    asserted, from the server and the relay, before the lookup's deadline is passed
+    (`LeapingClock`). The abandoned call must end within the bound and give its connection back
+    while the relay is still stalled, and the store must answer once the relay forwards again."""
+    clock = LeapingClock(monkeypatch)
+    store = SqlAlchemySessionStore(engine=relayed_engine, statement_timeout=WELL_PAST_THE_TEST)
+    await store.connect()
+    steady = verifier(store, lookup_timeout=LONG)
+    assert await one_lookup(steady) == "SessionRevoked"
+    setting = relay.stall_before(SETTINGS_PARAMETER)
+    lookup = asyncio.ensure_future(one_lookup(steady))
+    try:
+        with anyio.fail_after(GUARD):
+            await setting.wait()
+        phase = await stall_phase(observer, application_name, relay)
+        assert phase == ANSWERED_BEGIN_HELD_SETTINGS, f"the stall landed elsewhere: {phase}"
+        clock.leap(LONG)
+        with anyio.fail_after(GUARD):
+            refused = await lookup
+        with anyio.fail_after(WIND_DOWN_SECONDS + GUARD):
+            await store._handoff.settled()  # pyright: ignore[reportPrivateUsage]
+        held_while_stalled = checked_out(relayed_engine)
+    finally:
+        relay.resume()
+        lookup.cancel()
+
+    assert refused == "deadline"
+    assert held_while_stalled == 0, "the connection stayed checked out while the server was silent"
     await recovered(store, relayed_engine, observer, application_name)
     gc.collect()  # a driver future dropped unread is reported when it is collected
     assert unexpected(loop_reports) == []

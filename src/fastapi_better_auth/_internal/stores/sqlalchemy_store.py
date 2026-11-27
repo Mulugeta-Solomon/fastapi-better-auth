@@ -14,6 +14,7 @@ from ..errors import ConfigurationError
 from ..newest_first import NewestFirstLock
 from .outage import OutageLatch, report_once
 from .records import StoredSession, StoredUser
+from .statement_timeout import validated_statement_timeout
 from .task_handoff import TaskHandoff
 from .thread_handoff import run_in_worker
 
@@ -95,11 +96,15 @@ class _CoreStore(ABC):
 
         Raises:
             ConfigurationError: If a table is absent, or is missing a column every lookup reads.
+            SQLAlchemyError: A database error while reading, as SQLAlchemy raised it (a
+                `DBAPIError`, the driver's own error under `.orig`) - one a
+                `statement_timeout=` bound ended included. Nothing is kept: the next call, or
+                the first lookup, reads the schema again.
         """
         await self._ready()
 
     async def fetch_session_by_token(self, token: str) -> StoredSession | None:
-        """The session stored under this raw token, with its user, in one statement.
+        """The session stored under this raw token, with its user, in one SELECT.
 
         See `SessionStore.fetch_session_by_token`. A blank token never reaches the database.
         """
@@ -184,7 +189,7 @@ class SqlAlchemySessionStore(_CoreStore):
     """Better Auth's `session` and `user` tables, read through an async SQLAlchemy engine.
 
     The store for the shared-database topology: Better Auth writes sessions into Postgres (or
-    MySQL, or SQLite) and this reads them, one statement per lookup and no ORM anywhere -
+    MySQL, or SQLite) and this reads them, one SELECT per lookup and no ORM anywhere -
     SQLAlchemy Core against a declared, quoted schema, so nothing here depends on your models,
     your metadata or your session lifecycle.
 
@@ -210,8 +215,11 @@ class SqlAlchemySessionStore(_CoreStore):
     until a lookup completes again.
 
     **The session and its user arrive together**, joined in one statement, so the happy path is
-    a single round trip and the record's `user` is already populated. `fetch_user_by_id` is
-    there for callers that need a user on its own.
+    one query and the record's `user` is already populated. `fetch_user_by_id` is there for
+    callers that need a user on its own. Unset, `statement_timeout=` adds nothing: a lookup sends
+    that one statement. Set, it sends two (the bound, then the lookup) and discovery sends three
+    more (a probe, the bound, and their readback); counted from the engine's own events on the
+    live lane.
 
     **The schema is read once, on first use** (or from `connect()`), and it decides two things.
     That every column a lookup needs is there - and if one is not, that is a
@@ -267,6 +275,30 @@ class SqlAlchemySessionStore(_CoreStore):
     client. And a lookup that finds no idle connection opens a new one inside its own deadline,
     so keep `lookup_timeout` well above the time a new connection takes.
 
+    **A statement timeout of the store's own** (`statement_timeout=`, seconds, Postgres only) is
+    that setting without touching the role or the pool the application lends: a role-level or
+    engine-level timeout would bound every other statement the application runs as well. Set,
+    every transaction the store opens - each lookup, and the schema read that `connect()` and the
+    first lookup run - sends `SELECT set_config('statement_timeout', :ms, true)` before it reads
+    anything, the value rounded up to whole milliseconds (discovery sets its probe, below, just
+    before it). The setting is transaction-local, so it ends with the `ROLLBACK` the store sends,
+    and no other checkout of the pool ever sees it. For the store's own transactions it replaces
+    a role-level or database-level value, even a shorter one. Keep it below `lookup_timeout`. A
+    lookup the server ends is refused as above (`AuthServiceUnavailable`, one WARNING naming
+    SQLSTATE 57014); a schema read it ends raises from `connect()` as any database error does. It
+    bounds the statements after it in each transaction, not itself, the `ROLLBACK`, or what
+    SQLAlchemy sends to open a connection. On an engine in `AUTOCOMMIT` the setting would end
+    with the statement that made it, so the store refuses such an engine with a
+    `ConfigurationError` before any lookup reaches the database: from the engine's options before
+    every transaction, and from the setting read back at discovery. The readback is proven to be
+    the store's own: discovery first sets a random probe, transaction-locally, in a custom setting
+    of the library's (`fastapi_better_auth.discovery_probe`), and reads it back with the bound. So
+    an application's own session-level value, even one equal to the store's, does not pass for
+    it. Afterwards that setting reads as an empty string on the lent connection. Tested on
+    asyncpg; the role needs no grant beyond the `SELECT` above. `SyncStoreAdapter` has no such
+    option: give its role the timeout (`ALTER ROLE ... SET statement_timeout`), as for any other
+    database.
+
     Args:
         engine: An `AsyncEngine`. Always injected, never built here: the pool, the TLS
             configuration and the lifecycle belong to the application, and this store must not
@@ -279,13 +311,21 @@ class SqlAlchemySessionStore(_CoreStore):
             refused rather than iterated one character at a time.
         user_columns: The same for the user table - the columns beyond Better Auth's own that a
             verified request's `session.user` may carry.
+        statement_timeout: Seconds, or `None` (the default) to send nothing of the kind. PostgreSQL
+            only: a transaction-local `statement_timeout`, rounded up to whole milliseconds, set
+            before any read in every transaction the store opens - each lookup and the schema
+            read, where a probe is set just before it. Keep it below `CookieVerifier`'s
+            `lookup_timeout`.
 
     Raises:
         ConfigurationError: If `sqlalchemy` is not installed, if `engine` is not an
             `AsyncEngine`, if either table name is blank or the two are the same, if either
-            allow-list is not a sequence of distinct non-blank names, or - from `connect()` or
-            the first lookup - if the schema cannot answer a lookup at all or an allow-list
-            names a column the table does not have.
+            allow-list is not a sequence of distinct non-blank names, if `statement_timeout` is not
+            a positive, finite number of seconds within what Postgres accepts or is set on an
+            engine that is not PostgreSQL, or - from `connect()` or the first lookup - if the
+            schema cannot answer a lookup at all, if an allow-list names a column the table does
+            not have, or if `statement_timeout` is set on an engine in `AUTOCOMMIT` (from a
+            lookup too, when the engine was switched after `connect()`).
     """
 
     def __init__(
@@ -297,6 +337,7 @@ class SqlAlchemySessionStore(_CoreStore):
         schema: str | None = None,
         session_columns: Sequence[str] | None = None,
         user_columns: Sequence[str] | None = None,
+        statement_timeout: float | None = None,
     ) -> None:
         super().__init__(
             adapter="SqlAlchemySessionStore",
@@ -307,6 +348,9 @@ class SqlAlchemySessionStore(_CoreStore):
             user_columns=user_columns,
         )
         self._engine = self._sql.validated_async_engine(engine)
+        self._timeout = self._sql.bounded_engine(
+            self._engine, validated_statement_timeout(statement_timeout)
+        )
         self._handoff = TaskHandoff()
 
     async def _columns(self) -> Discovered:
@@ -315,6 +359,7 @@ class SqlAlchemySessionStore(_CoreStore):
     async def _inspected(self) -> Discovered:
         connection = await self._engine.connect()
         try:
+            await self._bounded(connection, confirm=True)
             return await connection.run_sync(self._reflected)
         finally:
             await _returned(connection)
@@ -333,9 +378,34 @@ class SqlAlchemySessionStore(_CoreStore):
     async def _queried(self, statement: Select[Any], params: dict[str, Any]) -> Rows:
         connection = await self._engine.connect()
         try:
+            await self._bounded(connection)
             return self._sql.rows(await connection.execute(statement, params))
         finally:
             await _returned(connection)
+
+    async def _bounded(self, connection: AsyncConnection, *, confirm: bool = False) -> None:
+        """Set the store's bound on the transaction just opened, when it has one; else send nothing.
+
+        Sent before any read in every transaction the store opens, so every read after it is
+        bounded, and transaction-local, so it ends with the `ROLLBACK` `_returned` sends. On an
+        engine in `AUTOCOMMIT` it would end with itself, so that engine is refused: from its
+        options before every transaction, and - for discovery, which every lookup waits on - by
+        reading the setting back in the same transaction, which also sees an engine built so.
+        Discovery sets a fresh probe first and reads it back with the bound: the probe proves the
+        readback ran in the transaction that set the bound (`confirmed_bound`).
+        """
+        if self._timeout is None:
+            return
+        self._sql.refuse_autocommit(self._engine)
+        probe = self._sql.new_probe() if confirm else None
+        if probe is not None:
+            await connection.execute(self._sql.timeout_statement(), self._sql.probe_params(probe))
+        await connection.execute(
+            self._sql.timeout_statement(), self._sql.timeout_params(self._timeout)
+        )
+        if probe is not None:
+            found = await connection.execute(self._sql.readback_statement())
+            self._sql.confirmed_bound(found.all(), self._timeout, probe)
 
 
 async def _returned(connection: AsyncConnection) -> None:

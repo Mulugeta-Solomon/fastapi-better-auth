@@ -18,6 +18,11 @@ a client is being kept from sending some bytes, `held` counts every chunk held e
 test knows that a command reached the relay and went no further, that a side hung up while
 stalled, or, once resumed, that everything held has been passed on.
 
+A stall can also wait for a command instead of being called at once: `stall_before(needle)` stalls
+the relay as it reads the client bytes that complete `needle`, and holds them. That lands a stall
+between two commands of one connection with nothing in between: the first is answered, and the
+second never reaches the server.
+
 A connection the client gave up on while the relay was stalled stays open on the relay's side
 until it resumes, as it would in a kernel's backlog, so how many connections the relay holds says
 nothing about how many the client has; a test reads that from the client's own pool.
@@ -60,6 +65,13 @@ class _Stream:
         if self.from_client:
             self.tail = (self.tail + data)[-TAIL_BYTES:]
 
+    def completes(self, needle: bytes, data: bytes) -> bool:
+        """Whether reading `data` next would complete `needle` in this client's stream."""
+        if not self.from_client:
+            return False
+        before = self.tail[max(0, len(self.tail) - (len(needle) - 1)) :]
+        return needle in before + data
+
     def holds(self, needle: bytes) -> bool:
         """Whether `needle` is in this client's stream with at least its last byte held.
 
@@ -82,6 +94,7 @@ class StallingRelay:
         self._connections: set[asyncio.Task[None]] = set()
         self._streams: set[_Stream] = set()
         self._server: asyncio.Server | None = None
+        self._trigger: tuple[bytes, asyncio.Event] | None = None
         self.port = 0
 
     async def start(self) -> None:
@@ -93,6 +106,17 @@ class StallingRelay:
 
     def resume(self) -> None:
         self._flowing.set()
+
+    def stall_before(self, needle: bytes) -> asyncio.Event:
+        """Stall as soon as a client's next read would complete `needle`, holding that read.
+
+        Once only: the returned event is set when it stalls, and `resume()` forwards as before.
+        Bytes read before the call never trip it, and bytes from the server never do.
+        """
+        _check(needle)
+        tripped = asyncio.Event()
+        self._trigger = (needle, tripped)
+        return tripped
 
     @property
     def held(self) -> int:
@@ -116,8 +140,7 @@ class StallingRelay:
         is what keeps that command from completing. A needle wholly passed on does not count,
         bytes from the server never do, and nothing joins one connection's bytes to another's.
         """
-        if not needle or len(needle) > TAIL_BYTES + 1:
-            raise ValueError(f"a needle must be 1 to {TAIL_BYTES + 1} bytes; got {len(needle)}")
+        _check(needle)
         return any(stream.holds(needle) for stream in self._streams)
 
     async def close(self) -> None:
@@ -169,6 +192,7 @@ class StallingRelay:
         # failed write is `sink` gone, which `_flush` meets too and ends the pump on.
         with contextlib.suppress(OSError):
             while data := await source.read(CHUNK_BYTES):
+                self._trip(stream, data)
                 if self._flowing.is_set() and not stream.held:
                     stream.passed(data)
                     sink.write(data)
@@ -176,6 +200,16 @@ class StallingRelay:
                 else:
                     stream.hold(data)
         stream.end()
+
+    def _trip(self, stream: _Stream, data: bytes) -> None:
+        """Stall, before `data` is passed on, if it completes the needle of `stall_before`."""
+        if self._trigger is None:
+            return
+        needle, tripped = self._trigger
+        if stream.completes(needle, data):
+            self._trigger = None
+            self.stall()
+            tripped.set()
 
     async def _flush(self, sink: asyncio.StreamWriter, stream: _Stream) -> None:
         """Pass on what `stream` holds, in order, whenever forwarding; return once its end has
@@ -194,3 +228,9 @@ class StallingRelay:
                 else:
                     stream.arrived.clear()
                     await stream.arrived.wait()
+
+
+def _check(needle: bytes) -> None:
+    """Refuse a needle the remembered tail cannot answer for."""
+    if not needle or len(needle) > TAIL_BYTES + 1:
+        raise ValueError(f"a needle must be 1 to {TAIL_BYTES + 1} bytes; got {len(needle)}")

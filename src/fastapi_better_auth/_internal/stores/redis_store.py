@@ -5,16 +5,16 @@ from __future__ import annotations
 
 import hmac
 import json
-import math
 from collections.abc import Mapping
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
 from ..errors import ConfigurationError
 from ..reasons import safe_label
 from .diagnostics import unusable
 from .records import StoredSession, StoredUser
 from .revocation import Verdict, judge, watermark_key
+from .seconds import is_seconds
 from .session_document import SESSION_KEY, parse_session_document
 
 if TYPE_CHECKING:
@@ -108,18 +108,8 @@ def _import_redis() -> Any:
     return Redis
 
 
-def _is_deadline(seconds: object) -> TypeGuard[float]:
-    """A positive, finite number of seconds. `None` is redis-py's "wait forever" - not one."""
-    return (
-        not isinstance(seconds, bool)
-        and isinstance(seconds, (int, float))
-        and math.isfinite(seconds)
-        and seconds > 0
-    )
-
-
 def _validated_deadline(name: str, seconds: object) -> float:
-    if not _is_deadline(seconds):
+    if not is_seconds(seconds):
         raise ConfigurationError(
             f"{name} must be a positive, finite number of seconds; got {safe_label(repr(seconds))}."
             " It bounds how long one Redis socket operation may hold the request that needed it."
@@ -136,7 +126,7 @@ def _unbounded_in_url(effective: Mapping[str, object]) -> ConfigurationError | N
     """
     for name in (SOCKET_TIMEOUT, SOCKET_CONNECT_TIMEOUT):
         seconds = effective.get(name)
-        if not _is_deadline(seconds):
+        if not is_seconds(seconds):
             return ConfigurationError(
                 f"{name} in the url= query string must be a positive, finite number of seconds;"
                 f" got {safe_label(repr(seconds))}. It wins over the {name}= argument, and bounds"

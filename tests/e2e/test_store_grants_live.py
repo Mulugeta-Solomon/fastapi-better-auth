@@ -8,10 +8,7 @@ holding `SELECT` on `session` alone is the under-grant, and what it gets is pinn
 answer the README documents: the uniform 401, and one WARNING naming SQLSTATE 42501 (R47).
 
 Both roles are created per test under random names and passwords by the harness superuser, and
-dropped in a `finally`. The password never reaches a log, a reason, an assertion or a repr: it
-lives in a `Login` whose repr leaves it out, the engine's URL masks it, and every statement that
-carries it runs through `as_superuser`, which re-raises a failure without the statement text.
-Every write attempted as the role carries `WHERE false`, so even a wrongly granted role changes
+dropped in a `finally` (`roles.py`, which keeps the password out of every message). Every write attempted as the role carries `WHERE false`, so even a wrongly granted role changes
 nothing; privileges are checked when the statement starts, before any row is considered.
 
 Names only 0.5.0 publishes, and the Mode A ones under the post-0.1.0 guard, so the module runs on
@@ -22,19 +19,15 @@ Asyncio only: asyncpg drives the event loop directly.
 from __future__ import annotations
 
 import logging
-import secrets
-from collections.abc import AsyncGenerator, Iterator
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from collections.abc import Iterator
 from importlib.util import find_spec
 
 import httpx
 import pytest
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.exception_handlers import http_exception_handler
-from sqlalchemy import URL, make_url, text
-from sqlalchemy.exc import DBAPIError, SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from fastapi_better_auth import (
     AuthServiceUnavailable,
@@ -48,13 +41,13 @@ from fastapi_better_auth import (
 from .conftest import (
     HARNESS_SECRET,
     PASSWORD,
-    POSTGRES_URL,
     SESSION_COOKIE,
     raw_token,
     sign_in,
     sign_out,
     sign_up,
 )
+from .roles import READ_BOTH, READ_SESSION_ONLY, engine_as, login_granted
 
 try:
     # Post-0.1.0 names belong under the guard: the published-wheel lane must skip, not raise.
@@ -77,9 +70,6 @@ LIBRARY_LOGGER = "fastapi_better_auth"
 FORMATTER = logging.Formatter("%(name)s %(levelname)s %(message)s")
 LOOKUP_UNAVAILABLE = "session store lookup could not complete ["
 
-READ_BOTH = 'GRANT SELECT ON "session", "user" TO "{role}"'
-READ_SESSION_ONLY = 'GRANT SELECT ON "session" TO "{role}"'
-
 WRITES = {
     "insert-session": """INSERT INTO "session" (id) SELECT 'wp25-never' WHERE false""",
     "update-session": 'UPDATE "session" SET "updatedAt" = "updatedAt" WHERE false',
@@ -91,71 +81,9 @@ WRITES = {
 """Every write either table could take, each one a no-op if Postgres ever let it through."""
 
 
-@dataclass(frozen=True)
-class Login:
-    """A throwaway LOGIN role. The password is in no repr, so in no failure message either."""
-
-    name: str
-    password: str = field(repr=False)
-
-    @property
-    def url(self) -> URL:
-        """The harness database's own host, port and name, logged in as this role."""
-        return make_url(POSTGRES_URL).set(username=self.name, password=self.password)
-
-
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
-
-
-async def as_superuser(*statements: str, step: str) -> None:
-    """Run DDL as the harness superuser, in one transaction, never echoing a statement back.
-
-    SQLAlchemy's error text embeds the statement, and one of these carries a password, so a
-    failure is re-raised as its class and SQLSTATE only - outside the `except`, with no chain.
-    """
-    engine = create_async_engine(POSTGRES_URL)
-    failure: RuntimeError | None = None
-    try:
-        async with engine.begin() as connection:
-            for statement in statements:
-                await connection.exec_driver_sql(statement)
-    except SQLAlchemyError as exc:
-        code = getattr(getattr(exc, "orig", None), "sqlstate", None)
-        failure = RuntimeError(f"{step} failed: {type(exc).__name__} (SQLSTATE {code})")
-    finally:
-        await engine.dispose()
-    if failure is not None:
-        raise failure from None
-
-
-@asynccontextmanager
-async def login_granted(grant: str) -> AsyncGenerator[Login]:
-    """A LOGIN role holding exactly `grant`, dropped again however the test ends."""
-    login = Login(name=f"wp25_store_{secrets.token_hex(8)}", password=secrets.token_hex(24))
-    await as_superuser(
-        f"CREATE ROLE \"{login.name}\" LOGIN PASSWORD '{login.password}'",
-        grant.format(role=login.name),
-        step="creating the least-privilege role",
-    )
-    try:
-        yield login
-    finally:
-        await as_superuser(
-            f'DROP OWNED BY "{login.name}"',
-            f'DROP ROLE "{login.name}"',
-            step="dropping the least-privilege role",
-        )
-
-
-@asynccontextmanager
-async def engine_as(login: Login) -> AsyncGenerator[AsyncEngine]:
-    engine = create_async_engine(login.url)
-    try:
-        yield engine
-    finally:
-        await engine.dispose()
 
 
 @pytest.fixture

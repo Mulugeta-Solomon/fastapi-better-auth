@@ -202,15 +202,16 @@ class TestASilentRedis:
 class TestRefusals:
     @pytest.mark.parametrize(
         "seconds",
-        [0, -1, math.inf, math.nan, True, "2", None],
-        ids=["zero", "negative", "inf", "nan", "bool", "string", "none"],
+        [0, -1, math.inf, math.nan, True, "2", None, 10**400],
+        ids=["zero", "negative", "inf", "nan", "bool", "string", "none", "beyond-a-float"],
     )
     @pytest.mark.parametrize("name", ["socket_timeout", "socket_connect_timeout"])
     def test_a_deadline_that_is_not_a_positive_number_of_seconds_is_refused(
         self, name: str, seconds: Any, capturing: Capturing
     ) -> None:
         """`None` included: it is redis-py's spelling of "wait forever", the one value this
-        option exists to rule out."""
+        option exists to rule out. An int too large for a float is refused too, as configuration:
+        no socket could be given it, and `math.isfinite` raises `OverflowError` on it."""
         with pytest.raises(ConfigurationError, match=name):
             RedisSessionStore(url=URL, **{name: seconds})
 

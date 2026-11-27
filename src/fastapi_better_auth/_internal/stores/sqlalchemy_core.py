@@ -1,8 +1,9 @@
 """Everything in this package that touches SQLAlchemy - which is why nothing imports it eagerly.
 
 `sqlalchemy` is an optional extra, so importing `fastapi_better_auth` must work without it. This
-module is the one place the library names it, and `sqlalchemy_store` reaches it through a guarded
-import at construction time - the same shape `httpx_transports` uses for its own extra.
+module, and the two it alone imports (`sql_widths`, `sqlalchemy_bound`), are the only places the
+library names it, and `sqlalchemy_store` reaches it through a guarded import at construction
+time - the same shape `httpx_transports` uses for its own extra.
 
 Better Auth's schema as SQLAlchemy Core sees it: two tables, quoted, and two SELECTs.
 
@@ -60,11 +61,32 @@ from .diagnostics import drifted, unusable
 from .records import StoredSession, StoredUser
 from .sql_ids import INT64_RANGE, IdKind, IntegerRange, bind_id, read_id
 from .sql_widths import integer_range
+from .sqlalchemy_bound import (
+    bounded_engine,
+    confirmed_bound,
+    new_probe,
+    probe_params,
+    readback_statement,
+    refuse_autocommit,
+    timeout_params,
+    timeout_statement,
+)
 from .upstream import as_db_flag, as_moment, as_text
 
 # Re-exported so `sqlalchemy_store` can name the exception class in an `except` without importing
-# `sqlalchemy` itself - that module has to import cleanly when the extra is absent (D-146).
-__all__ = ["SQLAlchemyError"]
+# `sqlalchemy` itself - that module has to import cleanly when the extra is absent (D-146). The
+# `statement_timeout=` bound is reached the same way, through the one module the store imports.
+__all__ = [
+    "SQLAlchemyError",
+    "bounded_engine",
+    "confirmed_bound",
+    "new_probe",
+    "probe_params",
+    "readback_statement",
+    "refuse_autocommit",
+    "timeout_params",
+    "timeout_statement",
+]
 
 SESSION_REQUIRED: tuple[str, ...] = ("id", "token", "expiresAt", "userId")
 SESSION_OPTIONAL: tuple[str, ...] = ("createdAt", "updatedAt", "ipAddress", "userAgent")

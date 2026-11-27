@@ -23,6 +23,7 @@ import asyncio
 import itertools
 import json
 import pathlib
+import re
 import sqlite3
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -225,12 +226,46 @@ def async_engine(path: pathlib.Path) -> AsyncEngine:
     return create_async_engine(f"sqlite+aiosqlite:///{path}", poolclass=AsyncAdaptedQueuePool)
 
 
+ASYNCPG_ABSENT = (
+    "asyncpg is not installed here (the py3.15 lane: it ships no wheel there), and a Postgres"
+    " AsyncEngine imports its driver when it is built, even one never connected"
+)
+
+
+def postgres_engine(url: str) -> AsyncEngine:
+    """A Postgres `AsyncEngine` through asyncpg, never connected; skips the case without asyncpg.
+
+    Only a case that needs the engine itself calls this. One that compiles against the dialect
+    class (`PGDialect_asyncpg()`) needs no driver and keeps running."""
+    pytest.importorskip("asyncpg", reason=ASYNCPG_ABSENT)
+    return create_async_engine(url)
+
+
 def sync_engine(path: pathlib.Path) -> Engine:
     return create_engine(f"sqlite+pysqlite:///{path}")
 
 
+READ_VERBS = frozenset({"SELECT", "PRAGMA"})
+"""What a read starts with: SQLite's reflection is `PRAGMA`, everything else a `SELECT`."""
+
+SETTING = "statement_timeout"
+SETTINGS_STATEMENT = "SELECT set_config($1::VARCHAR, $2::VARCHAR, true) AS set_config_1"
+"""The one statement a store may send that is not a read, exactly as asyncpg receives it.
+
+`SqlAlchemySessionStore(statement_timeout=...)` sends it first in every transaction it opens. It
+starts with `SELECT`, so a filter on the verb alone would wave it through, and with it any other
+function call that changes state; the invariant names it instead (`writes_emitted`). The final
+`true` makes the setting transaction-local, which is what keeps it out of the pool's other
+checkouts."""
+PROBE_SETTING = "fastapi_better_auth.discovery_probe"
+"""The only other setting that statement may carry: discovery's probe, under the library's own
+prefix. Named here, not imported, so a change of name in the library fails the invariant."""
+PROBE_VALUE = re.compile(r"[0-9a-f]{32}")
+"""What the probe may be set to: 128 random bits as lowercase hex, and nothing else."""
+
+
 class StatementLog:
-    """Every SQL statement an engine actually sent to its driver, in order.
+    """Every SQL statement an engine actually sent to its driver, in order, with its parameters.
 
     The read-only invariant is asserted against this and not against the store's source: an
     intention to read is not evidence, and a write emitted through a path nobody read is
@@ -239,11 +274,14 @@ class StatementLog:
 
     def __init__(self) -> None:
         self.statements: list[str] = []
+        self.parameters: list[Any] = []
         self.threads: list[int] = []
 
     def attach(self, engine: Engine | AsyncEngine) -> None:
-        target = engine.sync_engine if isinstance(engine, AsyncEngine) else engine
-        event.listen(target, "before_cursor_execute", self._record)
+        event.listen(_sync(engine), "before_cursor_execute", self._record)
+
+    def detach(self, engine: Engine | AsyncEngine) -> None:
+        event.remove(_sync(engine), "before_cursor_execute", self._record)
 
     def _record(
         self,
@@ -255,18 +293,70 @@ class StatementLog:
         executemany: bool,
     ) -> None:
         self.statements.append(statement)
+        self.parameters.append(parameters)
         self.threads.append(threading.get_ident())
 
     @property
     def verbs(self) -> frozenset[str]:
-        return frozenset(
-            line.split(maxsplit=1)[0].upper() for line in self.statements if line.split()
-        )
+        return frozenset(_verb(line) for line in self.statements if line.split())
+
+    @property
+    def settings(self) -> list[str]:
+        """Every statement that calls `set_config`, whatever else it says."""
+        return [line for line in self.statements if _sets_config(line)]
 
     @property
     def selects(self) -> list[str]:
-        """The SELECTs alone: schema discovery emits PRAGMA/reflection traffic around them."""
-        return [line for line in self.statements if line.lstrip().upper().startswith("SELECT")]
+        """The SELECTs that read: schema discovery emits PRAGMA/reflection traffic around them,
+        and the settings statement is a `SELECT` that reads nothing."""
+        return [
+            line
+            for line in self.statements
+            if line.lstrip().upper().startswith("SELECT") and not _sets_config(line)
+        ]
+
+
+def _sync(engine: Engine | AsyncEngine) -> Engine:
+    return engine.sync_engine if isinstance(engine, AsyncEngine) else engine
+
+
+def writes_emitted(log: StatementLog, milliseconds: int | None = None) -> list[str]:
+    """Every statement in `log` the read-only invariant refuses; empty when the store only read.
+
+    A statement is allowed when it starts with a read verb and calls no `set_config`, or when it
+    is exactly `SETTINGS_STATEMENT` carrying one of the two store settings: `statement_timeout`
+    at `milliseconds`, the value the store was given, or `PROBE_SETTING` at a `PROBE_VALUE`.
+    With `milliseconds=None` (the option unset) no settings statement is allowed at all.
+    """
+    refused: list[str] = []
+    for statement, parameters in zip(log.statements, log.parameters, strict=True):
+        if _sets_config(statement):
+            if statement != SETTINGS_STATEMENT or not _a_store_setting(parameters, milliseconds):
+                refused.append(statement)
+        elif _verb(statement) not in READ_VERBS:
+            refused.append(statement)
+    return refused
+
+
+def _a_store_setting(parameters: Any, milliseconds: int | None) -> bool:
+    if milliseconds is None:
+        return False
+    match tuple(parameters):
+        case (str(name), str(value)) if name == SETTING:
+            return value == str(milliseconds)
+        case (str(name), str(value)) if name == PROBE_SETTING:
+            return PROBE_VALUE.fullmatch(value) is not None
+        case _:
+            return False
+
+
+def _verb(statement: str) -> str:
+    words = statement.split(maxsplit=1)
+    return words[0].upper() if words else ""
+
+
+def _sets_config(statement: str) -> bool:
+    return "set_config" in statement.lower()
 
 
 FLAVOURS = ("async", "sync")
