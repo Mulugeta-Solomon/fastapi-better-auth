@@ -10,6 +10,10 @@ notes". The full release notes for each version are on the
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.8.0] - 2026-11-27
+
 ### Added
 
 - **`BetterAuth(unavailable_status=503, unavailable_retry_after=...)`** (#122). Opt-in. By default
@@ -291,7 +295,8 @@ it.
 
 Name reservation on PyPI. Not usable.
 
-[Unreleased]: https://github.com/Mulugeta-Solomon/fastapi-better-auth/compare/v0.7.0...main
+[Unreleased]: https://github.com/Mulugeta-Solomon/fastapi-better-auth/compare/v0.8.0...main
+[0.8.0]: https://github.com/Mulugeta-Solomon/fastapi-better-auth/releases/tag/v0.8.0
 [0.7.0]: https://github.com/Mulugeta-Solomon/fastapi-better-auth/releases/tag/v0.7.0
 [0.6.0]: https://github.com/Mulugeta-Solomon/fastapi-better-auth/releases/tag/v0.6.0
 [0.5.0]: https://github.com/Mulugeta-Solomon/fastapi-better-auth/releases/tag/v0.5.0
