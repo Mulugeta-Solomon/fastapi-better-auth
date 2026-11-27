@@ -31,10 +31,12 @@ MAX_RETRY_AFTER = 300
 """Five minutes. The header is fixed, not tied to recovery, so a longer one keeps clients away
 long after the dependency is back. Thirty times the longest retry spacing the library uses."""
 DEFAULT_RETRY_AFTER = 10
-"""The library's own retry spacing: the key set is refetched at most every 10 s by default
-(`REFETCH_INTERVAL`), and Mode C's readiness probe is retried every 10 s (`PROBE_RETRY_INTERVAL`).
-A retry sooner than that is answered from the same latched state in Modes B and C, so it adds
-load and cannot succeed. Mode A's lookup deadline (5 s) is per request and fits inside it."""
+"""The library's longest default retry spacing. Two of its own latches hold for 10 s: Mode B
+refetches the key set at most every 10 s (`REFETCH_INTERVAL`), so a kid no honoured key set
+carries gets the same refusal until then, and Mode C retries an unconfirmed readiness probe every
+10 s (`PROBE_RETRY_INTERVAL`). A retry inside those windows meets the same latch. Elsewhere a retry
+can succeed sooner: Mode A asks the store again on every request (its lookup deadline is 5 s),
+and Mode C with a confirmed probe asks upstream again on the next request."""
 
 MISSING_REASON = "an AuthServiceUnavailable subclass carried no reason"
 
@@ -108,7 +110,11 @@ class UnavailablePolicy:
 
 
 def _reason_of(refusal: AuthServiceUnavailable) -> str:
-    """The `reason`, read so a third-party subclass that never set one cannot become a 500."""
+    """The `reason`, read so a third-party subclass that never set one cannot become a 500.
+
+    Read from the instance dictionary, so no third-party code runs on the refusal path. A
+    subclass that keeps its reason behind a property gets `MISSING_REASON` too.
+    """
     reason: object = vars(refusal).get("reason")
     return reason if isinstance(reason, str) else MISSING_REASON
 
