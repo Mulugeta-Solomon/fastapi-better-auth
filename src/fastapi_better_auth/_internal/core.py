@@ -388,7 +388,8 @@ class BetterAuth:
         **A predicate that raises fails closed.** The traceback is logged and the request is
         answered `NotAuthorized`, because a `500` is the one request-time answer a client can
         tell apart from every other. A `SessionError` or a `BetterAuthError` the predicate
-        raised on purpose is re-raised as itself, so a refusal you chose keeps its own shape -
+        raised on purpose is re-raised as itself, so a refusal you chose keeps its own shape,
+        except that an `AuthServiceUnavailable` takes this bridge's `unavailable_status` form -
         and an `AuthorizationRefused` reaches the client with the status and body you built it
         with, which is how a rule explains why it refused.
 
