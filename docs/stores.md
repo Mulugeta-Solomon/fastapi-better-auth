@@ -105,7 +105,7 @@ keyword-only.
 | `session_columns` | `None` | Extra `session` columns that may be selected. `None` selects every column. |
 | `user_columns` | `None` | Extra `user` columns that may be selected. `None` selects every column. |
 | `max_concurrency` | `None` | `SyncStoreAdapter` only. The most lookups that may run on worker threads at once. `None` uses the engine pool's size plus overflow, or 8 where the pool states no size. |
-| `statement_timeout` | `None` | `SqlAlchemySessionStore` only, on PostgreSQL only. Seconds after which the server ends any statement of the store. Keep it below `lookup_timeout`. `None` sends nothing of the kind. See [When the database does not answer](#when-the-database-does-not-answer). |
+| `statement_timeout` | `None` | Both stores, on PostgreSQL only. Seconds after which the server ends any statement of the store. Keep it below `lookup_timeout`. `None` sends nothing of the kind. See [When the database does not answer](#when-the-database-does-not-answer). |
 
 **Call `await store.connect()` in your lifespan.** It reads the live schema once, so a table or a
 required column that is missing stops the application at startup instead of failing the first
@@ -176,9 +176,11 @@ What happens to the call that was running depends on the store:
   after 5 seconds and frees the connection's place in the pool. When the server answers again, it
   holds no connection of the store beyond the pool's.
 - **`SyncStoreAdapter`** cannot interrupt a worker thread. The statement runs on, and its thread and
-  its connection stay taken until the database answers or the driver gives up. The adapter never
-  runs more threads than `max_concurrency`. Further lookups wait without starting a thread, and are
-  refused at their own deadline.
+  its connection stay taken until the database answers, the driver gives up, or the server ends
+  the statement. The adapter never runs more threads than `max_concurrency`. Further lookups wait
+  without starting a thread, and are refused at their own deadline. With `statement_timeout=` set,
+  the server ends the statement at the bound, and the thread's slot and its connection come back
+  then, even while the database is still blocked.
 - **`RedisSessionStore`** cancels the `GET` it was waiting for. A reply that arrives afterwards is
   never read by a later lookup, because redis-py closes the connection of a cancelled command.
   `tests/e2e/test_redis_cut_reply_live.py` proves that against a live Redis.
@@ -190,8 +192,11 @@ Set these for either store:
   [A statement timeout](#a-statement-timeout).
 - **A connect timeout in the driver.** A lookup that finds no idle connection opens one inside its
   own deadline, so keep `lookup_timeout` well above the time a new connection takes.
-- **For `SyncStoreAdapter`, a read timeout in the driver**, so a thread waiting on a server that
-  never answers is given back.
+- **For `SyncStoreAdapter`, the driver's own timeouts**, so a thread waiting on a server that never
+  answers is given back. A statement timeout cannot do this: the server never hears of a call
+  stuck opening a connection, or of one on a network path that has gone dead. psycopg and
+  psycopg2 both take libpq's connection settings for it: `connect_timeout`, the TCP keepalive
+  settings and `tcp_user_timeout`.
 
 The `[sqlalchemy]` extra needs SQLAlchemy 2.0.38 or newer. Before 2.0.24, a cancelled connection
 is dropped without cancelling its statement on the server. Before 2.0.38, a server that stops
@@ -209,9 +214,10 @@ statement timeout covers them.
 
 ### A statement timeout
 
-**On Postgres, with `SqlAlchemySessionStore`, pass `statement_timeout=`.** It bounds only the
-store's own statements, so it works on an engine the store shares with the rest of the
-application:
+**On Postgres, pass `statement_timeout=` to either SQL store.** It bounds only the store's own
+statements, so it works on an engine the store shares with the rest of the application.
+`SyncStoreAdapter` takes it with the same meaning, sends the same statements and refuses the same
+engines as `SqlAlchemySessionStore`:
 
 - Every transaction the store opens sets
   `SELECT set_config('statement_timeout', <ms>, true)` before it reads anything. That covers each
@@ -260,13 +266,29 @@ and the store's own setting still bounds its statements if you change yours late
 schema read, that setting reads as an empty string on the connection, not as unset. It needs no
 grant.
 
+**With `SyncStoreAdapter`, it is also what gives a worker thread back.** A lookup abandoned at
+its deadline keeps its thread, its slot and its pooled connection until the database call
+returns, because a thread cannot be interrupted. The server ends that call at the bound. So the
+slot and the connection come back at the bound, even while the lock or the load that held the
+statement is still there. Without the option they stay taken until the database answers.
+
+**What it does not do.** It ends a statement that a reachable server is running. It does not end
+a call stuck opening a connection, or one waiting on a network path that has gone dead, because
+the server never hears of those. On a worker thread that is the case that hurts most. It belongs
+to the driver's own settings: see the driver timeouts in
+[When the database does not answer](#when-the-database-does-not-answer).
+
 `tests/e2e/test_store_statement_timeout_live.py` and
 `tests/e2e/test_store_statement_timeout_discovery_live.py` prove all of this against a live
-Postgres on `asyncpg`, the first for a role holding only `SELECT` on the two tables. Other drivers
-are not tested.
+Postgres on `asyncpg`, the first for a role holding only `SELECT` on the two tables.
+`tests/e2e/test_sync_store_statement_timeout_live.py` and
+`tests/e2e/test_sync_store_statement_timeout_discovery_live.py` prove the same for
+`SyncStoreAdapter` on `psycopg` (3) and `psycopg2`, on asyncio and trio, and that the slot and
+the connection come back. Other drivers are not tested. psycopg2 writes each value into the
+statement's text before it sends it, so the server's activity view and its log show the session
+token of a running lookup. asyncpg and psycopg send values apart from the text.
 
-**Everywhere else, set the timeout on the role.** That covers `SyncStoreAdapter`, which has no
-`statement_timeout=`, and other databases. On Postgres:
+**Everywhere else, set the timeout on the role.** That covers other databases. On Postgres:
 `ALTER ROLE <role> SET statement_timeout = '3s'`. It applies to connections opened after it, so
 restart the application or recycle its pool. On MySQL: `max_execution_time`. A role-level timeout
 bounds every statement the role runs, so give the store a role of its own if the application must

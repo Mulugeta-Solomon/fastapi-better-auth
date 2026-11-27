@@ -34,8 +34,17 @@ notes". The full release notes for each version are on the
   shorter one. Keep it below `lookup_timeout`. A lookup the server ends is refused as
   `AuthServiceUnavailable`. An engine in `AUTOCOMMIT` is refused with `ConfigurationError`,
   because there the setting would end before the lookup runs, even where the application gives
-  its connections an equal timeout of its own. Tested on `asyncpg`. `SyncStoreAdapter` has no
-  such option; set the timeout on its role. See
+  its connections an equal timeout of its own. Tested on `asyncpg`. See
+  [A statement timeout](docs/stores.md#a-statement-timeout).
+
+- **`SyncStoreAdapter(statement_timeout=...)`**. The same option, with the same meaning, the same
+  statements and the same refusals. Unset, the adapter sends exactly what it sent before. On the
+  adapter it also gives a worker thread back. A lookup abandoned at its deadline keeps its thread,
+  its slot and its pooled connection until the database call returns. With the option set, the
+  server ends that call at the bound, so the slot and the connection come back then, even while
+  the database is still blocked. It does not end a call that never reaches the server, such as
+  one stuck opening a connection or one on a dead network path: set the driver's own timeouts
+  for that. Tested on `psycopg` (3) and `psycopg2`, on asyncio and trio. See
   [A statement timeout](docs/stores.md#a-statement-timeout).
 
 ### Fixed
