@@ -36,6 +36,7 @@ from .errors import (
 )
 from .models import Session, User, UserId
 from .reasons import safe_label
+from .unavailable import UnavailablePolicy
 
 logger = logging.getLogger("fastapi_better_auth")
 
@@ -93,13 +94,15 @@ class Membership(Generic[UserModelT, GrantT]):
     grant: GrantT
 
 
-def require_dependency(current: Dependency, predicate: object, reason: object) -> Dependency:
+def require_dependency(
+    current: Dependency, predicate: object, reason: object, unavailable: UnavailablePolicy
+) -> Dependency:
     """The dependency `BetterAuth.require` returns: the session, gated on one rule."""
     rule = _validated_predicate(predicate)
     text = _validated_reason(reason, "require")
 
     async def authorized(session: Session[Any] = Depends(current)) -> Session[Any]:
-        if permitted(rule, session):
+        if permitted(rule, session, unavailable):
             return session
         raise NotAuthorized(reason=f"{text} refused for user {session.user.id}")
 
@@ -107,7 +110,11 @@ def require_dependency(current: Dependency, predicate: object, reason: object) -
 
 
 def membership_dependency(
-    current: Dependency, id_param: object, member: object, reason: object
+    current: Dependency,
+    id_param: object,
+    member: object,
+    reason: object,
+    unavailable: UnavailablePolicy,
 ) -> Dependency:
     """The dependency `BetterAuth.require_membership` returns.
 
@@ -125,7 +132,7 @@ def membership_dependency(
         resource_id = cast("str", values[name])
         if not _usable(resource_id):
             raise NotAuthorized(reason=_unusable(text, session, name, resource_id))
-        grant = await granted(lookup, resource_id, session)
+        grant = await granted(lookup, resource_id, session, unavailable)
         if grant is None or grant is False:
             raise NotAuthorized(reason=_no_membership(text, session, name, resource_id))
         return Membership(session=session, resource_id=resource_id, grant=grant)
@@ -135,19 +142,26 @@ def membership_dependency(
     return authorized
 
 
-def permitted(predicate: Predicate, session: Session[Any]) -> bool:
+def permitted(predicate: Predicate, session: Session[Any], unavailable: UnavailablePolicy) -> bool:
     """Ask the rule, and hold it to an answer that is exactly `True`.
 
     `if predicate(...)` would admit every accidental truthy value a consumer can return - a
     database row, a non-empty error string, the coroutine object an `async def` predicate hands
     back - so the comparison is identity against `True` and everything else refuses.
+
+    An `AuthServiceUnavailable` the rule raises takes the bridge's form (`unavailable`), as one a
+    verifier raises does. Every other refusal is re-raised as itself.
     """
     try:
         answer = predicate(session)
-    except HONOURED:
+    except BetterAuthError:
         raise
+    except SessionError as refusal:
+        failure = unavailable.replacing(refusal)
+        if failure is None:
+            raise
     except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-        failure = _resolved(exc, PREDICATE)
+        failure = _resolved(exc, PREDICATE, unavailable)
     else:
         return _exactly_true(answer)
     # Decided inside the handler (so _contained logs the accident), raised outside it: raised in
@@ -155,22 +169,29 @@ def permitted(predicate: Predicate, session: Session[Any]) -> bool:
     raise failure from None
 
 
-async def granted(member: Member, resource_id: str, session: Session[Any]) -> Any:
+async def granted(
+    member: Member, resource_id: str, session: Session[Any], unavailable: UnavailablePolicy
+) -> Any:
     """Run the consumer's membership query under the same containment the dispatcher uses.
 
     The whole call is inside the `try`, not just the `await`: a plain `def` that raises before
     returning its coroutine does that work synchronously, and a containment wrapping only the
-    `await` would never see it (D-064).
+    `await` would never see it (D-064). An `AuthServiceUnavailable` takes the bridge's form, as
+    in `permitted`.
     """
     try:
         answer = member(resource_id, session)
         if not inspect.isawaitable(answer):
             raise ConfigurationError(SYNC_LOOKUP)
         return await answer
-    except HONOURED:
+    except BetterAuthError:
         raise
+    except SessionError as refusal:
+        failure = unavailable.replacing(refusal)
+        if failure is None:
+            raise
     except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-        failure = _resolved(exc, LOOKUP)
+        failure = _resolved(exc, LOOKUP, unavailable)
     raise failure from None  # outside the handler, as in `permitted`
 
 
@@ -181,7 +202,7 @@ def _exactly_true(answer: object) -> bool:
     return answer is True
 
 
-def _resolved(exc: Exception, what: str) -> BaseException:
+def _resolved(exc: Exception, what: str, unavailable: UnavailablePolicy) -> BaseException:
     """Decide whether an escaping exception is an answer or an accident (D-066).
 
     The one place an `AuthorizationRefused` is honoured, bare or as a group's single leaf - and
@@ -189,7 +210,7 @@ def _resolved(exc: Exception, what: str) -> BaseException:
     """
     leaf = unwrapped(exc)
     if isinstance(leaf, HONOURED):
-        return leaf
+        return unavailable.replacing(leaf) or leaf
     if isinstance(leaf, AuthorizationRefused):
         return _answered(leaf, what)
     return _contained(leaf, what)

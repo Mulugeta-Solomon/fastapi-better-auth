@@ -415,7 +415,7 @@ class BetterAuth:
             AuthorizationRefused: At request time, when the predicate raises one on purpose.
         """
         current = self.current_session(user_model=user_model)
-        built = require_dependency(current, predicate, reason)
+        built = require_dependency(current, predicate, reason, self._unavailable)
         return cast("Callable[..., Awaitable[Session[UserModelT]]]", built)
 
     def require_membership(
@@ -487,7 +487,7 @@ class BetterAuth:
             AuthorizationRefused: At request time, when `member` raises one on purpose.
         """
         current = self.current_session(user_model=user_model)
-        built = membership_dependency(current, id_param, member, reason)
+        built = membership_dependency(current, id_param, member, reason, self._unavailable)
         return cast("Callable[..., Awaitable[Membership[UserModelT, GrantT]]]", built)
 
     def _require(self, user_model: type[UserModelT]) -> Dependency:

@@ -27,6 +27,7 @@ from exceptiongroup import ExceptionGroup
 
 from fastapi_better_auth import AuthorizationRefused, NotAuthorized, Session
 from fastapi_better_auth._internal.authz import permitted
+from fastapi_better_auth._internal.unavailable import UnavailablePolicy
 from tests.fakes import GOOD_CREDENTIAL, client
 from tests.log_hygiene import LIBRARY_LOGGER, capturing, rendered
 from tests.test_authz import FORBIDDEN, HEADER, Member, one_verifier
@@ -273,7 +274,7 @@ def test_an_honoured_refusal_leaves_with_the_very_headers_it_was_judged_by() -> 
         raise refusal
 
     with pytest.raises(AuthorizationRefused) as caught:
-        permitted(refuse, session)
+        permitted(refuse, session, UnavailablePolicy(retry_after=None))
 
     kept = caught.value.headers
     assert kept == {"X-Tag": "reassigned"}
