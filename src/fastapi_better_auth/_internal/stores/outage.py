@@ -1,7 +1,7 @@
 """What a store lookup that could not complete tells an operator: once per kind, until one completes.
 
-An under-granted role or a database gone away turns every request into the uniform 401, and the
-refusal's `reason` reaches only a handler the deployment wrote - so the store warns itself (R47),
+An under-granted role or a database gone away turns every request into a refusal (the uniform
+401, or a 503 for a bridge that opted in), and the refusal's `reason` reaches only a handler the deployment wrote - so the store warns itself (R47),
 and so does `CookieVerifier` for a failure a store did not translate (R47a). Not once per request:
 an outage fails every request, and a line per request would bury the log in exactly the event it
 reports. The latch holds one entry per distinct failure kind and is emptied by the next lookup

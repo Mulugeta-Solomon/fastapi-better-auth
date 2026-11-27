@@ -24,8 +24,8 @@ class UntrustedResponse(Exception):
     verifier that made the call knows that, and translating is its job. The base-class choice
     is the safety net for the day it forgets: an escaping `BetterAuthError` is honoured by
     dispatch and would leave as a 500 - the one request-time answer a client can tell apart
-    from every other - while this is contained as the uniform 401 like any other stray
-    exception, which is the direction a security library should fail in.
+    from every other - while this is contained as a refusal like any other stray exception,
+    which is the direction a security library should fail in.
 
     Its two concrete forms - `ResponseTooLarge` and `ContentEncodingRejected` - are the two
     ways a body can be refused before it is trusted. A network timeout is not one of them: it
@@ -49,7 +49,7 @@ class ResponseTooLarge(UntrustedResponse):
             raise AuthServiceUnavailable(reason="jwks fetch failed") from None
 
     An `UntrustedResponse`, so it stays outside the taxonomy for the reasons stated there: an
-    untranslated one fails closed as the uniform 401 rather than escaping as a 500.
+    untranslated one fails closed as a refusal rather than escaping as a 500.
 
     Args:
         max_bytes: Keyword-only, required. The cap that was exceeded. How far past it the
