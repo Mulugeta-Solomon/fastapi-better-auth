@@ -136,6 +136,10 @@ One Mode B effect to expect: the same token can get a `401` and later a `503`. A
 key set did not carry is remembered as absent, and once the key set goes stale and cannot be
 refetched, that key id is answered `503`.
 
+`tests/e2e/test_unavailable_live.py` proves both settings against a live Postgres that stops
+answering. A signed-in user gets the `401` or the `503` while the session table is locked, and is
+accepted again once the lock goes.
+
 ## Your own error envelope
 
 If your API wraps every response in a house envelope, the same handler that logs `exc.reason` is
