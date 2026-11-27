@@ -384,7 +384,7 @@ class SqlAlchemySessionStore(_CoreStore):
             await _returned(connection)
 
     async def _bounded(self, connection: AsyncConnection, *, confirm: bool = False) -> None:
-        """Open the transaction with the store's bound, when it has one; else send nothing.
+        """Set the store's bound on the transaction just opened, when it has one; else send nothing.
 
         Sent before any read in every transaction the store opens, so every read after it is
         bounded, and transaction-local, so it ends with the `ROLLBACK` `_returned` sends. On an
