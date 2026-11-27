@@ -158,7 +158,9 @@ as a whole.
 ## When the database does not answer
 
 `CookieVerifier` gives one request's store lookups `lookup_timeout` seconds together, 5 by default.
-A request that runs out is refused as `AuthServiceUnavailable`, the uniform `401`. One `WARNING` of
+A request that runs out is refused as `AuthServiceUnavailable`, the uniform `401`, or the `503`
+under [the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down). Route code that calls the store itself gets the exception as the store raised it, whatever
+the setting. One `WARNING` of
 the kind `LookupDeadlineExceeded` is logged, and not again until a lookup completes. A lookup is
 also cancelled when its request is cancelled, as a server may do when the client has gone.
 
