@@ -7,18 +7,20 @@ is built, so a deployment that asked for something this library cannot answer ne
 from __future__ import annotations
 
 import inspect
+from enum import IntEnum
 from http import HTTPStatus
 from typing import Any
 
 import pytest
 
-from fastapi_better_auth import BetterAuth, ConfigurationError
+from fastapi_better_auth import AuthServiceUnavailable, BetterAuth, ConfigurationError
 from fastapi_better_auth._internal.unavailable import (
     DEFAULT_RETRY_AFTER,
     MAX_RETRY_AFTER,
     MIN_RETRY_AFTER,
 )
-from tests.fakes import FakeVerifier
+from tests.fakes import FakeVerifier, TestClient, session_app
+from tests.unavailable_support import RaisingVerifier
 
 HEADER = "x-cred"
 
@@ -128,13 +130,73 @@ def test_a_non_int_refusal_names_only_its_type() -> None:
     assert "str" in text
 
 
-def test_an_int_subclass_status_is_kept_as_a_plain_int() -> None:
-    """`HTTPStatus` is accepted because it is that number; what is kept is the number."""
-    auth = build(unavailable_status=HTTPStatus.SERVICE_UNAVAILABLE, unavailable_retry_after=7)
+def test_an_http_status_is_accepted_as_the_number_it_is() -> None:
+    """`HTTPStatus` is accepted because it is that number."""
+    build(unavailable_status=HTTPStatus.SERVICE_UNAVAILABLE)
+    build(unavailable_status=HTTPStatus.UNAUTHORIZED)
 
-    policy = auth._unavailable  # pyright: ignore[reportPrivateUsage]
-    assert type(policy.retry_after) is int
-    assert policy.retry_after == 7
+
+TRUE_SECONDS = 12
+"""Neither the default nor any bound, so a kept number cannot match one by accident."""
+
+
+class LyingSeconds(int):
+    """An int whose every hook lies: only `int`'s own methods read the true number."""
+
+    def __str__(self) -> str:
+        return "Pause.TEN"
+
+    __repr__ = __str__
+
+    def __int__(self) -> int:
+        return 99
+
+    def __index__(self) -> int:
+        return 99
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __hash__(self) -> int:
+        return 0
+
+    def __lt__(self, other: object) -> bool:
+        return False
+
+    def __le__(self, other: object) -> bool:
+        return True
+
+    def __gt__(self, other: object) -> bool:
+        return False
+
+    def __ge__(self, other: object) -> bool:
+        return True
+
+
+class Pause(IntEnum):
+    TWELVE = TRUE_SECONDS
+
+
+@pytest.mark.parametrize(
+    "retry_after", [LyingSeconds(TRUE_SECONDS), Pause.TWELVE], ids=["liar", "int-enum"]
+)
+def test_an_int_subclass_retry_after_is_kept_and_sent_as_a_plain_int(retry_after: int) -> None:
+    """The retry-after is stored and then written into a header, so what is kept must be the
+    built-in number: `str()` of an `IntEnum` member is its name on Python 3.10."""
+    auth = BetterAuth(
+        verifiers=[RaisingVerifier(HEADER, lambda: AuthServiceUnavailable(reason="down"))],
+        unavailable_status=503,
+        unavailable_retry_after=retry_after,
+    )
+
+    kept = auth._unavailable.retry_after  # pyright: ignore[reportPrivateUsage]
+    with TestClient(session_app(auth)) as http:
+        response = http.get("/required", headers={HEADER: "x"})
+
+    assert type(kept) is int
+    assert int.__repr__(kept) == str(TRUE_SECONDS)
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == str(TRUE_SECONDS)
 
 
 def test_from_env_reads_no_variable_for_either_setting(monkeypatch: pytest.MonkeyPatch) -> None:
