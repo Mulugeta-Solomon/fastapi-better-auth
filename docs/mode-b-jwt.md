@@ -91,7 +91,8 @@ what happens after that. All ages are measured on the monotonic clock.
   successful fetch. One `WARNING` is logged per failed refresh: `jwks refresh failed for <uri>;
   serving the key set on hand`.
 - **Older than `max_stale`.** The set is no longer used. Every token is refused as
-  `AuthServiceUnavailable`, the uniform `401`, until a refresh succeeds. A key the auth server
+  `AuthServiceUnavailable`, the uniform `401` (or the `503` under [the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down)), until a refresh
+  succeeds. A key the auth server
   withdrew therefore stops verifying here within `max_stale`, even when this service cannot reach
   the key set.
 - **Unknown `kid`.** The request triggers a fetch and waits for it. At most one fetch happens per
@@ -106,7 +107,10 @@ The key-set body is capped at 64 KiB and 32 keys. A key published with `use` oth
 ## What Mode B refuses
 
 Every refusal is a `SessionError`, so the response is the uniform `401` whatever went wrong. See
-[Errors](errors.md).
+[Errors](errors.md). The one exception is opt-in: `AuthServiceUnavailable` can answer `503`, and
+then a forged token with a well-formed header and an unknown key id can get it, because the key
+set is asked before any signature is checked. See
+[Answering 503](errors.md#answering-503-while-the-auth-service-is-down).
 
 - An algorithm outside the allowlist, checked against the token header before any key is looked
   at.
