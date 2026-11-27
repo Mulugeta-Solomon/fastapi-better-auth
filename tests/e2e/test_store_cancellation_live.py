@@ -23,7 +23,8 @@ a store that answers as soon as the relay forwards again.
 
 Every case runs twice where the build has `statement_timeout=`: without it, and with a bound no
 case reaches, because each transaction then opens with one more statement (two at discovery,
-the probe and the bound) for a stall or a cancellation to land in. One more case lands the stall exactly there.
+the probe and the bound) for a stall or a cancellation to land in. One more case lands the stall
+exactly there.
 
 Asyncio only: `asyncpg` drives the event loop directly, as in every other store-backed lane.
 """

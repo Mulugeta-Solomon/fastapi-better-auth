@@ -1,10 +1,11 @@
 """`SqlAlchemySessionStore(statement_timeout=...)` as SQL: the bound set, and proven to hold.
 
 The store sends `timeout_statement` before any read in every transaction it opens (at discovery,
-just after the probe below). It sets Postgres's `statement_timeout` for that transaction alone. A function call rather than `SET LOCAL`, because a
-utility statement takes no bound parameter: the value would have to be written into the SQL text.
-Here it travels as a parameter, and the literal `true` makes the setting transaction-local. It
-ends with the transaction, so it never reaches another checkout of the pool the store shares.
+just after the probe below). It sets Postgres's `statement_timeout` for that transaction alone. A
+function call rather than `SET LOCAL`, because a utility statement takes no bound parameter: the
+value would have to be written into the SQL text. Here it travels as a parameter, and the literal
+`true` makes the setting transaction-local. It ends with the transaction, so it never reaches
+another checkout of the pool the store shares.
 
 That also means it holds only inside a transaction. On an engine in `AUTOCOMMIT` every statement
 is a transaction of its own, the setting ends with the statement that made it, and the lookup

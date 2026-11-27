@@ -257,8 +257,10 @@ and the store's own setting still bounds its statements if you change yours late
 schema read, that setting reads as an empty string on the connection, not as unset. It needs no
 grant.
 
-`tests/e2e/test_store_statement_timeout_live.py` proves all of this against a live Postgres on
-`asyncpg`, for a role holding only `SELECT` on the two tables. Other drivers are not tested.
+`tests/e2e/test_store_statement_timeout_live.py` and
+`tests/e2e/test_store_statement_timeout_discovery_live.py` prove all of this against a live
+Postgres on `asyncpg`, the first for a role holding only `SELECT` on the two tables. Other drivers
+are not tested.
 
 **Everywhere else, set the timeout on the role.** That covers `SyncStoreAdapter`, which has no
 `statement_timeout=`, and other databases. On Postgres:

@@ -279,23 +279,25 @@ class SqlAlchemySessionStore(_CoreStore):
     that setting without touching the role or the pool the application lends: a role-level or
     engine-level timeout would bound every other statement the application runs as well. Set,
     every transaction the store opens - each lookup, and the schema read that `connect()` and the
-    first lookup run - sets `SELECT set_config('statement_timeout', :ms, true)` first, the value
-    rounded up to whole milliseconds (discovery sets its probe, below, just before it). The setting is transaction-local, so it ends with the
-    `ROLLBACK` the store sends, and no other checkout of the pool ever sees it. For the store's
-    own transactions it replaces a role-level or database-level value, even a shorter one. Keep it
-    below `lookup_timeout`. A lookup the server ends is refused as above (`AuthServiceUnavailable`,
-    one WARNING naming SQLSTATE 57014); a schema read it ends raises from `connect()` as any
-    database error does. It bounds the statements after it in each transaction, not itself, the
-    `ROLLBACK`, or what SQLAlchemy sends to open a connection. On an engine in `AUTOCOMMIT` the
-    setting would end with the statement that made it, so the store refuses such an engine with a
+    first lookup run - sends `SELECT set_config('statement_timeout', :ms, true)` before it reads
+    anything, the value rounded up to whole milliseconds (discovery sets its probe, below, just
+    before it). The setting is transaction-local, so it ends with the `ROLLBACK` the store sends,
+    and no other checkout of the pool ever sees it. For the store's own transactions it replaces
+    a role-level or database-level value, even a shorter one. Keep it below `lookup_timeout`. A
+    lookup the server ends is refused as above (`AuthServiceUnavailable`, one WARNING naming
+    SQLSTATE 57014); a schema read it ends raises from `connect()` as any database error does. It
+    bounds the statements after it in each transaction, not itself, the `ROLLBACK`, or what
+    SQLAlchemy sends to open a connection. On an engine in `AUTOCOMMIT` the setting would end
+    with the statement that made it, so the store refuses such an engine with a
     `ConfigurationError` before any lookup reaches the database: from the engine's options before
     every transaction, and from the setting read back at discovery. The readback is proven to be
     the store's own: discovery first sets a random probe, transaction-locally, in a custom setting
     of the library's (`fastapi_better_auth.discovery_probe`), and reads it back with the bound. So
     an application's own session-level value, even one equal to the store's, does not pass for
     it. Afterwards that setting reads as an empty string on the lent connection. Tested on
-    asyncpg; the role needs no grant beyond the `SELECT` above. `SyncStoreAdapter` has no such option: give its
-    role the timeout (`ALTER ROLE ... SET statement_timeout`), as for any other database.
+    asyncpg; the role needs no grant beyond the `SELECT` above. `SyncStoreAdapter` has no such
+    option: give its role the timeout (`ALTER ROLE ... SET statement_timeout`), as for any other
+    database.
 
     Args:
         engine: An `AsyncEngine`. Always injected, never built here: the pool, the TLS

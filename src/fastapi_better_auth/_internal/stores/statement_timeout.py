@@ -43,9 +43,9 @@ def milliseconds(seconds: float) -> int:
 
     `repr` of a float is the shortest decimal that reads back as the same float, so `Fraction`
     of it is exactly the number the caller wrote, and stays exact when multiplied. An int is
-    exact already. The built-in types are asked,
-    never the value's own class: a subclass may print itself as anything (NumPy's `float64`, an
-    `IntEnum`), and its value is still the number given.
+    exact already. The built-in types are asked, never the value's own class: a subclass may
+    print itself as anything (NumPy's `float64`, an `IntEnum`), and its value is still the number
+    given.
     """
     written = int(seconds) if isinstance(seconds, int) else float.__repr__(float(seconds))
     return math.ceil(Fraction(written) * MILLISECONDS_PER_SECOND)
