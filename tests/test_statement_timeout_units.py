@@ -18,6 +18,7 @@ Only this discovery's own probe, with the store's value set in this session, is 
 
 from __future__ import annotations
 
+import decimal
 import enum
 from typing import Any, cast
 
@@ -89,6 +90,27 @@ def test_a_number_is_read_by_its_value_not_by_a_repr_of_its_own(
     """The conversion reads the decimal a float was written as, which is the built-in float's
     `repr`. A subclass may print itself as anything; its value is still the number given."""
     assert statement_timeout.milliseconds(seconds) == expected
+
+
+LOW_PRECISION = 3
+"""Fewer significant digits than `1.001` seconds needs in milliseconds."""
+
+
+@pytest.mark.parametrize(("seconds", "expected"), [(1.001, 1001), (16.1, 16100), (0.0001, 1)])
+def test_the_conversion_ignores_the_callers_decimal_precision(
+    seconds: float, expected: int
+) -> None:
+    """The caller's thread may run with any decimal context. The conversion must not use it."""
+    with decimal.localcontext() as context:
+        context.prec = LOW_PRECISION
+        assert statement_timeout.milliseconds(seconds) == expected
+
+
+def test_the_conversion_raises_nothing_where_the_caller_traps_inexact() -> None:
+    with decimal.localcontext() as context:
+        context.prec = LOW_PRECISION
+        context.traps[decimal.Inexact] = True
+        assert statement_timeout.milliseconds(1.001) == 1001
 
 
 def test_the_maximum_is_postgres_own() -> None:
