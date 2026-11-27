@@ -8,7 +8,9 @@ is not a Python port of Better Auth. Sign-up, sign-in, OAuth and 2FA stay on the
 Community-maintained; not affiliated with or endorsed by Better Auth.
 
 Every change is tested in CI against real Better Auth servers, not mocks. A credential that does
-not verify is always refused, with one uniform answer, whatever the reason.
+not verify is always refused, with one uniform answer, whatever the reason. An auth service that
+cannot answer gets that same answer by default, or a `503` with
+[the opt-in](https://github.com/Mulugeta-Solomon/fastapi-better-auth/blob/main/docs/errors.md#answering-503-while-the-auth-service-is-down).
 
 > **If your Better Auth server mounts `bearer()`, set `requireSignature: true`.** It defaults to
 > `false`, and then a raw session token in a log or a backup is a working credential. See

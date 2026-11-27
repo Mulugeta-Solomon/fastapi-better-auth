@@ -49,6 +49,7 @@ from fastapi_better_auth._internal.once import Once
 from fastapi_better_auth._internal.reasons import REDACTED, fingerprint
 from fastapi_better_auth._internal.remote_backoff import BackoffLatch
 from fastapi_better_auth._internal.stores.outage import MAX_REPORTED_KINDS
+from fastapi_better_auth._internal.unavailable import UnavailablePolicy
 from tests.cookies import COOKIE, FakeStore, http, run, sign, verifier
 from tests.fakes import connection, resolver_of
 from tests.log_hygiene import (
@@ -159,7 +160,7 @@ def test_an_escaped_authorization_callback_logs_no_credential(
         raise RuntimeError("the policy table could not be read")
 
     with pytest.raises(NotAuthorized) as caught:
-        permitted(explode, session)
+        permitted(explode, session, UnavailablePolicy(retry_after=None))
 
     assert_template_fired(records, manifest_site("the %s raised"))
     assert_no_leak(records, token)
@@ -188,7 +189,7 @@ def test_a_refusal_the_gate_will_not_honour_logs_no_header_no_detail_and_no_cred
         raise refusal
 
     with pytest.raises(NotAuthorized) as caught:
-        permitted(refuse, session)
+        permitted(refuse, session, UnavailablePolicy(retry_after=None))
 
     assert_template_fired(records, manifest_site("the %s refused with"))
     assert_no_leak(records, token)

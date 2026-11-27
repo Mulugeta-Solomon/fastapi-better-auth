@@ -73,9 +73,10 @@ schema is one `PUBLIC` holds on `public` by default — only a non-default `sche
 granted. Granting no more is what turns the read-only property into a database guarantee: Postgres
 itself refuses every `INSERT`, `UPDATE` and `DELETE` the role attempts. Grant less — `SELECT` on
 `session` alone — and `connect()` still succeeds (discovery reads the system catalog, which needs no
-grant), then every lookup answers the uniform `401` as `AuthServiceUnavailable`, and the store logs
-one `WARNING` naming the driver error and its SQLSTATE (`42501`, insufficient privilege) — once per
-kind of failure until a lookup completes again, never the token.
+grant), then every lookup is refused as `AuthServiceUnavailable` (the uniform `401`, or the `503`
+under [the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down)), and the store
+logs one `WARNING` naming the driver error and its SQLSTATE (`42501`, insufficient privilege) —
+once per kind of failure until a lookup completes again, never the token.
 `tests/e2e/test_store_grants_live.py` proves the grant, the refused writes and that answer against a
 live Postgres.
 
@@ -139,7 +140,9 @@ changes there.
 already covers it. The second `GET` is sent only when the first found a session the store could
 read; a miss stops before it. If the Redis user may not read the key, the store raises redis-py's
 error for that lookup. `CookieVerifier` then refuses the request as `AuthServiceUnavailable`, the
-uniform `401`. It logs one `WARNING`, and no more until a lookup completes.
+uniform `401`, or the `503` under
+[the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down). It logs one
+`WARNING`, and no more until a lookup completes.
 
 **A revocation the store cannot read is still a revocation.** If the key holds anything but a
 whole number of milliseconds, or the session has no readable `createdAt` while the key exists,
@@ -158,9 +161,12 @@ as a whole.
 ## When the database does not answer
 
 `CookieVerifier` gives one request's store lookups `lookup_timeout` seconds together, 5 by default.
-A request that runs out is refused as `AuthServiceUnavailable`, the uniform `401`. One `WARNING` of
-the kind `LookupDeadlineExceeded` is logged, and not again until a lookup completes. A lookup is
-also cancelled when its request is cancelled, as a server may do when the client has gone.
+A request that runs out is refused as `AuthServiceUnavailable`, the uniform `401`, or the `503`
+under [the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down). Route code that
+calls the store itself gets the exception as the store raised it, whatever the setting. One
+`WARNING` of the kind `LookupDeadlineExceeded` is logged, and not again until a lookup completes.
+A lookup is also cancelled when its request is cancelled, as a server may do when the client has
+gone.
 
 What happens to the call that was running depends on the store:
 
@@ -232,10 +238,13 @@ application:
   setting held (see below).
 - The role needs no grant for it beyond `SELECT` on the two tables.
 
-When the server ends a lookup, the store raises `AuthServiceUnavailable`, the uniform `401`. It
-logs one `WARNING` naming SQLSTATE `57014`, and no more until a lookup completes. When the server
-ends the schema read in `connect()`, `connect()` raises SQLAlchemy's `DBAPIError`, as it does for
-any database error. Nothing is kept, so the next `connect()` or lookup reads the schema again.
+When the server ends a lookup, the store raises `AuthServiceUnavailable`, whatever the setting,
+and route code that calls the store gets it as raised. The bridge answers it with the uniform
+`401`, or the `503` under
+[the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down). The store logs one
+`WARNING` naming SQLSTATE `57014`, and no more until a lookup completes. When the server ends the
+schema read in `connect()`, `connect()` raises SQLAlchemy's `DBAPIError`, as it does for any
+database error. Nothing is kept, so the next `connect()` or lookup reads the schema again.
 
 **An engine in `AUTOCOMMIT` is refused.** There each statement is a transaction of its own, so the
 setting would end before the lookup runs. With `statement_timeout=` set, `connect()` and every

@@ -84,9 +84,10 @@ class SessionError(HTTPException):
     Every failure in the 401 family renders a byte-identical response - same status, same
     body, same headers - so a client cannot tell a bad signature from an expired session
     from an unreachable auth service, and cannot use the difference to probe for valid
-    identifiers. That guarantee covers the response only; closing the timing channel
-    between a local signature check and a timed-out network call is the verifier's
-    timeout budget to own, not this class's.
+    identifiers. The one opt-in exception is `AuthServiceUnavailable` under
+    `BetterAuth(unavailable_status=503)`; see that class. That guarantee covers the response
+    only; closing the timing channel between a local signature check and a timed-out network
+    call is the verifier's timeout budget to own, not this class's.
 
     `reason` reaches operators through a registered exception handler, through `.reason`,
     and through `repr()`. It is absent from `str()` and from every response. Note that a
@@ -184,9 +185,16 @@ class SessionRevoked(SessionError):
 class AuthServiceUnavailable(SessionError):
     """The session could not be verified because a dependency was unreachable.
 
-    Answered as 401 on purpose: a session this library cannot verify is a session it
-    must not honour, and the state of an internal auth service is not something a client
-    gets to learn from a status code.
+    Answered as 401 by default, on purpose: a session this library cannot verify is a
+    session it must not honour, and the state of an internal auth service is not something
+    a client gets to learn from a status code.
+
+    A bridge built with `BetterAuth(unavailable_status=503)` answers it as 503 instead, with
+    `Retry-After`, the body "Service unavailable" and no `WWW-Authenticate` challenge, for
+    every dependency it builds, its rules included. The exception a handler then sees is
+    still an `AuthServiceUnavailable` with the same `reason`, and its `response_status`,
+    `response_detail` and `response_headers` say 503. It is not the application's own
+    subclass, if one was raised. A 503 is still a refusal.
     """
 
 

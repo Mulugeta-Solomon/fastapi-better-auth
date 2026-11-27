@@ -45,7 +45,7 @@ import inspect
 import logging
 import secrets
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Iterator
 from typing import Any
 
 import anyio
@@ -58,6 +58,7 @@ from fastapi_better_auth import AuthServiceUnavailable, ConfigurationError, Sess
 
 from .conftest import PASSWORD, POSTGRES_URL, raw_token, sign_in, sign_out, sign_up
 from .roles import READ_BOTH, as_superuser, engine_as, login_granted
+from .table_copies import table_copies, until
 
 try:
     # Post-0.1.0 names belong under the guard: the published-wheel lane must skip, not raise.
@@ -89,10 +90,6 @@ CLIENT_SIDE = LOOKUP_TIMEOUT / 4
 plus a few milliseconds."""
 QUERY_CANCELED = "57014"
 POOL_SIZE = 2
-BACKSTOP = 10.0
-"""How long a wait for a condition may take before the case fails. Healthy runs take tens of
-milliseconds; this only ever runs out red."""
-POLL = 0.05
 
 FORGED_TOKEN = "a-token-that-names-no-session"
 FORGED = f"{COOKIE}={sign(FORGED_TOKEN)}"
@@ -118,22 +115,9 @@ async def observer() -> AsyncIterator[AsyncEngine]:
 
 @pytest.fixture
 async def schema(harness: str, observer: AsyncEngine) -> AsyncIterator[str]:
-    """Empty copies of the two tables in a schema nobody else reads, dropped however it ends.
-
-    `INCLUDING ALL` copies the column defaults, and a default is what makes discovery wait on a
-    lock of the table (`pg_get_expr` opens it)."""
-    name = f"wp56_{secrets.token_hex(6)}"
-    async with observer.begin() as connection:
-        await connection.execute(text(f"CREATE SCHEMA {name}"))
-        for table in ('"user"', "session"):
-            await connection.execute(
-                text(f"CREATE TABLE {name}.{table} (LIKE public.{table} INCLUDING ALL)")
-            )
-    try:
+    """Empty copies of the two tables in a schema nobody else reads (`table_copies`)."""
+    async with table_copies(observer, "wp56") as name:
         yield name
-    finally:
-        async with observer.begin() as connection:
-            await connection.execute(text(f"DROP SCHEMA {name} CASCADE"))
 
 
 @pytest.fixture
@@ -180,15 +164,6 @@ async def server_value(observer: AsyncEngine) -> str:
 async def waiting_on_a_lock(observer: AsyncEngine, name: str) -> int:
     async with observer.connect() as connection:
         return int(await connection.scalar(text(WAITING_ON_A_LOCK), {"name": name}) or 0)
-
-
-async def until(condition: Callable[[], Awaitable[bool]], what: str) -> None:
-    """Poll `condition` until it holds; fail, naming `what`, if `BACKSTOP` runs out first."""
-    give_up = time.monotonic() + BACKSTOP
-    while not await condition():
-        if time.monotonic() > give_up:
-            pytest.fail(f"{what} did not happen within {BACKSTOP}s")
-        await asyncio.sleep(POLL)
 
 
 async def one_lookup(built: CookieVerifier) -> str:

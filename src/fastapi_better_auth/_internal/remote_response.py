@@ -13,8 +13,9 @@ traceback here. And the token comparison, expiry and ban are decided against the
 verifier forwarded, in the verifier's own frame; this module only proves the response is a
 trustworthy document, never that it is *this* request's session.
 
-There is no 503 in the taxonomy and none is added: every unreachable/unreadable outcome is an
-`AuthServiceUnavailable`, which is a 401 on the wire, indistinguishable from every other refusal.
+Every unreachable or unreadable outcome is an `AuthServiceUnavailable`. By default that is a 401
+on the wire, indistinguishable from every other refusal; a bridge built with
+`BetterAuth(unavailable_status=503)` answers it as a 503 instead.
 """
 
 from __future__ import annotations

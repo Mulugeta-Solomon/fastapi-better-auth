@@ -12,6 +12,19 @@ notes". The full release notes for each version are on the
 
 ### Added
 
+- **`BetterAuth(unavailable_status=503, unavailable_retry_after=...)`** (#122). Opt-in. By default
+  an auth dependency that cannot answer is the uniform `401`, and a browser reads that as "the
+  session ended", so during an outage every signed-in user is shown a false sign-in prompt. With
+  `unavailable_status=503`, `AuthServiceUnavailable` answers `503`, the body
+  `{"detail": "Service unavailable"}`, `Retry-After` (whole seconds, 1 to 300, default 10) and no
+  `WWW-Authenticate` challenge. It covers every dependency `BetterAuth` builds, `require` and
+  `require_membership` rules included, and a WebSocket handshake's denial. It does not cover route
+  code that calls a store or a verifier itself. Every other refusal is unchanged, and with the
+  default nothing changes. The cost: any caller learns that the auth dependency is failing and
+  that its credential passed the checks made before it was asked, and `5xx` rates rise during an
+  outage. `from_env()` reads no new variable. See
+  [Answering 503 while the auth service is down](docs/errors.md#answering-503-while-the-auth-service-is-down).
+
 - **`SqlAlchemySessionStore(statement_timeout=...)`** (#121). Seconds, `None` by default, and
   PostgreSQL only. When set, every transaction the store opens sets a transaction-local
   `statement_timeout` before it reads anything, so the server ends any statement of the store

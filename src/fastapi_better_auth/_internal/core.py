@@ -13,6 +13,7 @@ from fastapi import Depends
 from starlette.requests import HTTPConnection
 
 from .authz import Membership, membership_dependency, require_dependency
+from .construction import validate_user_model, validated_verifiers
 from .containment import unwrapped
 from .errors import (
     AmbiguousCredentials,
@@ -22,9 +23,9 @@ from .errors import (
     MissingCredential,
     SessionError,
 )
-from .labels import collision_key
 from .models import Session, User
 from .openapi import declaring, schemes_for
+from .unavailable import UNAUTHORIZED, UnavailablePolicy, unavailable_policy
 from .verifiers import PreparedVerifier, Verifier
 
 logger = logging.getLogger("fastapi_better_auth")
@@ -124,10 +125,18 @@ class BetterAuth:
         verifiers: One or more verifiers, in the order their credentials should be looked
             for. Each must satisfy the `Verifier` protocol and validate its own
             configuration in its own `__init__`.
+        unavailable_status: What an `AuthServiceUnavailable` answers: `401` (the default), the
+            uniform refusal every other credential failure gets, or `503`, with `Retry-After`,
+            the body `{"detail": "Service unavailable"}` and no `WWW-Authenticate` challenge.
+            Nothing else changes. Every other refusal keeps its answer.
+        unavailable_retry_after: Whole seconds for `Retry-After`, from 1 to 300. Only with
+            `unavailable_status=503`, where it defaults to 10.
 
     Raises:
         ConfigurationError: For every construction-time refusal, all of them before a request
-            exists: the sequence is empty or is not a sequence; an entry does not implement
+            exists: `unavailable_status` is not 401 or 503, or `unavailable_retry_after` is
+            given without 503 or is not whole seconds in range; the sequence is empty or is
+            not a sequence; an entry does not implement
             `Verifier`, has a non-callable `extract`/`verify`, declares an `async def extract`,
             or declares a blank `credential_source`; the same verifier appears twice; two
             verifiers declare the same `credential_source` - or cookie labels naming one cookie
@@ -137,8 +146,15 @@ class BetterAuth:
             other.
     """
 
-    def __init__(self, *, verifiers: Sequence[Verifier]) -> None:
-        self._verifiers = _validated(verifiers)
+    def __init__(
+        self,
+        *,
+        verifiers: Sequence[Verifier],
+        unavailable_status: int = UNAUTHORIZED,
+        unavailable_retry_after: int | None = None,
+    ) -> None:
+        self._unavailable = unavailable_policy(unavailable_status, unavailable_retry_after)
+        self._verifiers = validated_verifiers(verifiers)
         self._nothing = _nothing_presented(self._verifiers)
         self._declared = declaring(schemes_for(self._verifiers))
         self._resolvers: dict[type[User], Resolver] = {}
@@ -279,7 +295,7 @@ class BetterAuth:
             AmbiguousCredentials: At request time, when two or more verifiers did.
             SessionError: At request time, whatever the chosen verifier raised.
         """
-        _validate_user_model(user_model)
+        validate_user_model(user_model)
         cached = self._required.get(user_model)
         if cached is None:
             cached = self._required.setdefault(user_model, self._require(user_model))
@@ -328,7 +344,7 @@ class BetterAuth:
             SessionError: At request time, for any credential that was presented and did
                 not verify.
         """
-        _validate_user_model(user_model)
+        validate_user_model(user_model)
         cached = self._optional.get(user_model)
         if cached is None:
             cached = self._optional.setdefault(user_model, self._allow(user_model))
@@ -372,7 +388,8 @@ class BetterAuth:
         **A predicate that raises fails closed.** The traceback is logged and the request is
         answered `NotAuthorized`, because a `500` is the one request-time answer a client can
         tell apart from every other. A `SessionError` or a `BetterAuthError` the predicate
-        raised on purpose is re-raised as itself, so a refusal you chose keeps its own shape -
+        raised on purpose is re-raised as itself, so a refusal you chose keeps its own shape,
+        except that an `AuthServiceUnavailable` takes this bridge's `unavailable_status` form -
         and an `AuthorizationRefused` reaches the client with the status and body you built it
         with, which is how a rule explains why it refused.
 
@@ -399,7 +416,7 @@ class BetterAuth:
             AuthorizationRefused: At request time, when the predicate raises one on purpose.
         """
         current = self.current_session(user_model=user_model)
-        built = require_dependency(current, predicate, reason)
+        built = require_dependency(current, predicate, reason, self._unavailable)
         return cast("Callable[..., Awaitable[Session[UserModelT]]]", built)
 
     def require_membership(
@@ -471,7 +488,7 @@ class BetterAuth:
             AuthorizationRefused: At request time, when `member` raises one on purpose.
         """
         current = self.current_session(user_model=user_model)
-        built = membership_dependency(current, id_param, member, reason)
+        built = membership_dependency(current, id_param, member, reason, self._unavailable)
         return cast("Callable[..., Awaitable[Membership[UserModelT, GrantT]]]", built)
 
     def _require(self, user_model: type[UserModelT]) -> Dependency:
@@ -536,7 +553,7 @@ class BetterAuth:
             if not presented:
                 return None
             chosen, credential = presented[0]
-            answer = await _verified(chosen, credential, user_model)
+            answer = await _verified(chosen, credential, user_model, self._unavailable)
         finally:
             credential = None
             presented.clear()
@@ -570,10 +587,21 @@ def _presence(credential: object, verifier: Verifier) -> object | None:
     return credential
 
 
-async def _verified(verifier: Verifier, credential: object, user_model: type[UserModelT]) -> Any:
+async def _verified(
+    verifier: Verifier,
+    credential: object,
+    user_model: type[UserModelT],
+    unavailable: UnavailablePolicy,
+) -> Any:
     # Every refusal of every verifier passes through this frame, which holds the raw credential
     # in a parameter: a parameter is a frame local, and a locals-capturing reporter reads it
     # (D-094, D-180). Scrubbed in `finally`, so no path can skip it.
+    #
+    # It is also the one place `AuthServiceUnavailable` takes this bridge's form. A refusal the
+    # policy leaves alone is re-raised as itself, the same object `main` raised, and carries
+    # whatever frames it was raised through: a custom verifier's frames are that verifier's to
+    # scrub. One the policy replaces is a new object, raised outside the handler and `from None`,
+    # and no local of this frame keeps the refusal it replaced, so the new one cannot reach it.
     try:
         try:
             answer = verifier.verify(credential, user_model)
@@ -583,10 +611,16 @@ async def _verified(verifier: Verifier, credential: object, user_model: type[Use
                     " it with `async def`."
                 )
             return await answer
-        except (BetterAuthError, SessionError):
+        except BetterAuthError:
             raise
+        except SessionError as refusal:
+            failure = unavailable.replacing(refusal)
+            if failure is None:
+                raise
         except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
+            # One name only: a second one would keep the replaced leaf, and its traceback, alive.
             failure = _resolved(exc, verifier, "verify", (BetterAuthError, SessionError))
+            failure = unavailable.replacing(failure) or failure
         raise failure from None  # outside the handler, as in `_extracted`
     finally:
         credential = None
@@ -665,84 +699,3 @@ def _nothing_presented(verifiers: Sequence[Verifier]) -> str:
 
 def _ambiguity(names: Sequence[str]) -> str:
     return f"{len(names)} credentials presented at once: {', '.join(names)}"
-
-
-def _validated(verifiers: object) -> tuple[Verifier, ...]:
-    if isinstance(verifiers, (str, bytes, bytearray)) or not isinstance(verifiers, Sequence):
-        raise ConfigurationError(
-            "BetterAuth(verifiers=...) takes a sequence of verifiers, in the order their"
-            f" credentials should be looked for; got {type(verifiers).__name__}."
-        )
-    ordered = tuple(cast("Sequence[object]", verifiers))
-    if not ordered:
-        raise ConfigurationError(
-            "BetterAuth(verifiers=...) needs at least one verifier: with none configured,"
-            " every request would be answered as unauthenticated."
-        )
-    seen: list[Verifier] = []
-    for index, verifier in enumerate(ordered):
-        _validate_verifier(verifier, index)
-        checked = cast("Verifier", verifier)
-        if any(checked is earlier for earlier in seen):
-            raise ConfigurationError(
-                f"BetterAuth(verifiers=...) lists the same {type(checked).__name__} twice."
-                " Both copies would find the same credential, so every request carrying it"
-                " would be ambiguous."
-            )
-        _reject_collision(checked, seen)
-        seen.append(checked)
-    return cast("tuple[Verifier, ...]", ordered)
-
-
-def _reject_collision(verifier: Verifier, seen: Sequence[Verifier]) -> None:
-    """Two *different* verifiers reading one credential — what identity cannot see."""
-    key = collision_key(verifier.credential_source)
-    clash = next((s for s in seen if collision_key(s.credential_source) == key), None)
-    if clash is None:
-        return
-    raise ConfigurationError(
-        f"BetterAuth(verifiers=...) has two verifiers on one credential:"
-        f" {type(clash).__name__} declares credential_source={clash.credential_source!r} and"
-        f" {type(verifier).__name__} declares credential_source={verifier.credential_source!r}."
-        " Both would find it (a cookie and its __Secure- or __Host- form count as one), so"
-        " every request carrying it would be ambiguous."
-    )
-
-
-def _validate_verifier(verifier: object, index: int) -> None:
-    where = f"BetterAuth(verifiers=...)[{index}]"
-    if not isinstance(verifier, Verifier):
-        raise ConfigurationError(
-            f"{where} is a {type(verifier).__name__}, which does not implement the Verifier"
-            " protocol: it needs a synchronous extract(connection) and an async"
-            " verify(credential, user_model)."
-        )
-    for method in ("extract", "verify"):
-        if not callable(getattr(verifier, method)):
-            raise ConfigurationError(f"{where} has a {method} that is not callable.")
-    _validate_source(verifier.credential_source, where)
-    if inspect.iscoroutinefunction(verifier.extract):
-        raise ConfigurationError(
-            f"{where} declares extract() as async. extract() is a synchronous presence"
-            " check; an async one returns a coroutine object, which is never None, so this"
-            " verifier would claim every request and every request would be ambiguous."
-        )
-
-
-def _validate_source(source: object, where: str) -> None:
-    """`source` is annotated `str`; the object declaring it was written by someone else."""
-    if not isinstance(source, str) or not source.strip():
-        raise ConfigurationError(
-            f"{where} must declare a non-empty string credential_source naming where its"
-            " credential comes from, such as 'cookie:better-auth.session_token'. It is how"
-            " two verifiers reading one credential are caught here rather than by every"
-            f" request being ambiguous; got {source!r}."
-        )
-
-
-def _validate_user_model(user_model: object) -> None:
-    if not (isinstance(user_model, type) and issubclass(user_model, User)):
-        raise ConfigurationError(
-            "user_model must be User or a subclass of it, because the upstream payload is"
-            f" parsed into it; got {user_model!r}."
-        )

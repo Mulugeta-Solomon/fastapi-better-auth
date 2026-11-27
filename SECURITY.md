@@ -57,9 +57,12 @@ a `crit` header at all, because Better Auth never emits one and no extension is 
 ## Behaviours worth knowing before you deploy
 
 - **Refusals are uniform on the wire.** Every rejected credential answers the same 401 body; the
-  reason lives only on the exception's `.reason` and in your logs. Timing is not uniform by design:
-  a cookie whose signature does not verify is refused before the session store is consulted, so
-  the store is never a lever for unauthenticated traffic.
+  reason lives only on the exception's `.reason` and in your logs. An unreachable auth dependency
+  is part of that 401 by default. A deployment that opts in to the `503`
+  ([Errors](docs/errors.md#answering-503-while-the-auth-service-is-down)) tells any caller that the
+  dependency is failing and that its credential passed the checks made before it was asked. Timing
+  is not uniform by design: a cookie whose signature does not verify is refused before the session
+  store is consulted, so the store is never a lever for unauthenticated traffic.
 - **Match `secure_cookies` to what your server actually sets.** `CookieVerifier` reads exactly one
   cookie name: the `__Secure-`-prefixed one when `secure_cookies=True` (the default, and Better
   Auth's own production default), or the plain name when `False` — set `False` for a dev/HTTP
@@ -136,7 +139,9 @@ a `crit` header at all, because Better Auth never emits one and no extension is 
   plugin's hook overwrites the outgoing session cookie with whatever `Authorization` it sees, so a
   bridge that forwarded it would let a client turn any victim's cookie into a `200 null` (a targeted
   denial of service) or authenticate a raw token this side never extracted, never CSRF-checked and
-  never pre-filtered. An auth server that cannot be reached is a `401`, never a pass. The cookie
+  never pre-filtered. An auth server that cannot be reached is a refusal, never a pass: the uniform
+  `401` by default, or a `503` under
+  [the `503` opt-in](docs/errors.md#answering-503-while-the-auth-service-is-down). The cookie
   value itself is forwarded only if every byte is an RFC 6265 cookie-octet, so a client cannot put
   CR, LF, a comma or any other byte of its choosing into the outbound header; anything else is
   refused like a malformed cookie, with no upstream call.

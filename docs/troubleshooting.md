@@ -2,8 +2,10 @@
 
 After reading this page you can find the usual cause of a symptom and the page that fixes it.
 
-Refusals are not logged by default, and every `401` looks the same on the wire. To see why a
-request was refused, log `exc.reason` from an exception handler; see
+Refusals are not logged by default, and every `401` looks the same on the wire. If clients see a
+sign-in prompt while the auth service is down, see
+[the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down). To see why a request
+was refused, log `exc.reason` from an exception handler; see
 [Errors](errors.md#why-the-401s-are-identical).
 
 ## Every cookie request is `401`
@@ -58,8 +60,10 @@ stops startup but is not remembered: start again once the server answers. See
 ## Mode B: every token is `401` after an auth-server outage
 
 The cached key set is older than `max_stale` (one day by default) and could not be refreshed. The
-reason names `max_stale`. Tokens verify again as soon as one refresh succeeds. If your outages last
-longer, pass a longer `max_stale`. See
+reason names `max_stale`. Under
+[the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down) the same tokens get
+`503` instead. Tokens verify again as soon as one refresh succeeds. If your outages last longer,
+pass a longer `max_stale`. See
 [Mode B](mode-b-jwt.md#when-the-key-set-cannot-be-fetched).
 
 ## Mode B: `ConfigurationError` about `max_stale` at startup

@@ -28,7 +28,8 @@ lookup before any `connect()` included), or a store of your own raising — once
 error's class and its SQLSTATE when it carries a well-formed one, beside a fingerprint of what was
 looked up and none of the error's text. It is said again only after a lookup completes, and past
 eight distinct kinds one constant notice says further kinds are held back until then. The request
-is answered the uniform `401` either way, like any other dependency that could not be reached.
+is answered the uniform `401` either way, like any other dependency that could not be reached, or
+the `503` under [the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down).
 At `ERROR`, with the traceback: an
 exception that escaped a verifier, and one that escaped an authorization predicate or a membership
 lookup — each answered as the uniform refusal rather than a `500`, so the log is the only place the
