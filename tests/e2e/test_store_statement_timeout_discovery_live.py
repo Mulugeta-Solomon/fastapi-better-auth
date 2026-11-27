@@ -11,6 +11,10 @@ value can equal the store's. Each case here gives every pooled connection exactl
 - **On an engine that keeps a transaction** the same equal value is a legitimate deployment.
   Discovery passes, and a lookup is bounded by the store's own setting: with the application's
   value set to no timeout at all, the server still ends a lookup queued on a lock at the bound.
+- **The probe is compared, not looked for.** Once a transaction that set the probe has ended,
+  Postgres answers an empty string for it on that connection, not NULL. So the same connection
+  is used again: two discoveries pass, each with its own probe, and a discovery without a
+  transaction on a connection that held a probe before is refused.
 
 The pools here hold one connection, so every case runs on the same connection as the one before
 it in that case. The tables are copies in a schema of this module's own.
@@ -38,7 +42,7 @@ try:
     from fastapi_better_auth import CookieVerifier, SqlAlchemySessionStore
     from tests.cookies import COOKIE, http, run, sign
     from tests.deadlines import every_call_ended, outage_lines, verifier
-    from tests.stores import StatementLog
+    from tests.stores import PROBE_SETTING, PROBE_VALUE, StatementLog
 except ImportError:
     pytest.skip(
         "this build of fastapi-better-auth-bridge publishes no session stores",
@@ -65,6 +69,9 @@ CLIENT_SIDE = LOOKUP_TIMEOUT / 4
 QUERY_CANCELED = "57014"
 AUTOCOMMIT = "AUTOCOMMIT"
 SHOW = "show statement_timeout"
+PROBE_READ = "select current_setting(:name, true)"
+ENDED = ""
+"""What Postgres answers for the probe on a connection whose transaction that set it has ended."""
 
 FORGED_TOKEN = "a-token-that-names-no-session"
 FORGED = f"{COOKIE}={sign(FORGED_TOKEN)}"
@@ -141,6 +148,12 @@ class Pool:
         """`statement_timeout` as the pooled connection reports it, outside the store."""
         async with self.engine.connect() as connection:
             return str(await connection.scalar(text(SHOW)))
+
+    async def probe(self) -> str | None:
+        """The probe as the pooled connection reports it, outside the store; None if never set."""
+        async with self.engine.connect() as connection:
+            found = await connection.scalar(text(PROBE_READ), {"name": PROBE_SETTING})
+        return None if found is None else str(found)
 
 
 @pytest.fixture
@@ -230,4 +243,85 @@ async def test_an_equal_session_value_on_a_transactional_engine_is_served_under_
     assert BOUND <= took < CLIENT_SIDE, f"refused after {took:.3f}s"
     assert [tuple(r.args or ())[1] for r in outage_lines(logs.records)] == [QUERY_CANCELED]
     assert recovered == "SessionRevoked"
+    assert len(pool_of_one.opened) == 1
+
+
+def probes_sent(log: StatementLog) -> list[str]:
+    """Every probe value the store set, in order, from the engine's own events."""
+    return [
+        str(parameters[1])
+        for statement, parameters in zip(log.statements, log.parameters, strict=True)
+        if statement in log.settings and parameters[0] == PROBE_SETTING
+    ]
+
+
+def no_transaction_from_the_next_checkout(dbapi_connection: Any, *_: Any) -> None:
+    """Application code that puts a pooled connection into autocommit, where the engine's
+    options cannot show it: the one way to run discovery without a transaction on a connection
+    that a passing discovery used before."""
+    dbapi_connection.autocommit = True
+
+
+@pytest.mark.anyio
+async def test_each_discovery_on_one_connection_proves_its_own_probe(
+    pool_of_one: Pool, schema: str
+) -> None:
+    """Two discoveries on the same connection pass, each with a probe of its own, and the probe
+    of the first reads as an empty string, not NULL, before the second. Then that connection runs
+    without a transaction, and a third discovery is refused: what it reads is that empty string,
+    present on the connection and not its own."""
+    never_set = await pool_of_one.probe()
+    log = StatementLog()
+    log.attach(pool_of_one.engine)
+    first = SqlAlchemySessionStore(
+        engine=pool_of_one.engine, schema=schema, statement_timeout=BOUND
+    )
+    await first.connect()
+    after_first = await pool_of_one.probe()
+    second = SqlAlchemySessionStore(
+        engine=pool_of_one.engine, schema=schema, statement_timeout=BOUND
+    )
+    await second.connect()
+    after_second = await pool_of_one.probe()
+    passed = probes_sent(log)
+
+    event.listen(pool_of_one.engine.sync_engine, "checkout", no_transaction_from_the_next_checkout)
+    third = SqlAlchemySessionStore(
+        engine=pool_of_one.engine, schema=schema, statement_timeout=BOUND
+    )
+    with pytest.raises(ConfigurationError, match=AUTOCOMMIT):
+        await third.connect()
+    for store in (first, second, third):
+        await every_call_ended(store)
+
+    assert never_set is None
+    assert after_first == ENDED
+    assert after_second == ENDED
+    assert len(passed) == 2
+    assert passed[0] != passed[1]
+    assert all(PROBE_VALUE.fullmatch(probe) for probe in passed)
+    assert len(probes_sent(log)) == 3, "the third discovery set no probe of its own"
+    assert len(pool_of_one.opened) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("pool_of_one", [AUTOCOMMIT], indirect=True)
+async def test_a_discovery_without_a_transaction_is_refused_on_a_connection_that_held_a_probe(
+    pool_of_one: Pool, schema: str
+) -> None:
+    """The engine was built in `AUTOCOMMIT`. The first discovery leaves its probe on the
+    connection as an empty string; the second, on that same connection, reads it and is refused
+    too. A rule of "the probe is there" would have passed it."""
+    store = SqlAlchemySessionStore(
+        engine=pool_of_one.engine, schema=schema, statement_timeout=BOUND
+    )
+
+    with pytest.raises(ConfigurationError, match=AUTOCOMMIT):
+        await store.connect()
+    held = await pool_of_one.probe()
+    with pytest.raises(ConfigurationError, match=AUTOCOMMIT):
+        await store.connect()
+    await every_call_ended(store)
+
+    assert held == ENDED
     assert len(pool_of_one.opened) == 1
