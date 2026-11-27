@@ -47,6 +47,11 @@ def test_both_settings_are_keyword_only_with_the_401_default() -> None:
     assert retry_after.default is None
 
 
+def test_the_retry_after_numbers_are_the_documented_ones() -> None:
+    """The `BetterAuth` docstring states all three; a change here is a change there."""
+    assert (MIN_RETRY_AFTER, DEFAULT_RETRY_AFTER, MAX_RETRY_AFTER) == (1, 10, 300)
+
+
 def test_the_retry_after_bounds_are_whole_seconds_and_the_default_sits_inside() -> None:
     assert MIN_RETRY_AFTER == 1
     assert MIN_RETRY_AFTER <= DEFAULT_RETRY_AFTER <= MAX_RETRY_AFTER

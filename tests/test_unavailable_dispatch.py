@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import http_exception_handler
 
 from fastapi_better_auth import (
@@ -24,6 +24,7 @@ from fastapi_better_auth import (
 )
 from fastapi_better_auth._internal.unavailable import (
     DEFAULT_RETRY_AFTER,
+    MISSING_REASON,
     AuthServiceUnavailable503,
 )
 from tests.fakes import (
@@ -62,6 +63,18 @@ class OddSignature(AuthServiceUnavailable):
 
     def __init__(self, code: int) -> None:
         super().__init__(reason=f"upstream code {code}")
+
+
+class NoReason(AuthServiceUnavailable):
+    """A third-party subclass that skips `SessionError.__init__` and so never sets `reason`."""
+
+    def __init__(self) -> None:
+        HTTPException.__init__(
+            self,
+            status_code=401,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 def bridge(verifier: Any, **settings: Any) -> BetterAuth:
@@ -193,6 +206,20 @@ def test_with_the_opt_in_a_third_party_subclass_is_converted_whatever_its_signat
 
     assert wire(get(app, **{HEADER: GOOD_CREDENTIAL})) == service_unavailable(RETRY_AFTER)
     assert seen[0].reason == "upstream code 7"
+
+
+def test_a_subclass_that_never_set_a_reason_is_answered_not_a_500() -> None:
+    raised = NoReason()
+    default_app, default_seen = observing(bridge(RaisingVerifier(HEADER, lambda: raised)))
+    opted_app, opted_seen = observing(bridge(RaisingVerifier(HEADER, NoReason), **OPT_IN))
+
+    default = wire(get(default_app, **{HEADER: GOOD_CREDENTIAL}))
+    opted = wire(get(opted_app, **{HEADER: GOOD_CREDENTIAL}))
+
+    assert default == UNKNOWN_CREDENTIAL_401
+    assert default_seen[0] is raised
+    assert opted == service_unavailable(RETRY_AFTER)
+    assert opted_seen[0].reason == MISSING_REASON
 
 
 def test_with_the_opt_in_an_anonymous_request_is_still_none_on_the_optional_route() -> None:

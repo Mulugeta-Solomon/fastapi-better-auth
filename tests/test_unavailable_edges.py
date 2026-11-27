@@ -21,6 +21,7 @@ from fastapi_better_auth import (
     AuthServiceUnavailable,
     BetterAuth,
     ConfigurationError,
+    InvalidCredential,
     Session,
     SessionError,
     User,
@@ -192,6 +193,26 @@ def test_a_rule_raising_the_503_form_passes_it_through_a_default_bridge(path: st
     app = ruled_app(BetterAuth(verifiers=[FakeVerifier(HEADER)]), foreign)
 
     assert wire(get(app, path, **{HEADER: GOOD_CREDENTIAL})) == service_unavailable(99)
+
+
+def test_a_refusal_edited_to_503_still_passes_a_default_bridge_as_on_main() -> None:
+    """The off-switch guard keys on the private 503 form. A `SessionError` instance a verifier
+    edits by hand is re-raised as itself, exactly as `main` does; left for the maintainer."""
+
+    def edited() -> SessionError:
+        refusal = InvalidCredential(reason=REASON)
+        refusal.status_code = 503
+        return refusal
+
+    app = FastAPI()
+    current = BetterAuth(verifiers=[RaisingVerifier(HEADER, edited)]).current_session()
+
+    async def me(session: Session[User] = Depends(current)) -> dict[str, str]:
+        return {"id": session.user.id}
+
+    app.add_api_route("/required", me, methods=["GET"])
+
+    assert get(app, **{HEADER: GOOD_CREDENTIAL}).status_code == 503
 
 
 def test_route_code_calling_the_store_answers_the_401_even_with_the_opt_in() -> None:

@@ -189,6 +189,33 @@ def test_mode_b_past_the_cache_ttl_a_cached_kid_verifies_and_an_unknown_one_is_5
     assert verifier._keys.remembered == 0  # pyright: ignore[reportPrivateUsage]
 
 
+def test_mode_b_a_kid_remembered_absent_is_401_then_503_once_its_window_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One token, three answers under the opt-in while the key set is down after its first fetch.
+
+    A kid the fresh set did not carry is remembered absent, and that memory answers 401 inside
+    the refetch window even after the set goes stale. Once the window opens the refetch fails and
+    the same token is 503: a stored verdict, not a stored refusal, changing form with time.
+    """
+    clock = wind_jwks_clock(monkeypatch, start=1000.0)
+    transport = ScriptedTransport(json_reply(key_set(SIGNER)), OSError("connection refused"))
+    verifier = jwt_verifier(transport)
+    assert answers(verifier, bearer(SIGNER.sign(claims())), **OPT_IN).status_code == 200
+    stranger = bearer(STRANGER.sign(claims()))
+
+    seen: list[Any] = []
+    for moment in (1295.0, 1301.0, 1306.0):
+        clock.now = moment
+        seen.append(wire(answers(verifier, stranger, **OPT_IN)))
+
+    assert seen == [
+        UNKNOWN_CREDENTIAL_401,
+        UNKNOWN_CREDENTIAL_401,
+        service_unavailable(RETRY_AFTER),
+    ]
+
+
 # --- Mode C: the Better Auth server -----------------------------------------------------------
 
 
