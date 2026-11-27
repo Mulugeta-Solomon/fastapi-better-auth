@@ -160,6 +160,48 @@ def holding(exc: BaseException, needle: str, *, ignore: Sequence[object] = ()) -
     return sorted(found)
 
 
+def _linked(exc: BaseException) -> list[BaseException]:
+    """The exceptions `exc` links to itself: its cause, its context and a group's members."""
+    linked = [found for found in (exc.__cause__, exc.__context__) if found is not None]
+    members: object = getattr(exc, "exceptions", ())
+    if isinstance(members, tuple):
+        linked += [m for m in cast("tuple[object, ...]", members) if isinstance(m, BaseException)]
+    return linked
+
+
+def holding_reachable(
+    exc: BaseException, needle: str, *, ignore: Sequence[object] = ()
+) -> list[str]:
+    """`holding`, and also through every exception a frame local holds, to any depth.
+
+    `holding` walks the frames of the refusal and of what it chains to. A local can still hold
+    another exception, whose own traceback carries the frames it was raised through. This walk
+    follows such a local into that exception: its traceback, its cause and context, and a group's
+    members. Each exception is walked once, so a cycle ends.
+    """
+    excluded = frozenset(id(item) for item in ignore)
+    found: set[str] = set()
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        pending.extend(_linked(current))
+        traceback = current.__traceback__
+        while traceback:
+            frame = traceback.tb_frame
+            name = frame.f_code.co_filename.replace("\\", "/").rsplit("/", 1)[-1]
+            for key, value in list(frame.f_locals.items()):
+                if isinstance(value, BaseException):
+                    pending.append(value)
+                elif key != "self" and _holds(value, needle, excluded):
+                    found.add(f"{name}:{frame.f_code.co_name}.{key}")
+            traceback = traceback.tb_next
+    return sorted(found)
+
+
 # ---------------------------------------------------------------- fixtures
 
 
