@@ -10,10 +10,11 @@ import anyio
 
 from ..errors import ConfigurationError
 from .sqlalchemy_store import CoreStore, Rows
+from .statement_timeout import validated_statement_timeout
 from .thread_handoff import run_in_worker
 
 if TYPE_CHECKING:
-    from sqlalchemy import Engine, Select
+    from sqlalchemy import Connection, Engine, Select
 
     from .sqlalchemy_core import Discovered
 
@@ -63,10 +64,26 @@ class SyncStoreAdapter(CoreStore):
     is not answering, this adapter never holds more than `max_concurrency` threads and
     connections; further lookups wait for a slot without starting a thread, and are refused at
     their own deadline. Those slots come back only when the database answers or the driver gives
-    up, so give the database a reason to: a server-side statement timeout (Postgres
-    `statement_timeout`, MySQL `max_execution_time`) and a driver connect/read timeout end an
+    up, so give the database a reason to: a server-side statement timeout (`statement_timeout=`
+    below on Postgres, `max_execution_time` on MySQL) and the driver's own timeouts end an
     abandoned call, and an engine `pool_timeout` shorter than the request deadline turns a
     checkout wait into an error rather than a hang.
+
+    **A statement timeout of the adapter's own** (`statement_timeout=`, seconds, Postgres only) is
+    `SqlAlchemySessionStore`'s option: the same meaning, the same statements, the same refusals.
+    Set, every transaction the adapter opens - each lookup, and the schema read - sends
+    `SELECT set_config('statement_timeout', :ms, true)` before it reads anything, and the schema
+    read sets its probe first and reads both back, so an engine in `AUTOCOMMIT` is refused with a
+    `ConfigurationError`. Here it is what gives a slot back. A lookup abandoned at its deadline
+    keeps its thread, its slot and its pooled connection until the DBAPI call returns, and the
+    server ends that call at the bound: the slot and the connection come back then, while
+    whatever held the statement (a lock, a load) is still there. It ends only a statement that a
+    reachable server is running. A call stuck opening a connection, or waiting on a network path
+    that has gone dead, never reaches the server, so no server setting ends it; bound that with
+    the driver's own settings (libpq's `connect_timeout`, TCP keepalives and `tcp_user_timeout`,
+    which psycopg and psycopg2 both take). Unset, the adapter sends nothing it did not send
+    before. Tested on psycopg (3) and psycopg2, on asyncio and trio; the role needs no grant
+    beyond the `SELECT` above.
 
     Args:
         engine: A synchronous `Engine`, injected. Its pool needs room for the worker threads
@@ -80,13 +97,21 @@ class SyncStoreAdapter(CoreStore):
         max_concurrency: The most lookups that may run on worker threads at once. `None` (the
             default) sizes the bound to the engine's connection pool where that is introspectable,
             and otherwise to a conservative default; pass a positive int to set it explicitly.
+        statement_timeout: Seconds, or `None` (the default) to send nothing of the kind. PostgreSQL
+            only, as for `SqlAlchemySessionStore`: a transaction-local `statement_timeout`,
+            rounded up to whole milliseconds, set before any read in every transaction the adapter
+            opens - each lookup and the schema read, where a probe is set just before it. Keep it
+            below `CookieVerifier`'s `lookup_timeout`.
 
     Raises:
         ConfigurationError: If `sqlalchemy` is not installed, if `engine` is an `AsyncEngine` or
             not an `Engine` at all, if either table name is blank or the two are the same, if
             either allow-list is not a sequence of distinct non-blank names, if `max_concurrency`
-            is not a positive int, or - at discovery - if an allow-list names a column the table
-            does not have.
+            is not a positive int, if `statement_timeout` is not a positive, finite number of
+            seconds within what Postgres accepts or is set on an engine that is not PostgreSQL,
+            or - from `connect()` or the first lookup - if an allow-list names a column the table
+            does not have, or if `statement_timeout` is set on an engine in `AUTOCOMMIT` (from a
+            lookup too, when the engine was switched after `connect()`).
     """
 
     def __init__(
@@ -99,6 +124,7 @@ class SyncStoreAdapter(CoreStore):
         session_columns: Sequence[str] | None = None,
         user_columns: Sequence[str] | None = None,
         max_concurrency: int | None = None,
+        statement_timeout: float | None = None,
     ) -> None:
         super().__init__(
             adapter="SyncStoreAdapter",
@@ -109,6 +135,9 @@ class SyncStoreAdapter(CoreStore):
             user_columns=user_columns,
         )
         self._engine = self._sql.validated_sync_engine(engine)
+        self._timeout = self._sql.bounded_engine(
+            self._engine, validated_statement_timeout(statement_timeout)
+        )
         self._limiter_tokens = _limiter_tokens(
             self._engine, _validated_concurrency(max_concurrency)
         )
@@ -119,6 +148,7 @@ class SyncStoreAdapter(CoreStore):
 
     def _inspected(self) -> Discovered:
         with self._engine.connect() as connection:
+            self._bounded(connection, confirm=True)
             return self._reflected(connection)
 
     async def _select(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
@@ -141,10 +171,30 @@ class SyncStoreAdapter(CoreStore):
     def _queried(self, statement: Select[Any], params: Mapping[str, Any]) -> Rows:
         try:
             with self._engine.connect() as connection:
+                self._bounded(connection)
                 return self._sql.rows(connection.execute(statement, dict(params)))
         except self._sql.SQLAlchemyError as exc:
             failure = self._unavailable(exc, params)
         raise failure from None
+
+    def _bounded(self, connection: Connection, *, confirm: bool = False) -> None:
+        """Set the adapter's bound on the transaction just opened, when it has one; else send
+        nothing. `SqlAlchemySessionStore._bounded`'s rule, run on the worker thread.
+
+        Sent before any read in every transaction the adapter opens, and transaction-local, so it
+        ends with the `ROLLBACK` the connection sends on its way back to the pool. An engine in
+        `AUTOCOMMIT` is refused: from its options before every transaction, and at discovery from
+        the probe and the bound read back in the same transaction (`confirmed_bound`).
+        """
+        if self._timeout is None:
+            return
+        self._sql.refuse_autocommit(self._engine)
+        probe = self._sql.new_probe() if confirm else None
+        for params in self._sql.settings_in_order(self._timeout, probe):
+            connection.execute(self._sql.timeout_statement(), params)
+        if probe is not None:
+            found = connection.execute(self._sql.readback_statement())
+            self._sql.confirmed_bound(found.all(), self._timeout, probe)
 
 
 def _validated_concurrency(max_concurrency: object) -> int | None:

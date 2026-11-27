@@ -287,9 +287,8 @@ class SqlAlchemySessionStore(CoreStore):
     of the library's (`fastapi_better_auth.discovery_probe`), and reads it back with the bound. So
     an application's own session-level value, even one equal to the store's, does not pass for
     it. Afterwards that setting reads as an empty string on the lent connection. Tested on
-    asyncpg; the role needs no grant beyond the `SELECT` above. `SyncStoreAdapter` has no such
-    option: give its role the timeout (`ALTER ROLE ... SET statement_timeout`), as for any other
-    database.
+    asyncpg; the role needs no grant beyond the `SELECT` above. `SyncStoreAdapter` takes the same
+    option, and there it is also what gives an abandoned lookup's worker thread back.
 
     Args:
         engine: An `AsyncEngine`. Always injected, never built here: the pool, the TLS
