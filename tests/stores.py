@@ -256,7 +256,18 @@ SETTINGS_STATEMENT = "SELECT set_config($1::VARCHAR, $2::VARCHAR, true) AS set_c
 starts with `SELECT`, so a filter on the verb alone would wave it through, and with it any other
 function call that changes state; the invariant names it instead (`writes_emitted`). The final
 `true` makes the setting transaction-local, which is what keeps it out of the pool's other
-checkouts."""
+checkouts. Its two values arrive as a positional tuple: the setting's name, then its value."""
+PSYCOPG_SETTINGS_STATEMENT = (
+    "SELECT set_config(%(setting)s::VARCHAR, %(value)s::VARCHAR, true) AS set_config_1"
+)
+"""The same statement as psycopg (3) receives it from `SyncStoreAdapter`: named parameters, each
+with the cast SQLAlchemy renders for that driver. psycopg binds them on the server."""
+PSYCOPG2_SETTINGS_STATEMENT = "SELECT set_config(%(setting)s, %(value)s, true) AS set_config_1"
+"""The same statement as psycopg2 receives it: named parameters and no casts. psycopg2 quotes the
+values into the text on the client before it sends it."""
+NAMED_SETTINGS_STATEMENTS = frozenset({PSYCOPG_SETTINGS_STATEMENT, PSYCOPG2_SETTINGS_STATEMENT})
+"""The two whose values arrive as a mapping, under exactly these keys (`NAMED_SETTING_KEYS`)."""
+NAMED_SETTING_KEYS = ("setting", "value")
 PROBE_SETTING = "fastapi_better_auth.discovery_probe"
 """The only other setting that statement may carry: discovery's probe, under the library's own
 prefix. Named here, not imported, so a change of name in the library fails the invariant."""
@@ -324,24 +335,42 @@ def writes_emitted(log: StatementLog, milliseconds: int | None = None) -> list[s
     """Every statement in `log` the read-only invariant refuses; empty when the store only read.
 
     A statement is allowed when it starts with a read verb and calls no `set_config`, or when it
-    is exactly `SETTINGS_STATEMENT` carrying one of the two store settings: `statement_timeout`
-    at `milliseconds`, the value the store was given, or `PROBE_SETTING` at a `PROBE_VALUE`.
-    With `milliseconds=None` (the option unset) no settings statement is allowed at all.
+    is exactly one driver's settings statement (`SETTINGS_STATEMENT` for asyncpg, or one of
+    `NAMED_SETTINGS_STATEMENTS`), its values in that driver's shape, carrying one of the two store
+    settings: `statement_timeout` at `milliseconds`, the value the store was given, or
+    `PROBE_SETTING` at a `PROBE_VALUE`. With `milliseconds=None` (the option unset) no settings
+    statement is allowed at all.
     """
     refused: list[str] = []
     for statement, parameters in zip(log.statements, log.parameters, strict=True):
         if _sets_config(statement):
-            if statement != SETTINGS_STATEMENT or not _a_store_setting(parameters, milliseconds):
+            if not _a_store_setting(setting_values(statement, parameters), milliseconds):
                 refused.append(statement)
         elif _verb(statement) not in READ_VERBS:
             refused.append(statement)
     return refused
 
 
-def _a_store_setting(parameters: Any, milliseconds: int | None) -> bool:
-    if milliseconds is None:
+def setting_values(statement: str, parameters: Any) -> tuple[object, ...] | None:
+    """The values a settings statement carries, in order, or `None` when it is not exactly one
+    driver's settings statement with its values in that driver's shape.
+
+    asyncpg hands them over as a positional tuple. psycopg and psycopg2 hand them over as a
+    mapping, and only one with exactly `NAMED_SETTING_KEYS` is read: the keys of a mapping are not
+    its values, and another key would be a value nobody named."""
+    if statement == SETTINGS_STATEMENT:
+        return None if isinstance(parameters, Mapping) else tuple(parameters)
+    if statement in NAMED_SETTINGS_STATEMENTS and isinstance(parameters, Mapping):
+        named = cast("Mapping[str, object]", parameters)
+        if sorted(named) == sorted(NAMED_SETTING_KEYS):
+            return tuple(named[key] for key in NAMED_SETTING_KEYS)
+    return None
+
+
+def _a_store_setting(values: tuple[object, ...] | None, milliseconds: int | None) -> bool:
+    if milliseconds is None or values is None:
         return False
-    match tuple(parameters):
+    match values:
         case (str(name), str(value)) if name == SETTING:
             return value == str(milliseconds)
         case (str(name), str(value)) if name == PROBE_SETTING:

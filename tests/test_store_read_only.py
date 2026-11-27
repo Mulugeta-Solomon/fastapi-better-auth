@@ -39,6 +39,8 @@ from fastapi_better_auth import (
 )
 from tests.stores import (
     PROBE_SETTING,
+    PSYCOPG2_SETTINGS_STATEMENT,
+    PSYCOPG_SETTINGS_STATEMENT,
     SETTING,
     SETTINGS_STATEMENT,
     TOKEN,
@@ -296,7 +298,7 @@ async def test_no_sql_write_is_emitted_and_no_row_changes(
 # ---------------------------------------------------------------- the instrument that names the one setting
 
 
-def logged(*entries: tuple[str, tuple[Any, ...]]) -> StatementLog:
+def logged(*entries: tuple[str, object]) -> StatementLog:
     log = StatementLog()
     for statement, parameters in entries:
         log.statements.append(statement)
@@ -363,6 +365,64 @@ def test_any_other_set_config_is_refused_although_it_starts_with_select(
 
     assert log.verbs == {"SELECT"}
     assert writes_emitted(log, 1500) == [statement]
+
+
+NAMED = (PSYCOPG_SETTINGS_STATEMENT, PSYCOPG2_SETTINGS_STATEMENT)
+"""`SyncStoreAdapter`'s settings statement as each synchronous driver receives it, values named."""
+
+
+@pytest.mark.parametrize("statement", NAMED, ids=["psycopg", "psycopg2"])
+def test_a_sync_drivers_settings_statement_is_allowed_with_its_values_named(statement: str) -> None:
+    """psycopg and psycopg2 receive the values as a mapping; the same two settings are allowed,
+    each at the only value it may carry, and nothing at all with the option unset."""
+    bound = (statement, {"setting": SETTING, "value": "1500"})
+    probe = (statement, {"setting": PROBE_SETTING, "value": A_PROBE})
+
+    assert writes_emitted(logged(probe, bound, LOOKUP), 1500) == []
+    assert writes_emitted(logged(bound, LOOKUP)) == [statement]
+    assert writes_emitted(logged(bound), 3000) == [statement]
+
+
+@pytest.mark.parametrize("statement", NAMED, ids=["psycopg", "psycopg2"])
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        (SETTING, "1500"),
+        {"value": "1500", "setting": SETTING, "is_local": False},
+        {"setting": SETTING},
+        {"name": SETTING, "value": "1500"},
+        {"setting": "search_path", "value": "1500"},
+        {"setting": PROBE_SETTING, "value": A_PROBE.upper()},
+    ],
+    ids=["positional", "an-extra-key", "a-missing-key", "another-key", "another-setting", "upper"],
+)
+def test_a_sync_drivers_settings_statement_in_any_other_shape_is_refused(
+    statement: str, parameters: object
+) -> None:
+    """A tuple handed to a statement that names its values, or a mapping with any other keys, is
+    not that driver's settings statement: refused, not read some way that happens to pass."""
+    assert writes_emitted(logged((statement, parameters)), 1500) == [statement]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        PSYCOPG_SETTINGS_STATEMENT.replace(", true)", ", false)"),
+        PSYCOPG2_SETTINGS_STATEMENT.replace(", true)", ", false)"),
+    ],
+    ids=["psycopg", "psycopg2"],
+)
+def test_a_sync_drivers_session_level_settings_statement_is_refused(statement: str) -> None:
+    log = logged((statement, {"setting": SETTING, "value": "1500"}))
+
+    assert writes_emitted(log, 1500) == [statement]
+
+
+def test_asyncpgs_statement_with_its_values_named_is_refused() -> None:
+    """Each statement is read in its own driver's shape only."""
+    log = logged((SETTINGS_STATEMENT, {"setting": SETTING, "value": "1500"}))
+
+    assert writes_emitted(log, 1500) == [SETTINGS_STATEMENT]
 
 
 @pytest.mark.parametrize(
