@@ -3,19 +3,22 @@
 A live case that locks a table must never lock `public.session`: the auth server and every other
 lane read it. It locks a copy instead, in a schema nobody else reads, dropped however the case
 ends. `until` waits for a condition the server reports, with a backstop, rather than sleeping for
-a guess.
+a guess, on either anyio backend.
+
+`table_copies` takes an asyncpg engine; `sync_table_copies` is its twin for a synchronous engine,
+so a case that runs on trio, where asyncpg cannot, still locks only a copy.
 """
 
 from __future__ import annotations
 
-import asyncio
 import secrets
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
+from contextlib import asynccontextmanager, contextmanager
 
+import anyio
 import pytest
-from sqlalchemy import text
+from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 TABLES = ('"user"', "session")
@@ -33,16 +36,37 @@ async def table_copies(observer: AsyncEngine, prefix: str) -> AsyncGenerator[str
     lock of the table (`pg_get_expr` opens it)."""
     name = f"{prefix}_{secrets.token_hex(6)}"
     async with observer.begin() as connection:
-        await connection.execute(text(f"CREATE SCHEMA {name}"))
-        for table in TABLES:
-            await connection.execute(
-                text(f"CREATE TABLE {name}.{table} (LIKE public.{table} INCLUDING ALL)")
-            )
+        for statement in _created(name):
+            await connection.execute(text(statement))
     try:
         yield name
     finally:
         async with observer.begin() as connection:
-            await connection.execute(text(f"DROP SCHEMA {name} CASCADE"))
+            await connection.execute(text(_dropped(name)))
+
+
+@contextmanager
+def sync_table_copies(observer: Engine, prefix: str) -> Generator[str, None, None]:
+    """`table_copies` through a synchronous engine: the same copies, the same drop."""
+    name = f"{prefix}_{secrets.token_hex(6)}"
+    with observer.begin() as connection:
+        for statement in _created(name):
+            connection.execute(text(statement))
+    try:
+        yield name
+    finally:
+        with observer.begin() as connection:
+            connection.execute(text(_dropped(name)))
+
+
+def _created(name: str) -> list[str]:
+    return [f"CREATE SCHEMA {name}"] + [
+        f"CREATE TABLE {name}.{table} (LIKE public.{table} INCLUDING ALL)" for table in TABLES
+    ]
+
+
+def _dropped(name: str) -> str:
+    return f"DROP SCHEMA {name} CASCADE"
 
 
 async def until(condition: Callable[[], Awaitable[bool]], what: str) -> None:
@@ -51,4 +75,4 @@ async def until(condition: Callable[[], Awaitable[bool]], what: str) -> None:
     while not await condition():
         if time.monotonic() > give_up:
             pytest.fail(f"{what} did not happen within {BACKSTOP}s")
-        await asyncio.sleep(POLL)
+        await anyio.sleep(POLL)
