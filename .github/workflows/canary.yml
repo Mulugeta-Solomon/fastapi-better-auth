@@ -150,13 +150,16 @@ jobs:
       # itself on a build that publishes no stores, so the leg stays green until 0.2.0 ships.
       # aiosqlite is for the lane's shared helpers: tests/stores.py imports it, and a live module
       # that builds on those helpers would otherwise skip itself here instead of running.
+      # psycopg and psycopg2 are the synchronous drivers the SyncStoreAdapter live modules run on.
+      # A case that needs one skips where it is absent, so both are installed as the dev group has.
       - name: Install the published wheel and the conformance lane's test dependencies
         run: |
           uv venv --python 3.13 "$WHEEL_VENV"
           uv pip install --python "$WHEEL_VENV/bin/python" --refresh \
             --index-url https://pypi.org/simple/ \
             "fastapi-better-auth-bridge[httpx,httpx2]" "pytest>=8" "trio>=0.27" \
-            "sqlalchemy[asyncio]>=2.0" "asyncpg>=0.30" "redis>=5.0.1" "aiosqlite>=0.20"
+            "sqlalchemy[asyncio]>=2.0" "asyncpg>=0.30" "redis>=5.0.1" "aiosqlite>=0.20" \
+            "psycopg[binary]>=3.3.6" "psycopg2-binary>=2.9.13"
       - name: Instrument liveness — the library under test must be the installed wheel
         id: guard
         run: |
