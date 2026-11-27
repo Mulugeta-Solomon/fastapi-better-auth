@@ -1,27 +1,31 @@
 """The opt-in 503 at its edges: the house envelope, a WebSocket handshake, and every path that
 reaches a client without passing through the dispatcher.
 
-The bypass cases are characterisation, not design: the conversion lives in the dispatcher only,
-so a rule callable, route code calling the store, and a verifier called directly all still answer
-the 401 with its challenge. They are pinned so a change to that is a decision, not an accident.
+A rule callable is part of the bridge and follows its setting. Route code that calls a store or a
+verifier itself is outside the bridge and keeps the exception as raised: the 401 with its
+challenge. Those cases are pinned so a change to them is a decision, not an accident.
 """
 
 from __future__ import annotations
 
 import logging
 import pathlib
-from typing import Any
+from typing import Any, cast
 
 import pytest
-from fastapi import Depends, FastAPI, Request, WebSocket
+from exceptiongroup import ExceptionGroup
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse
 from starlette.testclient import WebSocketDenialResponse
 
 from fastapi_better_auth import (
+    AuthorizationRefused,
     AuthServiceUnavailable,
     BetterAuth,
     ConfigurationError,
     InvalidCredential,
+    NotAuthorized,
     Session,
     SessionError,
     User,
@@ -175,24 +179,77 @@ def ruled_app(auth: BetterAuth, refusal: Any) -> FastAPI:
     return app
 
 
-@pytest.mark.parametrize("path", ["/gated", "/orgs/org_a"])
-def test_a_rule_raising_unavailable_answers_the_401_even_with_the_opt_in(path: str) -> None:
-    """A verified session told to sign in again: the #122 symptom, left for the maintainer."""
+RULE_PATHS = ["/gated", "/orgs/org_a"]
+
+
+@pytest.mark.parametrize("path", RULE_PATHS)
+def test_a_rule_raising_unavailable_answers_the_bridge_s_503_with_the_opt_in(path: str) -> None:
+    """Rules follow the bridge's setting: a verified session is never told to sign in again."""
     app = ruled_app(BetterAuth(verifiers=[FakeVerifier(HEADER)], **OPT_IN), unavailable)
 
-    assert wire(get(app, path, **{HEADER: GOOD_CREDENTIAL})) == UNKNOWN_CREDENTIAL_401
+    assert wire(get(app, path, **{HEADER: GOOD_CREDENTIAL})) == service_unavailable(RETRY_AFTER)
 
 
-@pytest.mark.parametrize("path", ["/gated", "/orgs/org_a"])
-def test_a_rule_raising_the_503_form_passes_it_through_a_default_bridge(path: str) -> None:
-    """Rules re-raise any `SessionError` as itself, so the dispatcher's guard does not reach."""
+@pytest.mark.parametrize("path", RULE_PATHS)
+def test_a_rule_raising_unavailable_in_a_task_group_is_converted_too(path: str) -> None:
+    def grouped() -> BaseException:
+        return ExceptionGroup("one leaf", [unavailable()])
+
+    app = ruled_app(BetterAuth(verifiers=[FakeVerifier(HEADER)], **OPT_IN), grouped)
+
+    assert wire(get(app, path, **{HEADER: GOOD_CREDENTIAL})) == service_unavailable(RETRY_AFTER)
+
+
+@pytest.mark.parametrize("path", RULE_PATHS)
+def test_a_rule_raising_the_503_form_is_the_401_through_a_default_bridge(path: str) -> None:
+    """With the switch off, nothing a bridge built answers 503, the rules included."""
 
     def foreign() -> AuthServiceUnavailable503:
         return AuthServiceUnavailable503(reason=REASON, retry_after=99)
 
     app = ruled_app(BetterAuth(verifiers=[FakeVerifier(HEADER)]), foreign)
 
-    assert wire(get(app, path, **{HEADER: GOOD_CREDENTIAL})) == service_unavailable(99)
+    assert wire(get(app, path, **{HEADER: GOOD_CREDENTIAL})) == UNKNOWN_CREDENTIAL_401
+
+
+def rule_seen(auth: BetterAuth, refusal: Any, path: str) -> BaseException:
+    app = ruled_app(auth, refusal)
+    seen: list[BaseException] = []
+
+    async def record(request: Request, exc: Exception) -> Response:
+        seen.append(exc)
+        return await http_exception_handler(request, cast("HTTPException", exc))
+
+    app.add_exception_handler(HTTPException, record)
+    get(app, path, **{HEADER: GOOD_CREDENTIAL})
+    (only,) = seen
+    return only
+
+
+@pytest.mark.parametrize("path", RULE_PATHS)
+def test_by_default_a_rule_s_unavailable_reaches_the_handler_as_the_same_object(path: str) -> None:
+    raised = unavailable()
+
+    seen = rule_seen(BetterAuth(verifiers=[FakeVerifier(HEADER)]), lambda: raised, path)
+
+    assert seen is raised
+
+
+@pytest.mark.parametrize("path", RULE_PATHS)
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: NotAuthorized(reason="rule said no"),
+        lambda: AuthorizationRefused(status_code=404, detail={"code": "gone"}),
+    ],
+    ids=["not-authorized", "authorization-refused"],
+)
+def test_with_the_opt_in_every_other_rule_refusal_is_the_same_object(path: str, build: Any) -> None:
+    raised = build()
+
+    seen = rule_seen(BetterAuth(verifiers=[FakeVerifier(HEADER)], **OPT_IN), lambda: raised, path)
+
+    assert seen is raised
 
 
 def test_a_refusal_edited_to_503_still_passes_a_default_bridge_as_on_main() -> None:
