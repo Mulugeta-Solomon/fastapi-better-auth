@@ -32,7 +32,7 @@ from typing import Any, cast
 
 import aiosqlite
 import pytest
-from sqlalchemy import Engine, create_engine, event, text
+from sqlalchemy import URL, Engine, create_engine, event, make_url, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 
@@ -243,6 +243,26 @@ def postgres_engine(url: str) -> AsyncEngine:
 
 def sync_engine(path: pathlib.Path) -> Engine:
     return create_engine(f"sqlite+pysqlite:///{path}")
+
+
+SYNC_DRIVERS = ("psycopg", "psycopg2")
+"""The synchronous Postgres drivers `SyncStoreAdapter(statement_timeout=...)` is proven on: the
+two a deployment of the adapter runs. Each is also the name its module is imported by."""
+
+SYNC_DRIVER_ABSENT = (
+    "{driver} is not installed here, and a Postgres Engine imports its driver when it is built,"
+    " even one never connected"
+)
+
+
+def sync_postgres_engine(driver: str, url: str | URL, **options: Any) -> Engine:
+    """A Postgres `Engine` through `driver`, never connected; skips the case without `driver`.
+
+    `url` keeps everything but its driver, so the harness's asyncpg URL serves too. Only a case
+    that needs the engine itself calls this. One that compiles against the dialect class
+    (`PGDialect_psycopg()`) needs no driver and keeps running."""
+    pytest.importorskip(driver, reason=SYNC_DRIVER_ABSENT.format(driver=driver))
+    return create_engine(make_url(url).set(drivername=f"postgresql+{driver}"), **options)
 
 
 READ_VERBS = frozenset({"SELECT", "PRAGMA"})
