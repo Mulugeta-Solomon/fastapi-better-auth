@@ -5,7 +5,9 @@ The option is seconds, like every other deadline in this library. Postgres takes
 conversion rounds up, never down: a value below one millisecond is one, not the zero that would
 leave every statement unbounded while its operator believes otherwise. And it reads the value as
 the decimal it was written as, so binary float error cannot move it by a millisecond:
-`16.1 * 1000` is `16100.000000000002` as a float, and `16.1` seconds is still 16100 ms.
+`16.1 * 1000` is `16100.000000000002` as a float, and `16.1` seconds is still 16100 ms. The
+arithmetic is exact, with `Fraction`, so it does not depend on the caller's decimal context
+either: a thread running with low precision, or with `Inexact` trapped, gets the same answer.
 
 A value the server would refuse is refused here instead, when the store is built: above
 `MAX_MILLISECONDS` once rounded, Postgres answers `SET` with an error, and every lookup would be
@@ -15,7 +17,7 @@ refused for a reason nobody saw at startup.
 from __future__ import annotations
 
 import math
-from decimal import Decimal
+from fractions import Fraction
 
 from ..errors import ConfigurationError
 from ..reasons import safe_label
@@ -39,13 +41,14 @@ TOO_LARGE = (
 def milliseconds(seconds: float) -> int:
     """`seconds` as whole milliseconds, rounded up, read as the decimal it was written as.
 
-    `repr` of a float is the shortest decimal that reads back as the same float, so `Decimal`
-    of it is the number the caller wrote. An int is exact already. The built-in types are asked,
+    `repr` of a float is the shortest decimal that reads back as the same float, so `Fraction`
+    of it is exactly the number the caller wrote, and stays exact when multiplied. An int is
+    exact already. The built-in types are asked,
     never the value's own class: a subclass may print itself as anything (NumPy's `float64`, an
     `IntEnum`), and its value is still the number given.
     """
     written = int(seconds) if isinstance(seconds, int) else float.__repr__(float(seconds))
-    return math.ceil(Decimal(written) * MILLISECONDS_PER_SECOND)
+    return math.ceil(Fraction(written) * MILLISECONDS_PER_SECOND)
 
 
 def validated_statement_timeout(seconds: object) -> int | None:
