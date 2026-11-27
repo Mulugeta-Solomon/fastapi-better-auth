@@ -29,12 +29,15 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Select, String, bindparam, column, func, select, table, true
-from sqlalchemy.ext.asyncio import AsyncEngine
 
 from ..errors import ConfigurationError
 
 if TYPE_CHECKING:
-    from sqlalchemy import Executable
+    from sqlalchemy import Engine, Executable
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+    AnyEngine = Engine | AsyncEngine
+    """Either store's engine: the checks read only its dialect's name and its options."""
 
 POSTGRES = "postgresql"
 SETTING = "statement_timeout"
@@ -62,7 +65,7 @@ NO_TRANSACTION = (
 )
 
 
-def bounded_engine(engine: AsyncEngine, milliseconds: int | None) -> int | None:
+def bounded_engine(engine: AnyEngine, milliseconds: int | None) -> int | None:
     """The store's bound, refused when set on an engine that is not Postgres.
 
     Only the dialect's name is quoted, never the engine's URL: it can carry a password.
@@ -96,7 +99,18 @@ def probe_params(probe: str) -> dict[str, str]:
     return {SETTING_PARAM: PROBE_SETTING, VALUE_PARAM: probe}
 
 
-def refuse_autocommit(engine: AsyncEngine) -> None:
+def settings_in_order(milliseconds: int, probe: str | None) -> tuple[dict[str, str], ...]:
+    """What `timeout_statement` binds in one transaction, in the order the store sends it.
+
+    The bound alone in a lookup. At discovery the probe first, then the bound, so the readback
+    that follows proves the bound was set after the probe, in the same transaction. Both stores
+    send exactly this; only how a statement runs differs between them.
+    """
+    bound = timeout_params(milliseconds)
+    return (bound,) if probe is None else (probe_params(probe), bound)
+
+
+def refuse_autocommit(engine: AnyEngine) -> None:
     """Refuse an engine whose options say `AUTOCOMMIT`, before a transaction is opened on it.
 
     Free, and run for every transaction, so an engine switched after `connect()` is caught too

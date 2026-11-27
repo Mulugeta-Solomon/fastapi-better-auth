@@ -390,11 +390,8 @@ class SqlAlchemySessionStore(CoreStore):
             return
         self._sql.refuse_autocommit(self._engine)
         probe = self._sql.new_probe() if confirm else None
-        if probe is not None:
-            await connection.execute(self._sql.timeout_statement(), self._sql.probe_params(probe))
-        await connection.execute(
-            self._sql.timeout_statement(), self._sql.timeout_params(self._timeout)
-        )
+        for params in self._sql.settings_in_order(self._timeout, probe):
+            await connection.execute(self._sql.timeout_statement(), params)
         if probe is not None:
             found = await connection.execute(self._sql.readback_statement())
             self._sql.confirmed_bound(found.all(), self._timeout, probe)

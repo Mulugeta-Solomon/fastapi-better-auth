@@ -68,14 +68,15 @@ from .sqlalchemy_bound import (
     probe_params,
     readback_statement,
     refuse_autocommit,
+    settings_in_order,
     timeout_params,
     timeout_statement,
 )
 from .upstream import as_db_flag, as_moment, as_text
 
-# Re-exported so `sqlalchemy_store` can name the exception class in an `except` without importing
-# `sqlalchemy` itself - that module has to import cleanly when the extra is absent (D-146). The
-# `statement_timeout=` bound is reached the same way, through the one module the store imports.
+# Re-exported so the two store modules can name the exception class in an `except` without
+# importing `sqlalchemy` itself - they have to import cleanly when the extra is absent (D-146). The
+# `statement_timeout=` bound is reached the same way, through the one module the stores import.
 __all__ = [
     "SQLAlchemyError",
     "bounded_engine",
@@ -84,6 +85,7 @@ __all__ = [
     "probe_params",
     "readback_statement",
     "refuse_autocommit",
+    "settings_in_order",
     "timeout_params",
     "timeout_statement",
 ]
