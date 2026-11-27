@@ -41,6 +41,8 @@ import pytest
 from sqlalchemy import Engine
 from sqlalchemy.exc import DBAPIError
 
+from fastapi_better_auth import AuthServiceUnavailable
+
 from .conftest import PASSWORD, raw_token, sign_in, sign_out, sign_up
 from .roles import READ_BOTH, Login, sync_engine_as, sync_login_granted
 from .table_copies import sync_table_copies
@@ -65,15 +67,19 @@ try:
         QUERY_CANCELED,
         QUEUED,
         Lock,
+        Opened,
         back_within,
         count,
         driver_error,
         harness_engine,
         held,
         in_thread,
+        mentions,
         one_lookup,
         outages,
+        pooled_values,
         queued_while,
+        server_value,
     )
 except ImportError:
     pytest.skip(
@@ -194,6 +200,42 @@ async def test_a_lookup_queued_on_a_lock_is_ended_by_the_server_at_the_bound(
     assert BOUND <= watched.took < CLIENT_SIDE, f"refused after {watched.took:.3f}s"
     assert [sqlstate for _, sqlstate in outages(logs.records)] == [QUERY_CANCELED]
     assert recovered == "SessionRevoked"
+    assert mentions(logs.records, FORGED_TOKEN) == []
+
+
+@pytest.mark.anyio
+async def test_a_lookup_the_server_ends_raises_the_refusal_and_nothing_with_the_token(
+    engine: Engine,
+    observer: Engine,
+    lock: Lock,
+    schema: str,
+    application_name: str,
+    logs: pytest.LogCaptureFixture,
+) -> None:
+    """Called on the store itself, as route code may. The driver's error carries the token
+    (psycopg2 writes it into the statement's text); the refusal that leaves the adapter carries
+    neither, on its text, its repr or its chain, and no log record names it."""
+    store = SyncStoreAdapter(engine=engine, schema=schema, statement_timeout=BOUND)
+    await store.connect()
+
+    await in_thread(lock.take)
+    watched = await queued_while(
+        observer, application_name, lambda: store.fetch_session_by_token(FORGED_TOKEN)
+    )
+    await in_thread(lock.release)
+    await every_slot_returned(store)
+
+    refusal = watched.outcome
+    assert isinstance(refusal, AuthServiceUnavailable), f"the lookup gave {refusal!r}"
+    assert watched.queued_at is not None
+    assert BOUND <= watched.took < CLIENT_SIDE
+    assert FORGED_TOKEN not in str(refusal)
+    assert FORGED_TOKEN not in repr(refusal)
+    assert FORGED_TOKEN not in refusal.reason
+    assert refusal.__cause__ is None
+    assert refusal.__context__ is None
+    assert outages(logs.records) == [("QueryCanceled", QUERY_CANCELED)]
+    assert mentions(logs.records, FORGED_TOKEN) == []
 
 
 @pytest.mark.anyio
@@ -216,6 +258,7 @@ async def test_an_abandoned_lookups_slot_and_connection_come_back_at_the_bound(
     await store.connect()
     built = verifier(store, lookup_timeout=ABANDONED_AT)
     window = SLOT_BOUND + MARGIN
+    opened = Opened(engine)
 
     await in_thread(lock.take)
     try:
@@ -227,10 +270,11 @@ async def test_an_abandoned_lookups_slot_and_connection_come_back_at_the_bound(
     finally:
         await in_thread(lock.release)
         await every_slot_returned(store)
-    print(
-        f"slot case ({'bounded' if bounded else 'unbounded'}): abandoned at {watched.took:.3f}s,"
-        f" back at {back_at}, held {holding} with the lock held={lock_held} queued={queued}"
-    )
+    answered = await one_lookup(verifier(store, lookup_timeout=LOOKUP_TIMEOUT))
+    await every_slot_returned(store)
+    reopened = opened.count
+    readings = await in_thread(pooled_values, engine, POOL_SIZE)
+    own = await in_thread(server_value, observer)
 
     assert watched.queued_at is not None, (
         "the server never showed the lookup queued in a transaction"
@@ -239,6 +283,10 @@ async def test_an_abandoned_lookups_slot_and_connection_come_back_at_the_bound(
     assert watched.outcome == "deadline"
     assert ABANDONED_AT <= watched.took < SLOT_BOUND
     assert lock_held == 1, "the lock went before the measurement ended"
+    assert answered == "SessionRevoked", "the pool did not serve after the lock went"
+    assert reopened == 0, "the abandoned lookup's connection was not given back whole"
+    assert readings == [own] * POOL_SIZE
+    assert mentions(logs.records, FORGED_TOKEN) == []
     kinds = [kind for kind, _ in outages(logs.records)]
     if bounded:
         assert back_at is not None, f"slot or connection still held {window}s after the start"

@@ -19,7 +19,7 @@ from typing import Any, TypeVar
 
 import anyio
 import anyio.to_thread
-from sqlalchemy import Connection, Engine, QueuePool, text
+from sqlalchemy import Connection, Engine, QueuePool, event, text
 
 from fastapi_better_auth import (
     AuthServiceUnavailable,
@@ -193,3 +193,35 @@ async def back_within(
             return time.monotonic() - since
         await anyio.sleep(POLL)
     return None
+
+
+def pooled_values(engine: Engine, size: int) -> list[str]:
+    """`statement_timeout` as each of `size` pooled connections reports it, all checked out at
+    once, so every connection the pool holds is read."""
+    connections = [engine.connect() for _ in range(size)]
+    try:
+        return [str(connection.scalar(text(SERVER_VALUE))) for connection in connections]
+    finally:
+        for connection in connections:
+            connection.close()
+
+
+def mentions(records: list[logging.LogRecord], secret: str) -> list[str]:
+    """Every captured record whose rendered message, or whose exception text, carries `secret`."""
+    found: list[str] = []
+    for record in records:
+        rendered = record.getMessage() + (str(record.exc_info[1]) if record.exc_info else "")
+        if secret in rendered:
+            found.append(rendered)
+    return found
+
+
+class Opened:
+    """Counts the connections an engine's pool opens from now on."""
+
+    def __init__(self, engine: Engine) -> None:
+        self.count = 0
+        event.listen(engine, "connect", self._opened)
+
+    def _opened(self, *_: object) -> None:
+        self.count += 1

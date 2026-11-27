@@ -284,9 +284,14 @@ Postgres on `asyncpg`, the first for a role holding only `SELECT` on the two tab
 `tests/e2e/test_sync_store_statement_timeout_live.py` and
 `tests/e2e/test_sync_store_statement_timeout_discovery_live.py` prove the same for
 `SyncStoreAdapter` on `psycopg` (3) and `psycopg2`, on asyncio and trio, and that the slot and
-the connection come back. Other drivers are not tested. psycopg2 writes each value into the
-statement's text before it sends it, so the server's activity view and its log show the session
-token of a running lookup. asyncpg and psycopg send values apart from the text.
+the connection come back. Other drivers are not tested.
+
+**psycopg2 shows the token to the server's observers.** psycopg2 writes each value into the
+statement's text before it sends it. So `pg_stat_activity` shows the session token of a running
+lookup, and the server's log shows it for a lookup that fails, one the bound ends included,
+since Postgres logs a failed statement's text by default (`log_min_error_statement`). asyncpg and
+psycopg send values apart from the text, and the server shows `$1` in their place. With
+psycopg2, keep that view and that log to people you would trust with sessions.
 
 **Everywhere else, set the timeout on the role.** That covers other databases. On Postgres:
 `ALTER ROLE <role> SET statement_timeout = '3s'`. It applies to connections opened after it, so
