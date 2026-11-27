@@ -25,6 +25,7 @@ from .errors import (
 )
 from .models import Session, User
 from .openapi import declaring, schemes_for
+from .unavailable import UNAUTHORIZED, UnavailablePolicy, unavailable_policy
 from .verifiers import PreparedVerifier, Verifier
 
 logger = logging.getLogger("fastapi_better_auth")
@@ -124,10 +125,18 @@ class BetterAuth:
         verifiers: One or more verifiers, in the order their credentials should be looked
             for. Each must satisfy the `Verifier` protocol and validate its own
             configuration in its own `__init__`.
+        unavailable_status: What an `AuthServiceUnavailable` answers: `401` (the default), the
+            uniform refusal every other credential failure gets, or `503`, with `Retry-After`,
+            the body `{"detail": "Service unavailable"}` and no `WWW-Authenticate` challenge.
+            Nothing else changes. Every other refusal keeps its answer.
+        unavailable_retry_after: Whole seconds for `Retry-After`, from 1 to 300. Only with
+            `unavailable_status=503`, where it defaults to 10.
 
     Raises:
         ConfigurationError: For every construction-time refusal, all of them before a request
-            exists: the sequence is empty or is not a sequence; an entry does not implement
+            exists: `unavailable_status` is not 401 or 503, or `unavailable_retry_after` is
+            given without 503 or is not whole seconds in range; the sequence is empty or is
+            not a sequence; an entry does not implement
             `Verifier`, has a non-callable `extract`/`verify`, declares an `async def extract`,
             or declares a blank `credential_source`; the same verifier appears twice; two
             verifiers declare the same `credential_source` - or cookie labels naming one cookie
@@ -137,7 +146,14 @@ class BetterAuth:
             other.
     """
 
-    def __init__(self, *, verifiers: Sequence[Verifier]) -> None:
+    def __init__(
+        self,
+        *,
+        verifiers: Sequence[Verifier],
+        unavailable_status: int = UNAUTHORIZED,
+        unavailable_retry_after: int | None = None,
+    ) -> None:
+        self._unavailable = unavailable_policy(unavailable_status, unavailable_retry_after)
         self._verifiers = validated_verifiers(verifiers)
         self._nothing = _nothing_presented(self._verifiers)
         self._declared = declaring(schemes_for(self._verifiers))
@@ -536,7 +552,7 @@ class BetterAuth:
             if not presented:
                 return None
             chosen, credential = presented[0]
-            answer = await _verified(chosen, credential, user_model)
+            answer = await _verified(chosen, credential, user_model, self._unavailable)
         finally:
             credential = None
             presented.clear()
@@ -570,10 +586,19 @@ def _presence(credential: object, verifier: Verifier) -> object | None:
     return credential
 
 
-async def _verified(verifier: Verifier, credential: object, user_model: type[UserModelT]) -> Any:
+async def _verified(
+    verifier: Verifier,
+    credential: object,
+    user_model: type[UserModelT],
+    unavailable: UnavailablePolicy,
+) -> Any:
     # Every refusal of every verifier passes through this frame, which holds the raw credential
     # in a parameter: a parameter is a frame local, and a locals-capturing reporter reads it
     # (D-094, D-180). Scrubbed in `finally`, so no path can skip it.
+    #
+    # It is also the one place `AuthServiceUnavailable` takes this bridge's form. A refusal the
+    # policy leaves alone is re-raised as itself, the same object `main` raised. One it replaces
+    # is a new object, raised outside the handler and `from None`, so it links to nothing.
     try:
         try:
             answer = verifier.verify(credential, user_model)
@@ -583,10 +608,15 @@ async def _verified(verifier: Verifier, credential: object, user_model: type[Use
                     " it with `async def`."
                 )
             return await answer
-        except (BetterAuthError, SessionError):
+        except BetterAuthError:
             raise
+        except SessionError as refusal:
+            failure = unavailable.replacing(refusal)
+            if failure is None:
+                raise
         except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-            failure = _resolved(exc, verifier, "verify", (BetterAuthError, SessionError))
+            resolved = _resolved(exc, verifier, "verify", (BetterAuthError, SessionError))
+            failure = unavailable.replacing(resolved) or resolved
         raise failure from None  # outside the handler, as in `_extracted`
     finally:
         credential = None
