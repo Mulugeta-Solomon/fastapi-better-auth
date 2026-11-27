@@ -35,6 +35,7 @@ from fastapi_better_auth._internal.stores.sqlalchemy_core import (
     probe_params,
     readback_statement,
     refuse_autocommit,
+    settings_in_order,
     timeout_params,
     timeout_statement,
 )
@@ -133,6 +134,13 @@ def test_the_probe_is_the_same_statement_naming_the_probe_setting() -> None:
 
     assert str(compiled) == SETTINGS_STATEMENT
     assert [values[name] for name in compiled.positiontup or ()] == [PROBE_SETTING, PROBE]
+
+
+def test_a_lookup_sets_the_bound_alone_and_discovery_sets_the_probe_first() -> None:
+    """One order for both stores: the probe before the bound, so the readback after them proves
+    the bound was set in the transaction that set the probe."""
+    assert settings_in_order(1500, None) == (timeout_params(1500),)
+    assert settings_in_order(1500, PROBE) == (probe_params(PROBE), timeout_params(1500))
 
 
 def test_each_probe_is_fresh_random_hex() -> None:

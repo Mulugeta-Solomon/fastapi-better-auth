@@ -23,7 +23,7 @@ from sqlalchemy import Engine
 
 from fastapi_better_auth import ConfigurationError, SyncStoreAdapter
 from fastapi_better_auth._internal.stores.sqlalchemy_core import Discovered
-from fastapi_better_auth._internal.stores.sqlalchemy_store import (
+from fastapi_better_auth._internal.stores.sync_store import (
     DEFAULT_MAX_CONCURRENCY,
     _pool_ceiling,  # pyright: ignore[reportPrivateUsage]
 )

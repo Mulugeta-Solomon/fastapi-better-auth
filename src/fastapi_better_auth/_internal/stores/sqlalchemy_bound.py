@@ -1,11 +1,14 @@
-"""`SqlAlchemySessionStore(statement_timeout=...)` as SQL: the bound set, and proven to hold.
+"""`statement_timeout=` as SQL, for both SQLAlchemy stores: the bound set, and proven to hold.
 
-The store sends `timeout_statement` before any read in every transaction it opens (at discovery,
-just after the probe below). It sets Postgres's `statement_timeout` for that transaction alone. A
+`SqlAlchemySessionStore` and `SyncStoreAdapter` send `timeout_statement` before any read in every
+transaction they open (at discovery, just after the probe below), in the order
+`settings_in_order` gives. It sets Postgres's `statement_timeout` for that transaction alone. A
 function call rather than `SET LOCAL`, because a utility statement takes no bound parameter: the
-value would have to be written into the SQL text. Here it travels as a parameter, and the literal
-`true` makes the setting transaction-local. It ends with the transaction, so it never reaches
-another checkout of the pool the store shares.
+value would have to be written into the SQL text by this library. Here it is a bound parameter,
+and the literal `true` makes the setting transaction-local. asyncpg and psycopg send the value to
+the server apart from the text; psycopg2 quotes it into the text on the client, as it does every
+parameter. It ends with the transaction, so it never reaches another checkout of the pool the
+store shares.
 
 That also means it holds only inside a transaction. On an engine in `AUTOCOMMIT` every statement
 is a transaction of its own, the setting ends with the statement that made it, and the lookup
@@ -29,12 +32,15 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Select, String, bindparam, column, func, select, table, true
-from sqlalchemy.ext.asyncio import AsyncEngine
 
 from ..errors import ConfigurationError
 
 if TYPE_CHECKING:
-    from sqlalchemy import Executable
+    from sqlalchemy import Engine, Executable
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+    AnyEngine = Engine | AsyncEngine
+    """Either store's engine: the checks read only its dialect's name and its options."""
 
 POSTGRES = "postgresql"
 SETTING = "statement_timeout"
@@ -62,7 +68,7 @@ NO_TRANSACTION = (
 )
 
 
-def bounded_engine(engine: AsyncEngine, milliseconds: int | None) -> int | None:
+def bounded_engine(engine: AnyEngine, milliseconds: int | None) -> int | None:
     """The store's bound, refused when set on an engine that is not Postgres.
 
     Only the dialect's name is quoted, never the engine's URL: it can carry a password.
@@ -96,7 +102,18 @@ def probe_params(probe: str) -> dict[str, str]:
     return {SETTING_PARAM: PROBE_SETTING, VALUE_PARAM: probe}
 
 
-def refuse_autocommit(engine: AsyncEngine) -> None:
+def settings_in_order(milliseconds: int, probe: str | None) -> tuple[dict[str, str], ...]:
+    """What `timeout_statement` binds in one transaction, in the order the store sends it.
+
+    The bound alone in a lookup. At discovery the probe first, then the bound, so the readback
+    that follows proves the bound was set after the probe, in the same transaction. Both stores
+    send exactly this; only how a statement runs differs between them.
+    """
+    bound = timeout_params(milliseconds)
+    return (bound,) if probe is None else (probe_params(probe), bound)
+
+
+def refuse_autocommit(engine: AnyEngine) -> None:
     """Refuse an engine whose options say `AUTOCOMMIT`, before a transaction is opened on it.
 
     Free, and run for every transaction, so an engine switched after `connect()` is caught too
