@@ -85,9 +85,9 @@ class SessionError(HTTPException):
     body, same headers - so a client cannot tell a bad signature from an expired session
     from an unreachable auth service, and cannot use the difference to probe for valid
     identifiers. The one opt-in exception is `AuthServiceUnavailable` under
-    `BetterAuth(unavailable_status=503)`; see that class. That guarantee covers the response only; closing the timing channel
-    between a local signature check and a timed-out network call is the verifier's
-    timeout budget to own, not this class's.
+    `BetterAuth(unavailable_status=503)`; see that class. That guarantee covers the response
+    only; closing the timing channel between a local signature check and a timed-out network
+    call is the verifier's timeout budget to own, not this class's.
 
     `reason` reaches operators through a registered exception handler, through `.reason`,
     and through `repr()`. It is absent from `str()` and from every response. Note that a

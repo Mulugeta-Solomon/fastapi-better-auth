@@ -144,9 +144,10 @@ the server will still be up on the next request. It proves the URI and the contr
 Without the lifespan, the probe still runs — lazily, on the first request that gets that far. A
 contract failure there is remembered permanently, and every later request raises the same
 `ConfigurationError`. A temporary failure is not remembered: the request is refused with a 401
-(`AuthServiceUnavailable`, or a `503` under [the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down)) and the probe is retried at most once every ten seconds, so an auth
-service that comes up a moment after yours, or answers `503` while it restarts, recovers on its
-own.
+(`AuthServiceUnavailable`, or a `503` under
+[the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down)) and the probe is
+retried at most once every ten seconds, so an auth service that comes up a moment after yours, or
+answers `503` while it restarts, recovers on its own.
 
 **What one request costs.** The order below is the design, and everything above the fetch makes zero
 outbound calls by construction:

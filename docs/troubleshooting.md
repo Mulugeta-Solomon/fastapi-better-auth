@@ -3,8 +3,9 @@
 After reading this page you can find the usual cause of a symptom and the page that fixes it.
 
 Refusals are not logged by default, and every `401` looks the same on the wire. If clients see a
-sign-in prompt while the auth service is down, see [the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down). To see why a
-request was refused, log `exc.reason` from an exception handler; see
+sign-in prompt while the auth service is down, see
+[the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down). To see why a request
+was refused, log `exc.reason` from an exception handler; see
 [Errors](errors.md#why-the-401s-are-identical).
 
 ## Every cookie request is `401`

@@ -60,9 +60,9 @@ a `crit` header at all, because Better Auth never emits one and no extension is 
   reason lives only on the exception's `.reason` and in your logs. An unreachable auth dependency
   is part of that 401 by default. A deployment that opts in to the `503`
   ([Errors](docs/errors.md#answering-503-while-the-auth-service-is-down)) tells any caller that the
-  dependency is failing and that its credential passed the checks made before it was asked. Timing is not uniform by design:
-  a cookie whose signature does not verify is refused before the session store is consulted, so
-  the store is never a lever for unauthenticated traffic.
+  dependency is failing and that its credential passed the checks made before it was asked. Timing
+  is not uniform by design: a cookie whose signature does not verify is refused before the session
+  store is consulted, so the store is never a lever for unauthenticated traffic.
 - **Match `secure_cookies` to what your server actually sets.** `CookieVerifier` reads exactly one
   cookie name: the `__Secure-`-prefixed one when `secure_cookies=True` (the default, and Better
   Auth's own production default), or the plain name when `False` — set `False` for a dev/HTTP

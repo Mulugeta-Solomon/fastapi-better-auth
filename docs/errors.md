@@ -36,12 +36,13 @@ Two more exceptions are not refusals of this kind:
 Every request-time failure is an `HTTPException` subclass, so FastAPI answers it with no handler of
 yours: `401`, the body `{"detail": "Not authenticated"}`, and a `WWW-Authenticate: Bearer` header.
 Missing, malformed, expired, revoked, "the key set could not be fetched" and "the auth service could
-not be reached" are byte-identical on the wire by default, deliberately — a client must not be able
-to tell them apart and use the difference to probe. That last one is `AuthServiceUnavailable`, and by
-default it is a `401` rather than a `503` on purpose: an unreachable Better Auth server means this
-request was not authenticated, and saying so in a distinct status would be both an oracle and an
-invitation to retry. A deployment can choose the `503` instead; see
-[Answering 503 while the auth service is down](#answering-503-while-the-auth-service-is-down). Mode C raises it for every non-`200` upstream answer, every timeout, an unusable body, a
+not be reached" are byte-identical on the wire by default, deliberately: a client must not be able
+to tell them apart and use the difference to probe. That last one is `AuthServiceUnavailable`, and
+by default it is a `401` rather than a `503` on purpose: an unreachable Better Auth server means
+this request was not authenticated, and saying so in a distinct status would be both an oracle and
+an invitation to retry. A deployment can choose the `503` instead; see
+[Answering 503 while the auth service is down](#answering-503-while-the-auth-service-is-down).
+Mode C raises it for every non-`200` upstream answer, every timeout, an unusable body, a
 saturated outbound limiter, a live `429` backoff, and every request while its readiness probe has
 not yet passed. Mode B raises it when there is no usable key set: the first fetch failed, or the
 set on hand is older than `max_stale`. Two credentials on one request are a `400`

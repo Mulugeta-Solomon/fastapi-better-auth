@@ -54,8 +54,9 @@ silent `403`. Whatever the predicate raises is logged and answered `403`, except
 `AuthorizationRefused`, which is how a rule explains itself ([below](#a-refusal-that-explains)).
 One `SessionError` follows the bridge's setting instead: an `AuthServiceUnavailable` raised by a
 predicate or a membership lookup answers exactly as one raised by a verifier does, the `401` by
-default or the `503` under [the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down). So a rule that reads a store during a stall does not tell a
-verified session to sign in again.
+default or the `503` under
+[the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down). So a rule that reads a
+store during a stall does not tell a verified session to sign in again.
 
 **The organization id comes from the request — its path or its query — and membership is checked with
 your own query. Never from `session.raw["activeOrganizationId"]`.**
