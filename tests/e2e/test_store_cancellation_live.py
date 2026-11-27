@@ -632,7 +632,7 @@ class Phase(NamedTuple):
     """Where a transaction stood when the relay stalled: what the server and the relay say."""
 
     in_transaction: list[str]
-    """The first word of the last query of each store backend idle in a transaction."""
+    """The command of the last query of each store backend idle in a transaction."""
     active: int
     """The store backends running a statement."""
     settings_held: bool
@@ -642,11 +642,17 @@ class Phase(NamedTuple):
 async def stall_phase(observer: AsyncEngine, name: str, relay: StallingRelay) -> Phase:
     rows = await server_backends(observer, name)
     return Phase(
-        in_transaction=[str(row[2]).split()[0] for row in rows if row[1] == IDLE_IN_TRANSACTION],
+        in_transaction=[_command(str(row[2])) for row in rows if row[1] == IDLE_IN_TRANSACTION],
         active=sum(1 for row in rows if row[1] == "active"),
         settings_held=relay.holds(SETTINGS_PARAMETER),
         begin_held=relay.holds(BEGIN),
     )
+
+
+def _command(query: str) -> str:
+    """The command a query starts with, as asyncpg sends it (`BEGIN;`): `BEGIN`."""
+    words = query.split()
+    return words[0].rstrip(";").upper() if words else ""
 
 
 ANSWERED_BEGIN_HELD_SETTINGS = Phase(["BEGIN"], 0, settings_held=True, begin_held=False)
@@ -666,24 +672,19 @@ async def test_a_call_abandoned_while_its_settings_statement_is_unanswered_ends_
     loop_reports: list[dict[str, Any]],
 ) -> None:
     """With `statement_timeout=` set, each transaction opens with the settings statement, and the
-    server can stop answering right there. The relay is stalled from SQLAlchemy's
-    `before_cursor_execute` for that statement, just before it goes out, and the lookup's deadline
-    is passed only then (`LeapingClock`). The abandoned call must end within the bound and give
-    its connection back while the relay is still stalled, and the store must answer once the
-    relay forwards again."""
+    server can stop answering right there: after `BEGIN` was answered, with the settings statement
+    in flight. That is where the relay stalls: on the bytes that carry the statement's first
+    parameter (`stall_before`). Not from SQLAlchemy's `before_cursor_execute`: it fires before the
+    asyncpg adapter sends `BEGIN`, so a stall from there holds `BEGIN` instead. The phase is
+    asserted, from the server and the relay, before the lookup's deadline is passed
+    (`LeapingClock`). The abandoned call must end within the bound and give its connection back
+    while the relay is still stalled, and the store must answer once the relay forwards again."""
     clock = LeapingClock(monkeypatch)
     store = SqlAlchemySessionStore(engine=relayed_engine, statement_timeout=WELL_PAST_THE_TEST)
     await store.connect()
     steady = verifier(store, lookup_timeout=LONG)
     assert await one_lookup(steady) == "SessionRevoked"
-    setting = asyncio.Event()
-
-    def stall_the_setting(_connection: Any, _cursor: Any, statement: str, *_: Any) -> None:
-        if "set_config" in statement and not setting.is_set():
-            relay.stall()
-            setting.set()
-
-    event.listen(relayed_engine.sync_engine, "before_cursor_execute", stall_the_setting)
+    setting = relay.stall_before(SETTINGS_PARAMETER)
     lookup = asyncio.ensure_future(one_lookup(steady))
     try:
         with anyio.fail_after(GUARD):
@@ -697,7 +698,6 @@ async def test_a_call_abandoned_while_its_settings_statement_is_unanswered_ends_
             await store._handoff.settled()  # pyright: ignore[reportPrivateUsage]
         held_while_stalled = checked_out(relayed_engine)
     finally:
-        event.remove(relayed_engine.sync_engine, "before_cursor_execute", stall_the_setting)
         relay.resume()
         lookup.cancel()
 
