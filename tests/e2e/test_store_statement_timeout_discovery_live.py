@@ -21,6 +21,7 @@ from __future__ import annotations
 import inspect
 import logging
 import secrets
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -36,7 +37,7 @@ try:
     # Post-0.1.0 names belong under the guard: the published-wheel lane must skip, not raise.
     from fastapi_better_auth import CookieVerifier, SqlAlchemySessionStore
     from tests.cookies import COOKIE, http, run, sign
-    from tests.deadlines import every_call_ended
+    from tests.deadlines import every_call_ended, outage_lines, verifier
     from tests.stores import StatementLog
 except ImportError:
     pytest.skip(
@@ -193,4 +194,40 @@ async def test_autocommit_is_refused_where_the_applications_session_value_is_the
 
     assert equal == EQUAL_VALUE, "the application's session value did not take"
     assert lookups_sent(log, schema) == []
+    assert len(pool_of_one.opened) == 1
+
+
+@pytest.mark.anyio
+async def test_an_equal_session_value_on_a_transactional_engine_is_served_under_the_stores_bound(
+    pool_of_one: Pool, blocker: AsyncEngine, schema: str, logs: pytest.LogCaptureFixture
+) -> None:
+    """Discovery passes. Then the application sets its own value on the one pooled connection to
+    no timeout at all, and a lookup queued on a lock is still ended by the server at the bound:
+    the store's own setting is what bounds it, not the application's."""
+    equal = await pool_of_one.value()
+    store = SqlAlchemySessionStore(
+        engine=pool_of_one.engine, schema=schema, statement_timeout=BOUND
+    )
+    await store.connect()
+    async with pool_of_one.engine.connect() as connection:
+        await connection.execute(text(f"SET statement_timeout = {NO_TIMEOUT}"))
+        await connection.commit()
+    unbounded = await pool_of_one.value()
+    built = verifier(store, lookup_timeout=LOOKUP_TIMEOUT)
+
+    async with blocker.connect() as lock:
+        await lock.execute(text(f"LOCK TABLE {schema}.session IN ACCESS EXCLUSIVE MODE"))
+        started = time.monotonic()
+        outcome = await one_lookup(built)
+        took = time.monotonic() - started
+        await lock.rollback()
+    recovered = await one_lookup(built)
+    await every_call_ended(store)
+
+    assert equal == EQUAL_VALUE, "the application's session value did not take"
+    assert unbounded == NO_TIMEOUT, "the application's change did not take"
+    assert outcome == "store-error", "the lookup was not ended by the server"
+    assert BOUND <= took < CLIENT_SIDE, f"refused after {took:.3f}s"
+    assert [tuple(r.args or ())[1] for r in outage_lines(logs.records)] == [QUERY_CANCELED]
+    assert recovered == "SessionRevoked"
     assert len(pool_of_one.opened) == 1
