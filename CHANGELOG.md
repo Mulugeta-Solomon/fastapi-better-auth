@@ -13,8 +13,8 @@ notes". The full release notes for each version are on the
 ### Added
 
 - **`SqlAlchemySessionStore(statement_timeout=...)`** (#121). Seconds, `None` by default, and
-  PostgreSQL only. When set, every transaction the store opens starts with a transaction-local
-  `statement_timeout`, so the server ends any statement of the store that runs past it. That
+  PostgreSQL only. When set, every transaction the store opens sets a transaction-local
+  `statement_timeout` before it reads anything, so the server ends any statement of the store that runs past it. That
   covers each lookup and the schema read in `connect()`. The setting ends with the store's own
   transaction, so other statements on the same engine keep their own timeout. For the store's
   transactions it replaces a role-level or database-level value, even a shorter one. Keep it below

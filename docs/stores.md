@@ -210,9 +210,10 @@ statement timeout covers them.
 store's own statements, so it works on an engine the store shares with the rest of the
 application:
 
-- Every transaction the store opens starts with
-  `SELECT set_config('statement_timeout', <ms>, true)`. That covers each lookup, and the schema read
-  that `connect()` and the first lookup run.
+- Every transaction the store opens sets
+  `SELECT set_config('statement_timeout', <ms>, true)` before it reads anything. That covers each
+  lookup, and the schema read that `connect()` and the first lookup run. The schema read sets a
+  probe just before it (see below).
 - The setting lasts until the end of that transaction, and the store always ends it with a
   `ROLLBACK`. Other statements on the same pool keep their own timeout.
 - For the store's transactions, the store's value replaces a timeout set on the role or the
@@ -224,7 +225,8 @@ application:
   on it.
 - On any other database the option raises `ConfigurationError` when the store is built.
 - It bounds the statements that follow it in a transaction. It does not bound itself, the
-  `ROLLBACK`, or the statements SQLAlchemy sends when it opens a connection.
+  schema read's probe before it, the `ROLLBACK`, or the statements SQLAlchemy sends when it opens
+  a connection.
 - With the option set, a lookup sends two statements instead of one: the setting, then the lookup.
   The schema read sends three more: a probe, the setting, and a read of both that checks the
   setting held (see below).

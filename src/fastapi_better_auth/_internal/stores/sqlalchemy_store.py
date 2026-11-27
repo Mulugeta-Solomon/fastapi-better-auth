@@ -311,8 +311,9 @@ class SqlAlchemySessionStore(_CoreStore):
             verified request's `session.user` may carry.
         statement_timeout: Seconds, or `None` (the default) to send nothing of the kind. PostgreSQL
             only: a transaction-local `statement_timeout`, rounded up to whole milliseconds, set
-            first in every transaction the store opens - each lookup and the schema read. Keep
-            it below `CookieVerifier`'s `lookup_timeout`.
+            before any read in every transaction the store opens - each lookup and the schema
+            read, where a probe is set just before it. Keep it below `CookieVerifier`'s
+            `lookup_timeout`.
 
     Raises:
         ConfigurationError: If `sqlalchemy` is not installed, if `engine` is not an
