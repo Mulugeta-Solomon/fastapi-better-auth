@@ -267,7 +267,5 @@ def test_two_bridges_sharing_one_verifier_answer_each_by_its_own_setting() -> No
     for _ in range(2):
         assert wire(get(gated_app(quiet), **{HEADER: "x"})) == UNKNOWN_CREDENTIAL_401
         assert wire(get(gated_app(loud), **{HEADER: "x"})) == service_unavailable(RETRY_AFTER)
-        assert wire(get(gated_app(longer), **{HEADER: "x"})) == service_unavailable(
-            RETRY_AFTER + 1
-        )
+        assert wire(get(gated_app(longer), **{HEADER: "x"})) == service_unavailable(RETRY_AFTER + 1)
     assert shared.verify_calls == 6

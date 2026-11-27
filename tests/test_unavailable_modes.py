@@ -265,9 +265,7 @@ def test_mode_c_a_remembered_forged_cookie_stays_401_during_an_outage() -> None:
 
 
 def test_mode_c_a_503_is_never_remembered_and_recovery_answers_at_once() -> None:
-    transport = ScriptedTransport(
-        OSError("connection refused"), json_reply(remote.document())
-    )
+    transport = ScriptedTransport(OSError("connection refused"), json_reply(remote.document()))
     verifier = remote.verifier(transport)
 
     first = wire(answers(verifier, remote_cookie(), **OPT_IN))

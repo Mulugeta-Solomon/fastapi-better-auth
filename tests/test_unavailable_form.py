@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import gc
 import pickle
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import ClassVar
 
 import pytest
@@ -75,8 +75,10 @@ def test_the_headers_are_per_instance_and_the_envelope_view_is_read_only() -> No
 
     assert second.headers == {"Retry-After": str(RETRY_AFTER)}
     assert first.response_headers == {"Retry-After": str(RETRY_AFTER)}
+    view = first.response_headers
+    assert view is not None
     with pytest.raises(TypeError):
-        first.response_headers["X-Edited"] = "1"  # pyright: ignore[reportIndexIssue]
+        view["X-Edited"] = "1"  # pyright: ignore[reportIndexIssue]
 
 
 def test_the_class_constants_are_untouched() -> None:
@@ -107,17 +109,25 @@ def test_repr_carries_the_reason_and_the_retry_after_and_str_carries_neither() -
     assert REASON not in str(error)
 
 
-@pytest.mark.parametrize(
-    "revive",
-    [lambda e: pickle.loads(pickle.dumps(e)), copy.copy, copy.deepcopy],
-    ids=["pickle", "copy", "deepcopy"],
-)
-def test_it_survives_pickle_and_copy_as_the_503(revive: object) -> None:
-    error = answer()
+def pickled(error: AuthServiceUnavailable503) -> object:
+    return pickle.loads(pickle.dumps(error))
 
-    revived = revive(error)  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
 
-    assert type(revived) is AuthServiceUnavailable503  # pyright: ignore[reportUnknownArgumentType]
+def copied(error: AuthServiceUnavailable503) -> object:
+    return copy.copy(error)
+
+
+def deep_copied(error: AuthServiceUnavailable503) -> object:
+    return copy.deepcopy(error)
+
+
+@pytest.mark.parametrize("revive", [pickled, copied, deep_copied])
+def test_it_survives_pickle_and_copy_as_the_503(
+    revive: Callable[[AuthServiceUnavailable503], object],
+) -> None:
+    revived = revive(answer())
+
+    assert type(revived) is AuthServiceUnavailable503
     assert isinstance(revived, AuthServiceUnavailable503)
     assert revived.reason == REASON
     assert revived.retry_after == RETRY_AFTER

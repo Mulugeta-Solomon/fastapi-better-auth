@@ -126,22 +126,25 @@ def socket_app(auth: BetterAuth) -> FastAPI:
 
 
 def denial(auth: BetterAuth) -> WebSocketDenialResponse:
-    with TestClient(socket_app(auth)) as http, pytest.raises(WebSocketDenialResponse) as caught:
-        with http.websocket_connect("/ws", headers={HEADER: GOOD_CREDENTIAL}):
-            pass  # pragma: no cover - the handshake is refused before it is accepted
+    with (
+        TestClient(socket_app(auth)) as http,
+        pytest.raises(WebSocketDenialResponse) as caught,
+        http.websocket_connect("/ws", headers={HEADER: GOOD_CREDENTIAL}),
+    ):
+        pass  # pragma: no cover - the handshake is refused before it is accepted
     return caught.value
 
 
 def test_a_websocket_handshake_is_denied_with_the_default_401() -> None:
     refused = denial(BetterAuth(verifiers=[RaisingVerifier(HEADER, unavailable)]))
 
-    assert wire(refused) == UNKNOWN_CREDENTIAL_401  # pyright: ignore[reportArgumentType]
+    assert wire(refused) == UNKNOWN_CREDENTIAL_401
 
 
 def test_a_websocket_handshake_is_denied_with_the_503_under_the_opt_in() -> None:
     refused = denial(BetterAuth(verifiers=[RaisingVerifier(HEADER, unavailable)], **OPT_IN))
 
-    assert wire(refused) == service_unavailable(RETRY_AFTER)  # pyright: ignore[reportArgumentType]
+    assert wire(refused) == service_unavailable(RETRY_AFTER)
 
 
 # --- paths that do not pass through the dispatcher -------------------------------------------
