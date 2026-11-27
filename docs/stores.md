@@ -183,7 +183,8 @@ What happens to the call that was running depends on the store:
   the statement. The adapter never runs more threads than `max_concurrency`. Further lookups wait
   without starting a thread, and are refused at their own deadline. With `statement_timeout=` set,
   the server ends the statement at the bound, and the thread's slot and its connection come back
-  then, even while the database is still blocked.
+  then, even while the database is still blocked. The adapter logs that end as well: after the
+  `WARNING` for the deadline comes a second one naming SQLSTATE `57014`.
 - **`RedisSessionStore`** cancels the `GET` it was waiting for. A reply that arrives afterwards is
   never read by a later lookup, because redis-py closes the connection of a cancelled command.
   `tests/e2e/test_redis_cut_reply_live.py` proves that against a live Redis.
@@ -292,12 +293,23 @@ Postgres on `asyncpg`, the first for a role holding only `SELECT` on the two tab
 `SyncStoreAdapter` on `psycopg` (3) and `psycopg2`, on asyncio and trio, and that the slot and
 the connection come back. Other drivers are not tested.
 
-**psycopg2 shows the token to the server's observers.** psycopg2 writes each value into the
-statement's text before it sends it. So `pg_stat_activity` shows the session token of a running
-lookup, and the server's log shows it for a lookup that fails, one the bound ends included,
-since Postgres logs a failed statement's text by default (`log_min_error_statement`). asyncpg and
-psycopg send values apart from the text, and the server shows `$1` in their place. With
-psycopg2, keep that view and that log to people you would trust with sessions.
+**Where the session token shows on the server.** The token is the lookup's key, so every lookup
+sends it to Postgres. What the server shows of it depends on the driver:
+
+- asyncpg and psycopg (3) send values apart from the statement's text. `pg_stat_activity` and the
+  log line of a failed statement show `$1` in the token's place.
+- psycopg2 writes each value into the text before it sends it. `pg_stat_activity` shows the token
+  of a running lookup, and the server's log shows it for every lookup that fails, since Postgres
+  logs a failed statement's text by default (`log_min_error_statement`). A lookup the bound ends
+  is a failed statement, so with `statement_timeout=` set such lines become routine during a
+  stall.
+
+So prefer psycopg (3) to psycopg2 with `SyncStoreAdapter`. On any driver, a server set to log
+statements (`log_statement`, `log_min_duration_statement`) logs the token with them. For asyncpg
+and psycopg, `log_parameter_max_length = 0` keeps values out of those lines; for psycopg2 nothing
+does. Keep that view and those logs to people you would trust with the `session` table. A raw
+session token can be a credential on its own: see
+[SECURITY.md](../SECURITY.md).
 
 **Everywhere else, set the timeout on the role.** That covers other databases. On Postgres:
 `ALTER ROLE <role> SET statement_timeout = '3s'`. It applies to connections opened after it, so

@@ -59,6 +59,10 @@ notes". The full release notes for each version are on the
   Redis ACL must allow for the store's revocation read. Nothing in the library changed.
 - The README's install section says that `fastapi-betterauth` on PyPI is a different library by
   another author.
+- `SECURITY.md` and [Stores](docs/stores.md#a-statement-timeout) now say where a session token
+  shows on a Postgres server: with `psycopg2` it is in `pg_stat_activity` and in the log line of
+  every lookup that fails; with `asyncpg` and `psycopg` (3) it is not. Prefer `psycopg` (3) with
+  `SyncStoreAdapter`. Nothing in the library changed.
 
 ## [0.7.0] - 2026-11-26
 
