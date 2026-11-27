@@ -217,8 +217,9 @@ class SqlAlchemySessionStore(_CoreStore):
     **The session and its user arrive together**, joined in one statement, so the happy path is
     one query and the record's `user` is already populated. `fetch_user_by_id` is there for
     callers that need a user on its own. Unset, `statement_timeout=` adds nothing: a lookup sends
-    that one statement. Set, it sends two (the bound, then the lookup) and discovery sends two
-    more (the bound and its readback); counted from the engine's own events on the live lane.
+    that one statement. Set, it sends two (the bound, then the lookup) and discovery sends three
+    more (a probe, the bound, and their readback); counted from the engine's own events on the
+    live lane.
 
     **The schema is read once, on first use** (or from `connect()`), and it decides two things.
     That every column a lookup needs is there - and if one is not, that is a
@@ -278,8 +279,8 @@ class SqlAlchemySessionStore(_CoreStore):
     that setting without touching the role or the pool the application lends: a role-level or
     engine-level timeout would bound every other statement the application runs as well. Set,
     every transaction the store opens - each lookup, and the schema read that `connect()` and the
-    first lookup run - starts with `SELECT set_config('statement_timeout', :ms, true)`, the value
-    rounded up to whole milliseconds. The setting is transaction-local, so it ends with the
+    first lookup run - sets `SELECT set_config('statement_timeout', :ms, true)` first, the value
+    rounded up to whole milliseconds (discovery sets its probe, below, just before it). The setting is transaction-local, so it ends with the
     `ROLLBACK` the store sends, and no other checkout of the pool ever sees it. For the store's
     own transactions it replaces a role-level or database-level value, even a shorter one. Keep it
     below `lookup_timeout`. A lookup the server ends is refused as above (`AuthServiceUnavailable`,
@@ -288,8 +289,12 @@ class SqlAlchemySessionStore(_CoreStore):
     `ROLLBACK`, or what SQLAlchemy sends to open a connection. On an engine in `AUTOCOMMIT` the
     setting would end with the statement that made it, so the store refuses such an engine with a
     `ConfigurationError` before any lookup reaches the database: from the engine's options before
-    every transaction, and from the setting read back at discovery. Tested on asyncpg; the role
-    needs no grant beyond the `SELECT` above. `SyncStoreAdapter` has no such option: give its
+    every transaction, and from the setting read back at discovery. The readback is proven to be
+    the store's own: discovery first sets a random probe, transaction-locally, in a custom setting
+    of the library's (`fastapi_better_auth.discovery_probe`), and reads it back with the bound. So
+    an application's own session-level value, even one equal to the store's, does not pass for
+    it. Afterwards that setting reads as an empty string on the lent connection. Tested on
+    asyncpg; the role needs no grant beyond the `SELECT` above. `SyncStoreAdapter` has no such option: give its
     role the timeout (`ALTER ROLE ... SET statement_timeout`), as for any other database.
 
     Args:
@@ -378,21 +383,26 @@ class SqlAlchemySessionStore(_CoreStore):
     async def _bounded(self, connection: AsyncConnection, *, confirm: bool = False) -> None:
         """Open the transaction with the store's bound, when it has one; else send nothing.
 
-        The first statement of every transaction the store opens, so every statement after it is
+        Sent before any read in every transaction the store opens, so every read after it is
         bounded, and transaction-local, so it ends with the `ROLLBACK` `_returned` sends. On an
         engine in `AUTOCOMMIT` it would end with itself, so that engine is refused: from its
         options before every transaction, and - for discovery, which every lookup waits on - by
         reading the setting back in the same transaction, which also sees an engine built so.
+        Discovery sets a fresh probe first and reads it back with the bound: the probe proves the
+        readback ran in the transaction that set the bound (`confirmed_bound`).
         """
         if self._timeout is None:
             return
         self._sql.refuse_autocommit(self._engine)
+        probe = self._sql.new_probe() if confirm else None
+        if probe is not None:
+            await connection.execute(self._sql.timeout_statement(), self._sql.probe_params(probe))
         await connection.execute(
             self._sql.timeout_statement(), self._sql.timeout_params(self._timeout)
         )
-        if confirm:
+        if probe is not None:
             found = await connection.execute(self._sql.readback_statement())
-            self._sql.confirmed_bound(found.all(), self._timeout)
+            self._sql.confirmed_bound(found.all(), self._timeout, probe)
 
 
 async def _returned(connection: AsyncConnection) -> None:

@@ -38,6 +38,7 @@ from fastapi_better_auth import (
     SyncStoreAdapter,
 )
 from tests.stores import (
+    PROBE_SETTING,
     SETTING,
     SETTINGS_STATEMENT,
     TOKEN,
@@ -305,6 +306,8 @@ def logged(*entries: tuple[str, tuple[Any, ...]]) -> StatementLog:
 
 LOOKUP = ('SELECT "session".id FROM "session" WHERE "session".token = $1::VARCHAR', (TOKEN,))
 SETTINGS = (SETTINGS_STATEMENT, (SETTING, "1500"))
+A_PROBE = "0123456789abcdef" * 2
+PROBE = (SETTINGS_STATEMENT, (PROBE_SETTING, A_PROBE))
 
 
 def test_the_settings_statement_is_allowed_only_at_the_value_the_store_was_given() -> None:
@@ -312,6 +315,31 @@ def test_the_settings_statement_is_allowed_only_at_the_value_the_store_was_given
     assert writes_emitted(logged(SETTINGS, LOOKUP), 1500) == []
     assert writes_emitted(logged(SETTINGS, LOOKUP)) == [SETTINGS_STATEMENT]
     assert writes_emitted(logged(SETTINGS, LOOKUP), 3000) == [SETTINGS_STATEMENT]
+
+
+def test_the_probe_is_allowed_only_with_the_option_set_and_as_random_hex() -> None:
+    """Discovery's probe is the one other setting the statement may carry."""
+    assert writes_emitted(logged(PROBE, SETTINGS, LOOKUP), 1500) == []
+    assert writes_emitted(logged(PROBE, LOOKUP)) == [SETTINGS_STATEMENT]
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        (PROBE_SETTING, "not-hex-at-all-but-thirty-two-ch"),
+        (PROBE_SETTING, A_PROBE.upper()),
+        (PROBE_SETTING, A_PROBE[:-1]),
+        (PROBE_SETTING, A_PROBE + "0"),
+        (PROBE_SETTING, ""),
+        ("fastapi_better_auth.another", A_PROBE),
+        (PROBE_SETTING, A_PROBE, "extra"),
+    ],
+    ids=["not-hex", "upper-case", "short", "long", "empty", "another-name", "three-values"],
+)
+def test_the_probe_setting_at_any_other_value_is_refused(parameters: tuple[Any, ...]) -> None:
+    statement = (SETTINGS_STATEMENT, parameters)
+
+    assert writes_emitted(logged(statement), 1500) == [SETTINGS_STATEMENT]
 
 
 @pytest.mark.parametrize(

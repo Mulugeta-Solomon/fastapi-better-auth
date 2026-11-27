@@ -21,7 +21,8 @@ here proves one half of that against the harness Postgres:
   takes a lock on the table, so the same lock holds it. It raises what it raises for any database
   error, and the store reads the schema again on the next try.
 - **Least privilege.** A role holding `SELECT` on the two tables and nothing else sets the bound
-  and reads a real session: `set_config` on `statement_timeout` needs no grant.
+  and discovery's probe, and reads a real session: `set_config` on `statement_timeout`, or on a
+  custom setting of the library's own prefix, needs no grant.
 - **No transaction, no bound.** A transaction-local setting ends with the statement that made it
   when the engine runs in `AUTOCOMMIT`, so every lookup would run unbounded. The store refuses
   such an engine with a `ConfigurationError` before any lookup reaches the database, whether the
@@ -63,7 +64,7 @@ try:
     from fastapi_better_auth import CookieVerifier, SqlAlchemySessionStore
     from tests.cookies import COOKIE, http, run, sign
     from tests.deadlines import GUARD, every_call_ended, outage_lines, verifier
-    from tests.stores import StatementLog, writes_emitted
+    from tests.stores import PROBE_SETTING, SETTING, StatementLog, writes_emitted
 except ImportError:
     pytest.skip(
         "this build of fastapi-better-auth-bridge publishes no session stores",
@@ -442,8 +443,9 @@ def signed_in_user(harness: str) -> Iterator[tuple[str, str]]:
 async def test_select_on_both_tables_is_all_the_bound_needs(
     signed_in_user: tuple[str, str],
 ) -> None:
-    """The role the store's docstring asks for, and no more: the bound is set first in each of
-    its transactions, and a real session and its user are read under it."""
+    """The role the store's docstring asks for, and no more: the bound is set in each of its
+    transactions, discovery's probe in the first, and a real session and its user are read
+    under it."""
     user_id, cookie = signed_in_user
     log = StatementLog()
 
@@ -460,8 +462,17 @@ async def test_select_on_both_tables_is_all_the_bound_needs(
     assert record.user.id == user_id
     assert user is not None
     assert user.id == user_id
-    assert len(log.settings) == 3, "one per transaction: discovery and two lookups"
+    assert settings_named(log) == [PROBE_SETTING, SETTING, SETTING, SETTING]
     assert writes_emitted(log, int(BOUND * 1000)) == []
+
+
+def settings_named(log: StatementLog) -> list[str]:
+    """The setting each settings statement in `log` names, in order."""
+    return [
+        str(parameters[0])
+        for statement, parameters in zip(log.statements, log.parameters, strict=True)
+        if statement in log.settings
+    ]
 
 
 # ---------------------------------------------------------------- an engine without a transaction
@@ -612,10 +623,10 @@ async def test_the_bound_adds_its_statements_and_nothing_else(
     engine: AsyncEngine, schema: str
 ) -> None:
     """Counted on a warmed engine, so SQLAlchemy's own first-connect statements are not in it.
-    Unset: discovery's reads, then one statement per lookup. Set: discovery also sends the
-    settings statement and its readback, each lookup sends the settings statement first, and
-    everything else is byte for byte what the unset store sent. Both stores pass the read-only
-    invariant, the set one only for its own settings statement at its own value."""
+    Unset: discovery's reads, then one statement per lookup. Set: discovery also sends the probe,
+    the bound and their readback, each lookup sends the bound first, and everything else is byte
+    for byte what the unset store sent. Both stores pass the read-only invariant, the set one only
+    for its own two settings, the bound at its own value."""
     async with engine.connect():
         pass
     unset = await drive(engine, schema)
@@ -625,9 +636,9 @@ async def test_the_bound_adds_its_statements_and_nothing_else(
 
     assert lookups_unset == [1, 1]
     assert lookups_bounded == [2, 2]
-    assert discovery_bounded == discovery_unset + 2
+    assert discovery_bounded == discovery_unset + 3
     assert unset.log.settings == []
-    assert len(bounded.log.settings) == 3
+    assert settings_named(bounded.log) == [PROBE_SETTING, SETTING, SETTING, SETTING]
     assert without_the_bound(bounded.log) == without_the_bound(unset.log)
     assert writes_emitted(unset.log) == []
     assert writes_emitted(bounded.log, int(BOUND * 1000)) == []

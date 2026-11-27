@@ -64,6 +64,8 @@ from .sql_widths import integer_range
 from .sqlalchemy_bound import (
     bounded_engine,
     confirmed_bound,
+    new_probe,
+    probe_params,
     readback_statement,
     refuse_autocommit,
     timeout_params,
@@ -78,6 +80,8 @@ __all__ = [
     "SQLAlchemyError",
     "bounded_engine",
     "confirmed_bound",
+    "new_probe",
+    "probe_params",
     "readback_statement",
     "refuse_autocommit",
     "timeout_params",

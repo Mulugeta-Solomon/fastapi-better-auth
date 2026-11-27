@@ -23,6 +23,7 @@ import asyncio
 import itertools
 import json
 import pathlib
+import re
 import sqlite3
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -241,6 +242,11 @@ starts with `SELECT`, so a filter on the verb alone would wave it through, and w
 function call that changes state; the invariant names it instead (`writes_emitted`). The final
 `true` makes the setting transaction-local, which is what keeps it out of the pool's other
 checkouts."""
+PROBE_SETTING = "fastapi_better_auth.discovery_probe"
+"""The only other setting that statement may carry: discovery's probe, under the library's own
+prefix. Named here, not imported, so a change of name in the library fails the invariant."""
+PROBE_VALUE = re.compile(r"[0-9a-f]{32}")
+"""What the probe may be set to: 128 random bits as lowercase hex, and nothing else."""
 
 
 class StatementLog:
@@ -303,19 +309,30 @@ def writes_emitted(log: StatementLog, milliseconds: int | None = None) -> list[s
     """Every statement in `log` the read-only invariant refuses; empty when the store only read.
 
     A statement is allowed when it starts with a read verb and calls no `set_config`, or when it
-    is exactly `SETTINGS_STATEMENT` carrying `statement_timeout` and `milliseconds` - the one
-    store setting, at the value the store was given. With `milliseconds=None` (the option unset)
-    no settings statement is allowed at all.
+    is exactly `SETTINGS_STATEMENT` carrying one of the two store settings: `statement_timeout`
+    at `milliseconds`, the value the store was given, or `PROBE_SETTING` at a `PROBE_VALUE`.
+    With `milliseconds=None` (the option unset) no settings statement is allowed at all.
     """
     refused: list[str] = []
     for statement, parameters in zip(log.statements, log.parameters, strict=True):
         if _sets_config(statement):
-            expected = None if milliseconds is None else (SETTING, str(milliseconds))
-            if statement != SETTINGS_STATEMENT or tuple(parameters) != expected:
+            if statement != SETTINGS_STATEMENT or not _a_store_setting(parameters, milliseconds):
                 refused.append(statement)
         elif _verb(statement) not in READ_VERBS:
             refused.append(statement)
     return refused
+
+
+def _a_store_setting(parameters: Any, milliseconds: int | None) -> bool:
+    if milliseconds is None:
+        return False
+    match tuple(parameters):
+        case (str(name), str(value)) if name == SETTING:
+            return value == str(milliseconds)
+        case (str(name), str(value)) if name == PROBE_SETTING:
+            return PROBE_VALUE.fullmatch(value) is not None
+        case _:
+            return False
 
 
 def _verb(statement: str) -> str:

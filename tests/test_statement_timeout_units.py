@@ -11,13 +11,18 @@ asyncpg: the setting's name and its value travel as bound parameters, and the th
 the literal `true` that makes the setting last only until the end of the transaction. That `true`
 is what keeps the bound out of the pool's other checkouts, and no live test can tell it from
 `false` while every transaction the store opens rolls back, so it is pinned here, in the text.
+
+**The readback's verdicts.** Discovery sets a random probe, then the bound, then reads both back.
+Only this discovery's own probe, with the store's value set in this session, is a bound that held.
 """
 
 from __future__ import annotations
 
 import enum
+from typing import Any, cast
 
 import pytest
+from sqlalchemy import Select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -26,11 +31,17 @@ from fastapi_better_auth import ConfigurationError
 from fastapi_better_auth._internal.stores import statement_timeout
 from fastapi_better_auth._internal.stores.sqlalchemy_core import (
     confirmed_bound,
+    new_probe,
+    probe_params,
+    readback_statement,
     refuse_autocommit,
     timeout_params,
     timeout_statement,
 )
-from tests.stores import SETTINGS_STATEMENT
+from tests.stores import PROBE_SETTING, PROBE_VALUE, SETTINGS_STATEMENT
+
+PROBE = "0123456789abcdef" * 2
+"""This discovery's probe, in the readback cases."""
 
 
 @pytest.mark.parametrize(
@@ -93,6 +104,35 @@ def test_the_statement_names_the_setting_and_binds_its_value() -> None:
     assert [values[name] for name in compiled.positiontup or ()] == ["statement_timeout", "1500"]
 
 
+def test_the_probe_is_the_same_statement_naming_the_probe_setting() -> None:
+    """One statement's text for both settings, so the read-only invariant names one statement."""
+    compiled = timeout_statement().compile(dialect=PGDialect_asyncpg())
+    values = {**compiled.params, **probe_params(PROBE)}
+
+    assert str(compiled) == SETTINGS_STATEMENT
+    assert [values[name] for name in compiled.positiontup or ()] == [PROBE_SETTING, PROBE]
+
+
+def test_each_probe_is_fresh_random_hex() -> None:
+    probes = {new_probe() for _ in range(64)}
+
+    assert len(probes) == 64
+    assert all(PROBE_VALUE.fullmatch(probe) for probe in probes)
+
+
+def test_the_readback_reads_the_probe_without_failing_on_a_name_never_set() -> None:
+    """`current_setting(name, true)` answers NULL for a name never set, where the one-argument
+    form raises: an engine in AUTOCOMMIT must be refused as configuration, not as an error."""
+    statement = readback_statement()
+    assert isinstance(statement, Select)
+    compiled = cast("Select[Any]", statement).compile(dialect=PGDialect_asyncpg())
+    values = [compiled.params[name] for name in compiled.positiontup or ()]
+
+    assert "current_setting($1::VARCHAR, true)" in str(compiled)
+    assert "FROM pg_catalog.pg_settings" in str(compiled)
+    assert values == [PROBE_SETTING, "statement_timeout"]
+
+
 def test_the_local_flag_is_in_the_text_for_every_postgres_driver() -> None:
     """psycopg renders its parameters differently; the flag is the same literal."""
     compiled = str(timeout_statement().compile(dialect=postgresql.dialect()))
@@ -104,27 +144,47 @@ def test_the_local_flag_is_in_the_text_for_every_postgres_driver() -> None:
 @pytest.mark.parametrize(
     "rows",
     [
-        [("0", "default")],
-        [("1500", "user")],
-        [("1500", "database")],
-        [("1500", "client")],
-        [("3000", "session")],
+        [("0", "default", PROBE)],
+        [("1500", "user", PROBE)],
+        [("1500", "database", PROBE)],
+        [("1500", "client", PROBE)],
+        [("3000", "session", PROBE)],
+        [("1500", "session", None)],
+        [("1500", "session", "")],
+        [("1500", "session", "fedcba9876543210" * 2)],
+        [("1500", "session", PROBE.upper())],
+        [("1500", "session")],
+        [("1500", "session", PROBE), ("1500", "session", PROBE)],
         [],
     ],
-    ids=["server-default", "role-equal", "database-equal", "connect-equal", "other-value", "none"],
+    ids=[
+        "server-default",
+        "role-equal",
+        "database-equal",
+        "connect-equal",
+        "other-value",
+        "probe-never-set",
+        "probe-ended",
+        "probe-of-another-discovery",
+        "probe-in-another-case",
+        "no-probe-column",
+        "two-rows",
+        "none",
+    ],
 )
-def test_only_the_stores_own_value_set_in_this_session_is_a_bound_that_held(
-    rows: list[tuple[str, str]],
+def test_only_this_discoverys_probe_and_the_stores_own_value_are_a_bound_that_held(
+    rows: list[tuple[str | None, ...]],
 ) -> None:
-    """Read back on an engine in AUTOCOMMIT, the setting has ended, and what is read is someone
-    else's - even an equal value, from the role or the database, which would bound the store only
-    until it changed. Only the store's value from `session` is its own."""
+    """Read back on an engine in AUTOCOMMIT, both settings have ended. The probe is then NULL on
+    a connection that never held it, and an empty string on one that did; the bound read is
+    someone else's, even an equal value set in this session by the application. A probe that is
+    merely there, or that an earlier discovery set, is not this transaction's."""
     with pytest.raises(ConfigurationError, match="AUTOCOMMIT"):
-        confirmed_bound(rows, 1500)
+        confirmed_bound(rows, 1500, PROBE)
 
 
-def test_the_stores_own_value_set_in_this_session_is_a_bound_that_held() -> None:
-    confirmed_bound([("1500", "session")], 1500)
+def test_this_discoverys_probe_with_the_stores_own_value_is_a_bound_that_held() -> None:
+    confirmed_bound([("1500", "session", PROBE)], 1500, PROBE)
 
 
 @pytest.mark.parametrize("spelling", ["AUTOCOMMIT", "autocommit", "AutoCommit"])

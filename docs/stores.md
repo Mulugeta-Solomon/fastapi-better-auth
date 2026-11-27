@@ -226,7 +226,8 @@ application:
 - It bounds the statements that follow it in a transaction. It does not bound itself, the
   `ROLLBACK`, or the statements SQLAlchemy sends when it opens a connection.
 - With the option set, a lookup sends two statements instead of one: the setting, then the lookup.
-  The schema read sends two more: the setting, and a read of `pg_settings` that checks it held.
+  The schema read sends three more: a probe, the setting, and a read of both that checks the
+  setting held (see below).
 - The role needs no grant for it beyond `SELECT` on the two tables.
 
 When the server ends a lookup, the store raises `AuthServiceUnavailable`, the uniform `401`. It
@@ -241,6 +242,18 @@ for an engine built with `isolation_level="AUTOCOMMIT"`, for a copy made with
 `engine.execution_options(isolation_level="AUTOCOMMIT")`, and for an engine switched that way after
 `connect()`. One case is not seen: code of your own that puts single pooled connections into
 autocommit after the schema was read, in a pool event listener for example.
+
+**The check reads back a value only its own transaction can hold.** Your application may give its
+connections a `statement_timeout` of its own, for example with `SET` in a `connect` listener. If
+that value equals the store's, the setting alone cannot tell the store's value from yours. So the
+schema read first sets a random probe in a setting of the library's own,
+`fastapi_better_auth.discovery_probe`, for that transaction alone. It then sets the timeout, and
+reads both back. The check passes only when the probe is the one it just set and the timeout is
+the store's. On an engine in `AUTOCOMMIT` the probe is gone by then, so the store refuses it even
+when your value is equal. On an engine that keeps a transaction, an equal value of yours is fine,
+and the store's own setting still bounds its statements if you change yours later. After the
+schema read, that setting reads as an empty string on the connection, not as unset. It needs no
+grant.
 
 `tests/e2e/test_store_statement_timeout_live.py` proves all of this against a live Postgres on
 `asyncpg`, for a role holding only `SELECT` on the two tables. Other drivers are not tested.

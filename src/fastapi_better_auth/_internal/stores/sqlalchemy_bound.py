@@ -13,11 +13,17 @@ configured: from its options before every transaction (`refuse_autocommit`), and
 by reading the setting back in the same transaction (`confirmed_bound`), which also sees an engine
 built that way.
 
+A value read back is not proof on its own: the application may give its connections a
+session-level value equal to the store's. So discovery also sets a probe: a random value under a
+name of the library's own (`PROBE_SETTING`), set transaction-locally before the bound, and read
+back with it. Only this transaction can hold this value.
+
 Imported by `sqlalchemy_core` alone (it names SQLAlchemy, and `sqlalchemy` is an extra).
 """
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -31,8 +37,13 @@ if TYPE_CHECKING:
 
 POSTGRES = "postgresql"
 SETTING = "statement_timeout"
+PROBE_SETTING = "fastapi_better_auth.discovery_probe"
+"""The setting discovery's probe is put in: a custom one, under the library's own prefix."""
+PROBE_BYTES = 16
+"""The probe's random bytes: 128 bits, so no other value on the connection can equal it."""
 SETTING_PARAM = "setting"
-TIMEOUT_PARAM = "statement_timeout_ms"
+VALUE_PARAM = "value"
+PROBE_PARAM = "probe"
 ISOLATION_LEVEL = "isolation_level"
 AUTOCOMMIT = "AUTOCOMMIT"
 SESSION_SOURCE = "session"
@@ -61,15 +72,27 @@ def bounded_engine(engine: AsyncEngine, milliseconds: int | None) -> int | None:
 
 
 def timeout_statement() -> Select[Any]:
-    """`SELECT set_config('statement_timeout', :ms, true)`, the first statement of a transaction."""
+    """`SELECT set_config(:setting, :value, true)`: the bound, and at discovery the probe too.
+
+    The setting's name is a parameter, so the bound and the probe are one statement's text."""
     name = bindparam(SETTING_PARAM, SETTING, type_=String)
-    value = bindparam(TIMEOUT_PARAM, type_=String)
+    value = bindparam(VALUE_PARAM, type_=String)
     return select(func.set_config(name, value, true()))
 
 
 def timeout_params(milliseconds: int) -> dict[str, str]:
-    """The value `timeout_statement` binds: whole milliseconds, as the text `set_config` takes."""
-    return {TIMEOUT_PARAM: str(milliseconds)}
+    """What `timeout_statement` binds for the bound: whole milliseconds, as text."""
+    return {SETTING_PARAM: SETTING, VALUE_PARAM: str(milliseconds)}
+
+
+def new_probe() -> str:
+    """A fresh probe for one discovery: random hex, never reused."""
+    return secrets.token_hex(PROBE_BYTES)
+
+
+def probe_params(probe: str) -> dict[str, str]:
+    """What `timeout_statement` binds for the probe: `PROBE_SETTING`, set to `probe`."""
+    return {SETTING_PARAM: PROBE_SETTING, VALUE_PARAM: probe}
 
 
 def refuse_autocommit(engine: AsyncEngine) -> None:
@@ -88,22 +111,30 @@ def refuse_autocommit(engine: AsyncEngine) -> None:
 
 
 def readback_statement() -> Executable:
-    """`statement_timeout` as the transaction now sees it: whole milliseconds, and where from."""
+    """`statement_timeout` as the transaction now sees it (milliseconds, and where from), and
+    the probe. `current_setting(..., true)` answers NULL, not an error, for a name never set."""
     settings = table(
         "pg_settings", column("name"), column("setting"), column("source"), schema="pg_catalog"
     )
     name = bindparam(SETTING_PARAM, SETTING, type_=String)
-    return select(settings.c.setting, settings.c.source).where(settings.c.name == name)
+    probe = func.current_setting(bindparam(PROBE_PARAM, PROBE_SETTING, type_=String), true())
+    return select(settings.c.setting, settings.c.source, probe).where(settings.c.name == name)
 
 
-def confirmed_bound(rows: Sequence[Sequence[Any]], milliseconds: int) -> None:
-    """Refuse unless the statement after `timeout_statement` still runs under the store's bound.
+def confirmed_bound(rows: Sequence[Sequence[Any]], milliseconds: int, probe: str) -> None:
+    """Refuse unless the readback ran in the transaction that set the probe and the bound.
 
-    A transaction-local setting holds to the end of its transaction, so read back by the next
-    statement it is the store's value, set in this session. On an engine that runs without a
-    transaction it has already ended, and what is read is the role's, the database's or the
-    server's own value - even one that happens to be equal, which would then bound the store only
-    for as long as nobody changed it.
+    Discovery sets the probe, then the bound, then reads both back, all transaction-locally. The
+    rule: the probe read back must equal this discovery's own probe, and the bound must be the
+    store's value, set in this session. A probe that merely is there proves nothing. Once a
+    transaction that set it has ended, Postgres answers an empty string on that connection, not
+    NULL, and a probe of an earlier discovery is not this one's.
+
+    Equal to this transaction's probe, the readback ran in the transaction that set it, and so
+    did the bound, sent between the two. On an engine that runs without a transaction both have
+    already ended, and the value read is someone else's: the role's, the database's, or the
+    application's own session-level value. Even an equal one would bound the store only until
+    somebody changed it.
     """
-    if [tuple(row) for row in rows] != [(str(milliseconds), SESSION_SOURCE)]:
+    if [tuple(row) for row in rows] != [(str(milliseconds), SESSION_SOURCE, probe)]:
         raise ConfigurationError(NO_TRANSACTION)

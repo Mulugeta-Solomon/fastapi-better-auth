@@ -20,7 +20,8 @@ notes". The full release notes for each version are on the
   transactions it replaces a role-level or database-level value, even a shorter one. Keep it below
   `lookup_timeout`. A lookup the server ends is refused as `AuthServiceUnavailable`. An engine in
   `AUTOCOMMIT` is refused with `ConfigurationError`, because there the setting would end before
-  the lookup runs. Tested on `asyncpg`. `SyncStoreAdapter` has no such option; set the timeout on
+  the lookup runs, even where the application gives its connections an equal timeout of its own.
+  Tested on `asyncpg`. `SyncStoreAdapter` has no such option; set the timeout on
   its role. See [A statement timeout](docs/stores.md#a-statement-timeout).
 
 ### Fixed
