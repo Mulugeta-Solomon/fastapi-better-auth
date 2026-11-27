@@ -74,10 +74,9 @@ granted. Granting no more is what turns the read-only property into a database g
 itself refuses every `INSERT`, `UPDATE` and `DELETE` the role attempts. Grant less — `SELECT` on
 `session` alone — and `connect()` still succeeds (discovery reads the system catalog, which needs no
 grant), then every lookup is refused as `AuthServiceUnavailable` (the uniform `401`, or the `503`
-under [the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down)),
-and the store logs
-one `WARNING` naming the driver error and its SQLSTATE (`42501`, insufficient privilege) — once per
-kind of failure until a lookup completes again, never the token.
+under [the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down)), and the store
+logs one `WARNING` naming the driver error and its SQLSTATE (`42501`, insufficient privilege) —
+once per kind of failure until a lookup completes again, never the token.
 `tests/e2e/test_store_grants_live.py` proves the grant, the refused writes and that answer against a
 live Postgres.
 
@@ -242,10 +241,10 @@ application:
 When the server ends a lookup, the store raises `AuthServiceUnavailable`, whatever the setting,
 and route code that calls the store gets it as raised. The bridge answers it with the uniform
 `401`, or the `503` under
-[the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down). It
-logs one `WARNING` naming SQLSTATE `57014`, and no more until a lookup completes. When the server
-ends the schema read in `connect()`, `connect()` raises SQLAlchemy's `DBAPIError`, as it does for
-any database error. Nothing is kept, so the next `connect()` or lookup reads the schema again.
+[the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down). The store logs one
+`WARNING` naming SQLSTATE `57014`, and no more until a lookup completes. When the server ends the
+schema read in `connect()`, `connect()` raises SQLAlchemy's `DBAPIError`, as it does for any
+database error. Nothing is kept, so the next `connect()` or lookup reads the schema again.
 
 **An engine in `AUTOCOMMIT` is refused.** There each statement is a transaction of its own, so the
 setting would end before the lookup runs. With `statement_timeout=` set, `connect()` and every
