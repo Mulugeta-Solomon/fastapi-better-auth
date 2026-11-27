@@ -25,7 +25,7 @@ Each mode has its own page: [Mode A](mode-a-cookie.md), [Mode B](mode-b-jwt.md) 
 | **Bans** | refused here — upstream's `get-session` never reads `banned` either | invisible until the token expires | refused here, from the record upstream returns |
 | **Algorithm confusion** | not applicable | refused: a pinned algorithm allowlist, and an unknown `kid` is a refusal rather than a search | not applicable |
 | **Secret rotation** | a keyring, compared in constant time with no early return | upstream's own `kid` rollover | the same keyring, when you configure one |
-| **Auth server down** | keeps verifying — it never calls it | keeps verifying from the cached key set for at most `max_stale` (one day by default) after its last successful fetch, then refuses (`401`) | refuses (`401`); guessing here would be the bypass |
+| **Auth server down** | keeps verifying — it never calls it | keeps verifying from the cached key set for at most `max_stale` (one day by default) after its last successful fetch, then refuses (`401`, or `503` under [the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down)) | refuses (`401`, or `503` under the same opt-in); guessing here would be the bypass |
 
 **Two caveats behind the "Bans" row.** A ban is enforced *by this library*, from the user record it
 already has, because upstream's `get-session` route never reads `banned` — the admin plugin enforces
