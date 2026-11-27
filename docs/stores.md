@@ -297,7 +297,8 @@ the connection come back. Other drivers are not tested.
 sends it to Postgres. What the server shows of it depends on the driver:
 
 - asyncpg and psycopg (3) send values apart from the statement's text. `pg_stat_activity` and the
-  log line of a failed statement show `$1` in the token's place.
+  log line of a failed statement show `$1` in the token's place. A failed statement's log entry
+  adds the values only where `log_parameter_max_length_on_error` is not `0`, its default.
 - psycopg2 writes each value into the text before it sends it. `pg_stat_activity` shows the token
   of a running lookup, and the server's log shows it for every lookup that fails, since Postgres
   logs a failed statement's text by default (`log_min_error_statement`). A lookup the bound ends
@@ -306,7 +307,9 @@ sends it to Postgres. What the server shows of it depends on the driver:
 
 So prefer psycopg (3) to psycopg2 with `SyncStoreAdapter`. On any driver, a server set to log
 statements (`log_statement`, `log_min_duration_statement`) logs the token with them. For asyncpg
-and psycopg, `log_parameter_max_length = 0` keeps values out of those lines; for psycopg2 nothing
+and psycopg, two settings keep values out, one for each kind of line:
+`log_parameter_max_length = 0` for a logged statement, and
+`log_parameter_max_length_on_error = 0` (the default) for a failed one. For psycopg2 neither
 does. Keep that view and those logs to people you would trust with the `session` table. A raw
 session token can be a credential on its own: see
 [SECURITY.md](../SECURITY.md).

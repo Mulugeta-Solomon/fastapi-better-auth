@@ -155,8 +155,10 @@ a `crit` header at all, because Better Auth never emits one and no extension is 
   statement's text, so `pg_stat_activity` and the log line of a failed statement show `$1` in its
   place. psycopg2 writes it into the text: there the token shows in `pg_stat_activity` while a
   lookup runs, and in the server's log for every lookup that fails. On any driver, a server set
-  to log statements logs the token with them, unless `log_parameter_max_length` is `0`, and with
-  psycopg2 even then. Prefer psycopg (3) to psycopg2 with `SyncStoreAdapter`, and guard those logs
+  to log statements logs the token with them, unless `log_parameter_max_length` is `0`. A failed
+  statement's log entry carries it too where `log_parameter_max_length_on_error` is not `0`, its
+  default. With psycopg2 neither setting keeps it out. Prefer psycopg (3) to psycopg2 with
+  `SyncStoreAdapter`, and guard those logs
   as you guard the `session` table. Other databases and drivers are not tested. See
   [Stores](docs/stores.md#a-statement-timeout).
 - **Traceback hygiene.** Every frame of this library that holds a raw credential drops it before a

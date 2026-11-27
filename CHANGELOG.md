@@ -61,10 +61,10 @@ notes". The full release notes for each version are on the
   another author.
 - `SECURITY.md` and [Stores](docs/stores.md#a-statement-timeout) now say where a session token
   shows on a Postgres server. With `psycopg2` it is in `pg_stat_activity` and in the log line of
-  every lookup that fails; with `asyncpg` and `psycopg` (3) those show `$1` in its place. A
-  server set to log statements logs the token on any driver, unless `log_parameter_max_length`
-  is `0`, and with `psycopg2` even then. Prefer `psycopg` (3) with `SyncStoreAdapter`. Nothing in
-  the library changed.
+  every lookup that fails; with `asyncpg` and `psycopg` (3) those show `$1` in its place on a
+  server with default logging. Two server settings add it on any driver: statement logging,
+  unless `log_parameter_max_length` is `0`, and `log_parameter_max_length_on_error` when it is
+  not `0`. Prefer `psycopg` (3) with `SyncStoreAdapter`. Nothing in the library changed.
 
 ## [0.7.0] - 2026-11-26
 
