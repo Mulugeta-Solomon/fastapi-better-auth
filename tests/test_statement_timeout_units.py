@@ -26,7 +26,6 @@ import pytest
 from sqlalchemy import Select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from fastapi_better_auth import ConfigurationError
 from fastapi_better_auth._internal.stores import statement_timeout
@@ -39,10 +38,11 @@ from fastapi_better_auth._internal.stores.sqlalchemy_core import (
     timeout_params,
     timeout_statement,
 )
-from tests.stores import PROBE_SETTING, PROBE_VALUE, SETTINGS_STATEMENT
+from tests.stores import PROBE_SETTING, PROBE_VALUE, SETTINGS_STATEMENT, postgres_engine
 
 PROBE = "0123456789abcdef" * 2
 """This discovery's probe, in the readback cases."""
+NEVER_CONNECTED = "postgresql+asyncpg://bridge@db-host.invalid/app"
 
 
 @pytest.mark.parametrize(
@@ -213,7 +213,7 @@ def test_this_discoverys_probe_with_the_stores_own_value_is_a_bound_that_held() 
 def test_an_engine_whose_options_say_autocommit_is_refused(spelling: str) -> None:
     """No connection is opened: the engine's options are read. SQLAlchemy takes the level in any
     case and keeps it as it was written, so the check cannot depend on the spelling."""
-    engine = create_async_engine("postgresql+asyncpg://bridge@db-host.invalid/app")
+    engine = postgres_engine(NEVER_CONNECTED)
 
     refuse_autocommit(engine)
     with pytest.raises(ConfigurationError, match="AUTOCOMMIT"):
@@ -223,6 +223,6 @@ def test_an_engine_whose_options_say_autocommit_is_refused(spelling: str) -> Non
 @pytest.mark.parametrize("level", ["READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"])
 def test_an_isolation_level_that_keeps_a_transaction_is_not_refused(level: str) -> None:
     """Only `AUTOCOMMIT` runs without a transaction; the bound holds under every other level."""
-    engine = create_async_engine("postgresql+asyncpg://bridge@db-host.invalid/app")
+    engine = postgres_engine(NEVER_CONNECTED)
 
     refuse_autocommit(engine.execution_options(isolation_level=level))

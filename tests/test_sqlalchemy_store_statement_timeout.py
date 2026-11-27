@@ -26,10 +26,18 @@ import pathlib
 from typing import Any
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from fastapi_better_auth import ConfigurationError, SqlAlchemySessionStore, SyncStoreAdapter
-from tests.stores import TOKEN, USER_ID, StatementLog, async_engine, build_schema, sync_engine
+from tests.stores import (
+    TOKEN,
+    USER_ID,
+    StatementLog,
+    async_engine,
+    build_schema,
+    postgres_engine,
+    sync_engine,
+)
 
 USERNAME = "bridge-user"
 PASSWORD = "pw-Hunter2-sekrit"
@@ -73,7 +81,7 @@ def anyio_backend() -> str:
 
 @pytest.fixture
 def postgres() -> AsyncEngine:
-    return create_async_engine(POSTGRES_URL)
+    return postgres_engine(POSTGRES_URL)
 
 
 def assert_quiet_about_the_url(refusal: ConfigurationError) -> None:

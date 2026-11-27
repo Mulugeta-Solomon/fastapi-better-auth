@@ -226,6 +226,21 @@ def async_engine(path: pathlib.Path) -> AsyncEngine:
     return create_async_engine(f"sqlite+aiosqlite:///{path}", poolclass=AsyncAdaptedQueuePool)
 
 
+ASYNCPG_ABSENT = (
+    "asyncpg is not installed here (the py3.15 lane: it ships no wheel there), and a Postgres"
+    " AsyncEngine imports its driver when it is built, even one never connected"
+)
+
+
+def postgres_engine(url: str) -> AsyncEngine:
+    """A Postgres `AsyncEngine` through asyncpg, never connected; skips the case without asyncpg.
+
+    Only a case that needs the engine itself calls this. One that compiles against the dialect
+    class (`PGDialect_asyncpg()`) needs no driver and keeps running."""
+    pytest.importorskip("asyncpg", reason=ASYNCPG_ABSENT)
+    return create_async_engine(url)
+
+
 def sync_engine(path: pathlib.Path) -> Engine:
     return create_engine(f"sqlite+pysqlite:///{path}")
 
