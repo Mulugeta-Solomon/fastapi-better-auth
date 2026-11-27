@@ -621,6 +621,38 @@ async def test_a_return_cut_short_by_the_backstop_still_gives_the_connection_bac
     assert unexpected(loop_reports) == []
 
 
+SETTINGS_PARAMETER = b"statement_timeout"
+"""The settings statement's first parameter, as the driver sends it: the setting's name. The SQL
+text carries only `$1`, and on a warmed connection asyncpg sends no text at all, only the
+prepared statement's parameters, so this is what marks that statement on the wire."""
+BEGIN = b"BEGIN"
+
+
+class Phase(NamedTuple):
+    """Where a transaction stood when the relay stalled: what the server and the relay say."""
+
+    in_transaction: list[str]
+    """The first word of the last query of each store backend idle in a transaction."""
+    active: int
+    """The store backends running a statement."""
+    settings_held: bool
+    begin_held: bool
+
+
+async def stall_phase(observer: AsyncEngine, name: str, relay: StallingRelay) -> Phase:
+    rows = await server_backends(observer, name)
+    return Phase(
+        in_transaction=[str(row[2]).split()[0] for row in rows if row[1] == IDLE_IN_TRANSACTION],
+        active=sum(1 for row in rows if row[1] == "active"),
+        settings_held=relay.holds(SETTINGS_PARAMETER),
+        begin_held=relay.holds(BEGIN),
+    )
+
+
+ANSWERED_BEGIN_HELD_SETTINGS = Phase(["BEGIN"], 0, settings_held=True, begin_held=False)
+"""`BEGIN` answered, the server idle in that transaction, and the settings statement held."""
+
+
 @pytest.mark.anyio
 @pytest.mark.skipif(
     not BOUNDED, reason="this build predates SqlAlchemySessionStore(statement_timeout=...)"
@@ -656,6 +688,8 @@ async def test_a_call_abandoned_while_its_settings_statement_is_unanswered_ends_
     try:
         with anyio.fail_after(GUARD):
             await setting.wait()
+        phase = await stall_phase(observer, application_name, relay)
+        assert phase == ANSWERED_BEGIN_HELD_SETTINGS, f"the stall landed elsewhere: {phase}"
         clock.leap(LONG)
         with anyio.fail_after(GUARD):
             refused = await lookup
