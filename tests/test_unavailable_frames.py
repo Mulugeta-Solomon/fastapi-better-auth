@@ -11,7 +11,14 @@ from typing import Any
 
 import pytest
 
-from fastapi_better_auth import AuthServiceUnavailable, BetterAuth, CookieVerifier, CsrfDisabled
+from fastapi_better_auth import (
+    AuthServiceUnavailable,
+    BetterAuth,
+    CookieVerifier,
+    CsrfDisabled,
+    Session,
+    User,
+)
 from fastapi_better_auth._internal.unavailable import AuthServiceUnavailable503
 from tests.fakes import resolver_of
 from tests.refusal_frames import (
@@ -25,6 +32,7 @@ from tests.refusal_frames import (
     holding,
     jwt_verifier,
     request,
+    stored_session,
 )
 from tests.unavailable_support import RaisingVerifier
 
@@ -88,3 +96,37 @@ async def test_a_replaced_refusal_holds_no_credential(
     assert holding(error, credential, ignore=[connection]) == []
     assert error.__context__ is None
     assert error.__cause__ is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("needle", [TOKEN, COOKIE_VALUE], ids=["token", "cookie-value"])
+async def test_a_rule_s_converted_refusal_holds_no_cookie_material(needle: str) -> None:
+    """Nothing beyond what every rule refusal already carries on `main`.
+
+    The rule frames hold the verified session as a parameter, and its stored payload carries the
+    token: true of `NotAuthorized` today, and not this change's to scrub. So the session is
+    excluded, with this test's own locals; anything else holding the material, such as the
+    replaced refusal riding along on `__context__`, would still be found.
+    """
+    verifier = CookieVerifier(
+        secret=SECRET,
+        store=Store(session=stored_session()),
+        csrf=CsrfDisabled(reason="this row is not about cross-site request forgery"),
+        secure_cookies=False,
+    )
+    connection = request(cookies=[f"{COOKIE_NAME}={COOKIE_VALUE}"])
+    credential = verifier.extract(connection)
+    assert credential is not None
+    session = await verifier.verify(credential, User)
+    auth = BetterAuth(verifiers=[verifier], **OPT_IN)
+
+    def predicate(_session: Session[User]) -> bool:
+        raise AuthServiceUnavailable(reason="the rule's own lookup could not complete")
+
+    gate = auth.require(predicate, reason="calls the store")
+    with pytest.raises(AuthServiceUnavailable503) as caught:
+        await gate(session=session)
+
+    ignored = [connection, credential, session, needle]
+    assert holding(caught.value, needle, ignore=ignored) == []
+    assert caught.value.__context__ is None
