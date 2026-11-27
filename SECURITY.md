@@ -139,7 +139,9 @@ a `crit` header at all, because Better Auth never emits one and no extension is 
   plugin's hook overwrites the outgoing session cookie with whatever `Authorization` it sees, so a
   bridge that forwarded it would let a client turn any victim's cookie into a `200 null` (a targeted
   denial of service) or authenticate a raw token this side never extracted, never CSRF-checked and
-  never pre-filtered. An auth server that cannot be reached is a `401`, never a pass. The cookie
+  never pre-filtered. An auth server that cannot be reached is a refusal, never a pass: the uniform
+  `401` by default, or a `503` under
+  [the `503` opt-in](docs/errors.md#answering-503-while-the-auth-service-is-down). The cookie
   value itself is forwarded only if every byte is an RFC 6265 cookie-octet, so a client cannot put
   CR, LF, a comma or any other byte of its choosing into the outbound header; anything else is
   refused like a malformed cookie, with no upstream call.

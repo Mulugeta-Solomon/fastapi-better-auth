@@ -664,7 +664,7 @@ def lookup_unavailable(params: Mapping[str, Any]) -> AuthServiceUnavailable:
     and nothing else; the caller raises it `from None` so the original never rides along on
     `__cause__`/`__context__`. `AuthServiceUnavailable` because a lookup that could not complete is
     a refusal, the same family as a JWKS fetch that could not complete - which is what lets the
-    verifier answer the uniform 401.
+    bridge answer it like one: the uniform 401, or a 503 for a bridge that opted in.
     """
     return AuthServiceUnavailable(
         reason=f"session store lookup could not complete [{lookup_marker(params)}]"

@@ -60,8 +60,10 @@ stops startup but is not remembered: start again once the server answers. See
 ## Mode B: every token is `401` after an auth-server outage
 
 The cached key set is older than `max_stale` (one day by default) and could not be refreshed. The
-reason names `max_stale`. Tokens verify again as soon as one refresh succeeds. If your outages last
-longer, pass a longer `max_stale`. See
+reason names `max_stale`. Under
+[the `503` opt-in](errors.md#answering-503-while-the-auth-service-is-down) the same tokens get
+`503` instead. Tokens verify again as soon as one refresh succeeds. If your outages last longer,
+pass a longer `max_stale`. See
 [Mode B](mode-b-jwt.md#when-the-key-set-cannot-be-fetched).
 
 ## Mode B: `ConfigurationError` about `max_stale` at startup

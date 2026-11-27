@@ -135,7 +135,8 @@ class CookieVerifier:
     6. **parse_user** into the requested model, and the `Session` it proves, carrying the raw token.
 
     Every refusal is a `SessionError`, so the response is the uniform 401 (403 for CSRF) whatever
-    went wrong, and every `reason` carries a fingerprint of the token and never the token itself.
+    went wrong, except a store that cannot answer under `BetterAuth(unavailable_status=503)`,
+    and every `reason` carries a fingerprint of the token and never the token itself.
 
     Args:
         secret: The single `SharedSecret` this deployment signs with. Exactly one of this and

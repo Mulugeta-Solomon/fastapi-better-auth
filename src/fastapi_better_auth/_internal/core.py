@@ -598,8 +598,10 @@ async def _verified(
     # (D-094, D-180). Scrubbed in `finally`, so no path can skip it.
     #
     # It is also the one place `AuthServiceUnavailable` takes this bridge's form. A refusal the
-    # policy leaves alone is re-raised as itself, the same object `main` raised. One it replaces
-    # is a new object, raised outside the handler and `from None`, so it links to nothing.
+    # policy leaves alone is re-raised as itself, the same object `main` raised, and carries
+    # whatever frames it was raised through: a custom verifier's frames are that verifier's to
+    # scrub. One the policy replaces is a new object, raised outside the handler and `from None`,
+    # and no local of this frame keeps the refusal it replaced, so the new one cannot reach it.
     try:
         try:
             answer = verifier.verify(credential, user_model)
@@ -616,8 +618,9 @@ async def _verified(
             if failure is None:
                 raise
         except Exception as exc:  # noqa: BLE001 - see _contained: a 500 here is the leak
-            resolved = _resolved(exc, verifier, "verify", (BetterAuthError, SessionError))
-            failure = unavailable.replacing(resolved) or resolved
+            # One name only: a second one would keep the replaced leaf, and its traceback, alive.
+            failure = _resolved(exc, verifier, "verify", (BetterAuthError, SessionError))
+            failure = unavailable.replacing(failure) or failure
         raise failure from None  # outside the handler, as in `_extracted`
     finally:
         credential = None

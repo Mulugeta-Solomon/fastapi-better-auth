@@ -202,9 +202,9 @@ class SqlAlchemySessionStore(CoreStore):
     which `PUBLIC` holds on `public` by default, so only a non-default `schema=` needs it granted.
     Granting no more is what turns the read-only property into a database guarantee. A role
     granted less (`SELECT` on `session` alone) still passes `connect()`, since discovery reads the
-    system catalog, and then answers every lookup with `AuthServiceUnavailable` - the uniform 401 -
-    logging one WARNING per kind of failure (driver error class and SQLSTATE, never its text)
-    until a lookup completes again.
+    system catalog, and then answers every lookup with `AuthServiceUnavailable` - the uniform 401,
+    or a 503 under `BetterAuth(unavailable_status=503)` - logging one WARNING per kind of failure
+    (driver error class and SQLSTATE, never its text) until a lookup completes again.
 
     **The session and its user arrive together**, joined in one statement, so the happy path is
     one query and the record's `user` is already populated. `fetch_user_by_id` is there for

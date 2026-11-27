@@ -93,7 +93,8 @@ class JwtVerifier:
       claim is good. Upstream issues fifteen minutes; a token claiming a year means the Node
       side was misconfigured or replaced, and this is the only place that would notice.
 
-    Every refusal is a `SessionError`, so the response is the uniform 401 whatever went wrong.
+    Every refusal is a `SessionError`, so the response is the uniform 401 whatever went wrong,
+    except a key set that cannot be had under `BetterAuth(unavailable_status=503)`.
     The `reason` carries a fingerprint of the credential and never the credential, because
     error reporters serialize exception attributes and capture frame locals (D-018).
 

@@ -7,9 +7,13 @@ same instrument as every other refusal, through the resolver FastAPI itself awai
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable
+from types import FrameType
 from typing import Any
 
 import pytest
+from exceptiongroup import ExceptionGroup
 
 from fastapi_better_auth import (
     AuthServiceUnavailable,
@@ -30,6 +34,7 @@ from tests.refusal_frames import (
     Store,
     claims,
     holding,
+    holding_reachable,
     jwt_verifier,
     request,
     stored_session,
@@ -130,3 +135,94 @@ async def test_a_rule_s_converted_refusal_holds_no_cookie_material(needle: str) 
     ignored = [connection, credential, session, needle]
     assert holding(caught.value, needle, ignore=ignored) == []
     assert caught.value.__context__ is None
+
+
+GROUPED_CREDENTIAL = "regrouped-credential-0123456789"
+
+
+class Regrouping:
+    """A third party's verifier: it catches its own refusal and raises it again inside a
+    single-leaf group, so the leaf's traceback holds this `verify` frame, credential and all.
+    It does not scrub: a third party's verifier is not the bridge's to scrub."""
+
+    credential_source = "header:x-cred"
+
+    def __init__(self, refusal: Callable[[], AuthServiceUnavailable]) -> None:
+        self.refusal = refusal
+
+    def extract(self, connection: Any) -> str | None:
+        return connection.headers.get("x-cred")
+
+    async def verify(self, credential: str, user_model: type[User]) -> Session[User]:
+        try:
+            raise self.refusal()
+        except AuthServiceUnavailable as caught:
+            raise ExceptionGroup("one leaf", [caught]) from None
+
+
+def plain() -> AuthServiceUnavailable:
+    return AuthServiceUnavailable(reason="upstream down")
+
+
+def foreign() -> AuthServiceUnavailable:
+    return AuthServiceUnavailable503(reason="upstream down", retry_after=99)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("refusal", "settings"),
+    [(plain, OPT_IN), (foreign, {})],
+    ids=["opt-in-replaces-the-leaf", "default-rebuilds-the-503-form"],
+)
+async def test_a_replaced_grouped_leaf_is_not_reachable_from_the_refusal(
+    refusal: Callable[[], AuthServiceUnavailable], settings: dict[str, Any]
+) -> None:
+    """A replaced refusal must not reach the leaf it replaced, by any path: the leaf's traceback
+    holds the third party's frame, and that frame holds the credential."""
+    connection = request(x_cred=GROUPED_CREDENTIAL)
+
+    error = await refused_with(Regrouping(refusal), connection, **settings)
+
+    assert holding_reachable(error, GROUPED_CREDENTIAL, ignore=[connection]) == []
+
+
+@pytest.mark.anyio
+async def test_a_leaf_left_alone_is_raised_as_itself_with_the_verifier_s_own_frames() -> None:
+    """Not claimed: a refusal the policy leaves alone is the leaf itself, as on `main`, and its
+    traceback holds the custom verifier's frames. Those are the verifier's to scrub. The bridge's
+    own frames hold nothing."""
+    connection = request(x_cred=GROUPED_CREDENTIAL)
+
+    error = await refused_with(Regrouping(plain), connection)
+
+    holders = holding_reachable(error, GROUPED_CREDENTIAL, ignore=[connection])
+    assert type(error) is AuthServiceUnavailable
+    assert holders == ["test_unavailable_frames.py:verify.credential"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("refusal", "settings"),
+    [(plain, OPT_IN), (foreign, {})],
+    ids=["opt-in-replaces-the-leaf", "default-rebuilds-the-503-form"],
+)
+async def test_after_a_replacement_the_dispatcher_frame_holds_no_refusal_and_no_live_frame(
+    refusal: Callable[[], AuthServiceUnavailable], settings: dict[str, Any]
+) -> None:
+    """What `_verified` keeps once it has raised the replacement, read off its own frame."""
+    error = await refused_with(Regrouping(refusal), request(x_cred=GROUPED_CREDENTIAL), **settings)
+
+    frames: list[FrameType] = []
+    traceback = error.__traceback__
+    while traceback:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    (verified,) = [frame for frame in frames if frame.f_code.co_name == "_verified"]
+    kept: dict[str, Any] = dict(verified.f_locals)
+
+    assert error is kept["failure"]
+    assert kept["credential"] is None
+    others = [value for key, value in kept.items() if key != "failure"]
+    assert not any(isinstance(value, BaseException) for value in others)
+    assert inspect.iscoroutine(kept["answer"])
+    assert kept["answer"].cr_frame is None, "the verifier's coroutine still holds its frame"
