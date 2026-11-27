@@ -186,7 +186,8 @@ class CookieVerifier:
             cancellation. `None` disables it, for a caller that enforces its own deadline. A
             store that blocks a worker thread (`SyncStoreAdapter`) is released from the request
             at the deadline, but the thread cannot be interrupted: its call runs on, holding its
-            connection, until the database answers.
+            connection, until the database answers or, with the adapter's `statement_timeout`
+            set, the server ends it.
 
     Raises:
         ConfigurationError: For any unusable configuration, at construction: neither or both of
