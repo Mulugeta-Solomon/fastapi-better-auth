@@ -219,9 +219,12 @@ async def test_a_lookup_the_server_ends_raises_the_refusal_and_nothing_with_the_
     await store.connect()
 
     await in_thread(lock.take)
-    watched = await queued_while(
-        observer, application_name, lambda: store.fetch_session_by_token(FORGED_TOKEN)
-    )
+    # The guard only ever runs out red: called directly there is no lookup_timeout, and a lookup
+    # with no bound would wait on the lock for good. The fixture releases the lock either way.
+    with anyio.fail_after(CLIENT_SIDE):
+        watched = await queued_while(
+            observer, application_name, lambda: store.fetch_session_by_token(FORGED_TOKEN)
+        )
     await in_thread(lock.release)
     await every_slot_returned(store)
 
